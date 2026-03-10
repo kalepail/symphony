@@ -1,0 +1,621 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use thiserror::Error;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    pub tracker: TrackerConfig,
+    pub polling: PollingConfig,
+    pub workspace: WorkspaceConfig,
+    pub hooks: HookConfig,
+    pub agent: AgentConfig,
+    pub codex: CodexConfig,
+    pub server: ServerConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackerConfig {
+    pub kind: Option<String>,
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub project_slug: Option<String>,
+    pub assignee: Option<String>,
+    pub active_states: Vec<String>,
+    pub terminal_states: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PollingConfig {
+    pub interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub root: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HookConfig {
+    pub after_create: Option<String>,
+    pub before_run: Option<String>,
+    pub after_run: Option<String>,
+    pub before_remove: Option<String>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub max_concurrent_agents: usize,
+    pub max_turns: usize,
+    pub max_retry_backoff_ms: u64,
+    pub max_concurrent_agents_by_state: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexConfig {
+    pub command: String,
+    pub approval_policy: Value,
+    pub thread_sandbox: Value,
+    pub turn_sandbox_policy: Value,
+    pub turn_timeout_ms: u64,
+    pub read_timeout_ms: u64,
+    pub stall_timeout_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Error, Clone)]
+pub enum ConfigError {
+    #[error("invalid_workflow_config {0}")]
+    Invalid(String),
+    #[error("missing_tracker_kind")]
+    MissingTrackerKind,
+    #[error("unsupported_tracker_kind {0}")]
+    UnsupportedTrackerKind(String),
+    #[error("missing_tracker_api_key")]
+    MissingTrackerApiKey,
+    #[error("missing_tracker_project_slug")]
+    MissingTrackerProjectSlug,
+    #[error("missing_codex_command")]
+    MissingCodexCommand,
+}
+
+impl ServiceConfig {
+    pub fn from_map(config: &Map<String, Value>) -> Result<Self, ConfigError> {
+        let tracker = parse_tracker_config(config.get("tracker"))?;
+        let polling = parse_polling_config(config.get("polling"))?;
+        let workspace = parse_workspace_config(config.get("workspace"))?;
+        let hooks = parse_hook_config(config.get("hooks"))?;
+        let agent = parse_agent_config(config.get("agent"))?;
+        let codex = parse_codex_config(config.get("codex"), &workspace.root)?;
+        let server = parse_server_config(config.get("server"))?;
+
+        Ok(Self {
+            tracker,
+            polling,
+            workspace,
+            hooks,
+            agent,
+            codex,
+            server,
+        })
+    }
+
+    pub fn validate_dispatch_ready(&self) -> Result<(), ConfigError> {
+        let kind = self
+            .tracker
+            .kind
+            .as_deref()
+            .ok_or(ConfigError::MissingTrackerKind)?;
+
+        if kind != "linear" {
+            return Err(ConfigError::UnsupportedTrackerKind(kind.to_string()));
+        }
+        if self.tracker.api_key.is_none() {
+            return Err(ConfigError::MissingTrackerApiKey);
+        }
+        if self.tracker.project_slug.is_none() {
+            return Err(ConfigError::MissingTrackerProjectSlug);
+        }
+        if self.codex.command.is_empty() {
+            return Err(ConfigError::MissingCodexCommand);
+        }
+        Ok(())
+    }
+
+    pub fn active_state_set(&self) -> BTreeSet<String> {
+        self.tracker
+            .active_states
+            .iter()
+            .map(|value| normalize_state_key(value))
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    pub fn terminal_state_set(&self) -> BTreeSet<String> {
+        self.tracker
+            .terminal_states
+            .iter()
+            .map(|value| normalize_state_key(value))
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    pub fn max_concurrent_agents_for_state(&self, state: &str) -> usize {
+        let state_key = normalize_state_key(state);
+        self.agent
+            .max_concurrent_agents_by_state
+            .get(&state_key)
+            .copied()
+            .unwrap_or(self.agent.max_concurrent_agents)
+    }
+}
+
+fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigError> {
+    let map = as_object(value, "tracker")?;
+    let api_key = resolve_secret(map.get("api_key"), "LINEAR_API_KEY")?;
+    let assignee = resolve_secret(map.get("assignee"), "LINEAR_ASSIGNEE")?;
+
+    Ok(TrackerConfig {
+        kind: optional_string(map.get("kind"), "tracker.kind")?,
+        endpoint: optional_string(map.get("endpoint"), "tracker.endpoint")?
+            .unwrap_or_else(|| "https://api.linear.app/graphql".to_string()),
+        api_key,
+        project_slug: optional_string(map.get("project_slug"), "tracker.project_slug")?,
+        assignee,
+        active_states: parse_string_list(
+            map.get("active_states"),
+            "tracker.active_states",
+            &["Todo", "In Progress"],
+        )?,
+        terminal_states: parse_string_list(
+            map.get("terminal_states"),
+            "tracker.terminal_states",
+            &["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+        )?,
+    })
+}
+
+fn parse_polling_config(value: Option<&Value>) -> Result<PollingConfig, ConfigError> {
+    let map = as_object(value, "polling")?;
+    Ok(PollingConfig {
+        interval_ms: parse_positive_u64(map.get("interval_ms"), "polling.interval_ms")?
+            .unwrap_or(30_000),
+    })
+}
+
+fn parse_workspace_config(value: Option<&Value>) -> Result<WorkspaceConfig, ConfigError> {
+    let map = as_object(value, "workspace")?;
+    let root = optional_string(map.get("root"), "workspace.root")?;
+    Ok(WorkspaceConfig {
+        root: resolve_path_value(root.as_deref(), default_workspace_root()),
+    })
+}
+
+fn parse_hook_config(value: Option<&Value>) -> Result<HookConfig, ConfigError> {
+    let map = as_object(value, "hooks")?;
+    Ok(HookConfig {
+        after_create: map
+            .get("after_create")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        before_run: map
+            .get("before_run")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        after_run: map
+            .get("after_run")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        before_remove: map
+            .get("before_remove")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        timeout_ms: parse_positive_u64(map.get("timeout_ms"), "hooks.timeout_ms")?
+            .unwrap_or(60_000),
+    })
+}
+
+fn parse_agent_config(value: Option<&Value>) -> Result<AgentConfig, ConfigError> {
+    let map = as_object(value, "agent")?;
+    Ok(AgentConfig {
+        max_concurrent_agents: parse_positive_u64(
+            map.get("max_concurrent_agents"),
+            "agent.max_concurrent_agents",
+        )?
+        .unwrap_or(10) as usize,
+        max_turns: parse_positive_u64(map.get("max_turns"), "agent.max_turns")?.unwrap_or(20)
+            as usize,
+        max_retry_backoff_ms: parse_positive_u64(
+            map.get("max_retry_backoff_ms"),
+            "agent.max_retry_backoff_ms",
+        )?
+        .unwrap_or(300_000),
+        max_concurrent_agents_by_state: parse_state_limits(
+            map.get("max_concurrent_agents_by_state"),
+        )?,
+    })
+}
+
+fn parse_codex_config(
+    value: Option<&Value>,
+    workspace_root: &Path,
+) -> Result<CodexConfig, ConfigError> {
+    let map = as_object(value, "codex")?;
+    Ok(CodexConfig {
+        command: optional_string(map.get("command"), "codex.command")?
+            .unwrap_or_else(|| "codex app-server".to_string()),
+        approval_policy: map
+            .get("approval_policy")
+            .cloned()
+            .unwrap_or_else(default_approval_policy),
+        thread_sandbox: map
+            .get("thread_sandbox")
+            .cloned()
+            .unwrap_or_else(|| Value::String("workspace-write".to_string())),
+        turn_sandbox_policy: map
+            .get("turn_sandbox_policy")
+            .cloned()
+            .unwrap_or_else(|| default_turn_sandbox_policy(workspace_root)),
+        turn_timeout_ms: parse_positive_u64(map.get("turn_timeout_ms"), "codex.turn_timeout_ms")?
+            .unwrap_or(3_600_000),
+        read_timeout_ms: parse_positive_u64(map.get("read_timeout_ms"), "codex.read_timeout_ms")?
+            .unwrap_or(5_000),
+        stall_timeout_ms: parse_i64(map.get("stall_timeout_ms"), "codex.stall_timeout_ms")?
+            .unwrap_or(300_000),
+    })
+}
+
+fn parse_server_config(value: Option<&Value>) -> Result<ServerConfig, ConfigError> {
+    let map = as_object(value, "server")?;
+    let port = parse_non_negative_u64(map.get("port"), "server.port")?.map(|value| value as u16);
+    Ok(ServerConfig {
+        host: optional_string(map.get("host"), "server.host")?,
+        port,
+    })
+}
+
+fn parse_state_limits(value: Option<&Value>) -> Result<BTreeMap<String, usize>, ConfigError> {
+    let map = match value {
+        None | Some(Value::Null) => return Ok(BTreeMap::new()),
+        Some(Value::Object(map)) => map,
+        _ => {
+            return Err(ConfigError::Invalid(
+                "agent.max_concurrent_agents_by_state must be an object".to_string(),
+            ));
+        }
+    };
+
+    let mut parsed = BTreeMap::new();
+    for (state, raw_limit) in map {
+        let normalized_state = normalize_state_key(state);
+        if normalized_state.is_empty() {
+            return Err(ConfigError::Invalid(
+                "agent.max_concurrent_agents_by_state state names must not be blank".to_string(),
+            ));
+        }
+
+        let limit = parse_positive_u64(Some(raw_limit), "agent.max_concurrent_agents_by_state")?
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "agent.max_concurrent_agents_by_state limits must be positive integers"
+                        .to_string(),
+                )
+            })?;
+
+        parsed.insert(normalized_state, limit as usize);
+    }
+
+    Ok(parsed)
+}
+
+fn parse_string_list(
+    value: Option<&Value>,
+    field: &str,
+    default: &[&str],
+) -> Result<Vec<String>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(default.iter().map(|value| (*value).to_string()).collect()),
+        Some(Value::String(raw)) => Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(text) => Ok(text.clone()),
+                _ => Err(ConfigError::Invalid(format!(
+                    "{field} must be a string list"
+                ))),
+            })
+            .collect(),
+        _ => Err(ConfigError::Invalid(format!(
+            "{field} must be a string list"
+        ))),
+    }
+}
+
+fn as_object<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<&'a Map<String, Value>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(empty_object()),
+        Some(Value::Object(map)) => Ok(map),
+        _ => Err(ConfigError::Invalid(format!("{field} must be an object"))),
+    }
+}
+
+fn empty_object() -> &'static Map<String, Value> {
+    static EMPTY: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(Map::new)
+}
+
+fn optional_string(value: Option<&Value>, field: &str) -> Result<Option<String>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.to_string())),
+        _ => Err(ConfigError::Invalid(format!("{field} must be a string"))),
+    }
+}
+
+fn parse_positive_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, ConfigError> {
+    let parsed = parse_non_negative_u64(value, field)?;
+    match parsed {
+        Some(0) => Err(ConfigError::Invalid(format!(
+            "{field} must be greater than 0"
+        ))),
+        other => Ok(other),
+    }
+}
+
+fn parse_non_negative_u64(value: Option<&Value>, field: &str) -> Result<Option<u64>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| ConfigError::Invalid(format!("{field} must be a non-negative integer")))
+            .map(Some),
+        Some(Value::String(text)) => {
+            text.trim().parse::<u64>().map(Some).map_err(|_| {
+                ConfigError::Invalid(format!("{field} must be a non-negative integer"))
+            })
+        }
+        _ => Err(ConfigError::Invalid(format!(
+            "{field} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn parse_i64(value: Option<&Value>, field: &str) -> Result<Option<i64>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| ConfigError::Invalid(format!("{field} must be an integer")))
+            .map(Some),
+        Some(Value::String(text)) => text
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| ConfigError::Invalid(format!("{field} must be an integer"))),
+        _ => Err(ConfigError::Invalid(format!("{field} must be an integer"))),
+    }
+}
+
+fn resolve_secret(value: Option<&Value>, env_name: &str) -> Result<Option<String>, ConfigError> {
+    let value = optional_string(value, env_name)?;
+    Ok(match value {
+        None => normalize_secret(env::var(env_name).ok()),
+        Some(value) => {
+            if let Some(reference) = env_reference(&value) {
+                normalize_secret(env::var(reference).ok())
+            } else {
+                normalize_secret(Some(value))
+            }
+        }
+    })
+}
+
+fn normalize_secret(value: Option<String>) -> Option<String> {
+    value.and_then(|value| if value.is_empty() { None } else { Some(value) })
+}
+
+fn env_reference(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('$')
+        .filter(|name| !name.is_empty())
+        .filter(|name| {
+            name.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+}
+
+fn resolve_path_value(value: Option<&str>, default: PathBuf) -> PathBuf {
+    let raw = value
+        .and_then(|value| {
+            env_reference(value)
+                .map(|name| env::var(name).ok())
+                .unwrap_or_else(|| Some(value.to_string()))
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.display().to_string());
+
+    let expanded = shellexpand::tilde(&raw).to_string();
+    let path = PathBuf::from(&expanded);
+
+    if path.is_absolute() {
+        return path;
+    }
+    if raw.contains(std::path::MAIN_SEPARATOR)
+        || raw.contains('/')
+        || raw.contains('\\')
+        || raw.starts_with('~')
+    {
+        return env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path);
+    }
+    PathBuf::from(raw)
+}
+
+fn default_workspace_root() -> PathBuf {
+    env::temp_dir().join("symphony_workspaces")
+}
+
+fn default_approval_policy() -> Value {
+    serde_json::json!({
+        "reject": {
+            "sandbox_approval": true,
+            "rules": true,
+            "mcp_elicitations": true
+        }
+    })
+}
+
+fn default_turn_sandbox_policy(workspace_root: &Path) -> Value {
+    serde_json::json!({
+        "type": "workspaceWrite",
+        "writableRoots": [workspace_root],
+        "readOnlyAccess": { "type": "fullAccess" },
+        "networkAccess": false,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false
+    })
+}
+
+pub fn normalize_state_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceConfig;
+    use serde_json::json;
+
+    #[test]
+    fn parses_defaults_and_limits() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "agent": {
+                    "max_concurrent_agents_by_state": {
+                        "In Progress": 2,
+                        "Review": 3
+                    }
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.polling.interval_ms, 30_000);
+        assert_eq!(config.max_concurrent_agents_for_state("in progress"), 2);
+        assert_eq!(config.max_concurrent_agents_for_state("review"), 3);
+    }
+
+    #[test]
+    fn supports_csv_state_config() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj",
+                    "active_states": "Todo, In Progress, Review"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.tracker.active_states,
+            vec!["Todo", "In Progress", "Review"]
+        );
+    }
+
+    #[test]
+    fn default_turn_sandbox_policy_matches_current_codex_schema() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.codex.turn_sandbox_policy.get("networkAccess"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_state_limits() {
+        let error = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "agent": {
+                    "max_concurrent_agents_by_state": {
+                        "Review": 0
+                    }
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_hook_timeout() {
+        let error = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "hooks": {
+                    "timeout_ms": 0
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, super::ConfigError::Invalid(_)));
+    }
+}

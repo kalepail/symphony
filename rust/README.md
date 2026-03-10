@@ -1,0 +1,110 @@
+# Symphony Rust
+
+This directory contains a Rust implementation of the Symphony service specification in [`../SPEC.md`](../SPEC.md).
+
+It follows the Elixir reference implementation’s operating model:
+
+1. Poll Linear for active work
+2. Create or reuse one isolated workspace per issue
+3. Launch Codex in app-server mode inside that workspace
+4. Render the repo-owned `WORKFLOW.md` prompt for the issue
+5. Keep running continuation turns until the issue leaves an active state or the run hits `agent.max_turns`
+
+## Trust And Safety Posture
+
+This Rust port is intended for trusted environments.
+
+- Codex is launched only inside sanitized per-issue workspaces.
+- Workspace paths are validated to stay under `workspace.root`.
+- Command and file-change approvals are only auto-approved when `codex.approval_policy: never`.
+- Tool `requestUserInput` prompts are answered non-interactively so unattended runs continue, while broader MCP elicitations and extra permission requests still fail hard.
+- The optional `linear_graphql` dynamic tool is exposed only when `tracker.kind == "linear"`.
+
+If you need a stricter posture, tighten the Codex approval and sandbox settings in `WORKFLOW.md` and run Symphony inside an external sandbox.
+
+## Features
+
+- `WORKFLOW.md` loader with YAML front matter, content-hash reload detection, and last-known-good fallback
+- Typed config layer with defaults, `$VAR` resolution, path normalization, and stricter validation for state limits and hook timeouts
+- Linear polling, pagination, issue-state refresh, and startup terminal cleanup
+- Workspace hooks: `after_create`, `before_run`, `after_run`, `before_remove`
+- Codex app-server client over stdio with:
+  - `initialize` / `initialized` / `thread/start` / `turn/start`
+  - separate stdout protocol parsing and stderr diagnostics
+  - command/file-change approval handling
+  - `linear_graphql` dynamic tool execution
+  - token and rate-limit extraction
+- Single-authority orchestrator with:
+  - bounded concurrency
+  - retry queue and exponential backoff
+  - continuation retries after clean worker exit
+  - reconciliation for stall detection and tracker state changes
+- Optional HTTP observability server:
+  - `/`
+  - `/api/v1/state`
+  - `/api/v1/<issue_identifier>`
+  - `/api/v1/refresh`
+
+## Run
+
+```bash
+cd rust
+cargo run -- --i-understand-that-this-will-be-running-without-the-usual-guardrails ./WORKFLOW.md --port 3000
+```
+
+If no path is provided, Symphony uses `./WORKFLOW.md` from the current working directory.
+
+Press `Ctrl+C` to stop the service.
+
+## Configuration
+
+Minimal example:
+
+```md
+---
+tracker:
+  kind: linear
+  api_key: $LINEAR_API_KEY
+  project_slug: your-project-slug
+workspace:
+  root: ~/code/symphony-workspaces
+hooks:
+  after_create: |
+    git clone --depth 1 git@github.com:your-org/your-repo.git .
+agent:
+  max_concurrent_agents: 10
+  max_turns: 20
+codex:
+  command: codex app-server
+---
+
+You are working on Linear issue {{ issue.identifier }}.
+
+Title: {{ issue.title }}
+
+{% if issue.description %}
+{{ issue.description }}
+{% else %}
+No description provided.
+{% endif %}
+```
+
+Notes:
+
+- The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the same stronger unattended workflow contract as the Elixir sample: explicit workpad discipline, PR feedback sweeps, rework/reset behavior, and a completion bar before `Human Review`.
+- `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
+- `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
+- `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
+- Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
+- The Rust implementation watches `WORKFLOW.md` and reloads the last good config without restart. Invalid reloads are logged and block new dispatches until fixed.
+- `linear_graphql` accepts raw GraphQL strings or `{ query, variables }` objects and preserves GraphQL error payloads in tool output.
+- Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
+- Optional HTTP observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now includes lightweight live polling with an online/offline status badge.
+- Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`.
+- The sample `before_remove` hook uses [`rust/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) to close open GitHub PRs for the current branch when `gh` is installed and authenticated. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
+
+## Testing
+
+```bash
+cargo test
+```
