@@ -2,7 +2,7 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: "replace-me"
+  project_slug: $SYMPHONY_SMOKE_PROJECT_SLUG
   active_states:
     - Todo
     - In Progress
@@ -20,11 +20,7 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
-    git clone --depth 1 git@github.com:your-org/your-repo.git .
-  before_remove: |
-    if [ -f rust/scripts/workspace_before_remove.sh ]; then
-      sh rust/scripts/workspace_before_remove.sh
-    fi
+    git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .
 agent:
   max_concurrent_agents: 10
   max_turns: 20
@@ -70,6 +66,16 @@ Instructions:
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
 
 Work only in the provided repository copy. Do not touch any other path.
+
+## Smoke repo constraints
+
+This workflow targets `kalepail/symphony-smoke-lab`.
+
+- Default mutation target: `SMOKE_TARGET.md`.
+- Review/rework target when explicitly requested: `smoke/review-target.md`.
+- Default validation command for repo mutations: `sh scripts/validate-smoke-repo.sh`.
+- Pull request titles should begin with `[smoke]`.
+- Do not edit CI or workflow files in the smoke repo unless the issue explicitly asks for that path.
 
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 

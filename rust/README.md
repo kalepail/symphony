@@ -97,7 +97,7 @@ Notes:
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
 - The Rust implementation watches `WORKFLOW.md` and reloads the last good config without restart. Invalid reloads are logged and block new dispatches until fixed.
-- `linear_graphql` accepts raw GraphQL strings or `{ query, variables }` objects and preserves GraphQL error payloads in tool output.
+- `linear_graphql` accepts raw GraphQL strings or `{ query, variables }` objects, includes exact `issue`/`commentCreate`/`issueUpdate` recipes in the tool description, and now preserves Linear HTTP/GraphQL error payloads in tool output so Codex can recover from validation failures.
 - Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
 - Optional HTTP observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now includes lightweight live polling with an online/offline status badge.
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`.
@@ -108,3 +108,11 @@ Notes:
 ```bash
 cargo test
 ```
+
+## Live Smoke Workflows
+
+Tracked live-smoke workflow files now live alongside the main workflow:
+
+- [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
+- [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
+- [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, and the dedicated repo `kalepail/symphony-smoke-lab`.

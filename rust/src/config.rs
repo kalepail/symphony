@@ -171,7 +171,7 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
         endpoint: optional_string(map.get("endpoint"), "tracker.endpoint")?
             .unwrap_or_else(|| "https://api.linear.app/graphql".to_string()),
         api_key,
-        project_slug: optional_string(map.get("project_slug"), "tracker.project_slug")?,
+        project_slug: resolve_env_string(map.get("project_slug"), "tracker.project_slug")?,
         assignee,
         active_states: parse_string_list(
             map.get("active_states"),
@@ -418,18 +418,32 @@ fn parse_i64(value: Option<&Value>, field: &str) -> Result<Option<i64>, ConfigEr
 fn resolve_secret(value: Option<&Value>, env_name: &str) -> Result<Option<String>, ConfigError> {
     let value = optional_string(value, env_name)?;
     Ok(match value {
-        None => normalize_secret(env::var(env_name).ok()),
+        None => normalize_string(env::var(env_name).ok()),
         Some(value) => {
             if let Some(reference) = env_reference(&value) {
-                normalize_secret(env::var(reference).ok())
+                normalize_string(env::var(reference).ok())
             } else {
-                normalize_secret(Some(value))
+                normalize_string(Some(value))
             }
         }
     })
 }
 
-fn normalize_secret(value: Option<String>) -> Option<String> {
+fn resolve_env_string(value: Option<&Value>, field: &str) -> Result<Option<String>, ConfigError> {
+    let value = optional_string(value, field)?;
+    Ok(match value {
+        None => None,
+        Some(value) => {
+            if let Some(reference) = env_reference(&value) {
+                normalize_string(env::var(reference).ok())
+            } else {
+                normalize_string(Some(value))
+            }
+        }
+    })
+}
+
+fn normalize_string(value: Option<String>) -> Option<String> {
     value.and_then(|value| if value.is_empty() { None } else { Some(value) })
 }
 
@@ -503,8 +517,15 @@ pub fn normalize_state_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::ServiceConfig;
     use serde_json::json;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn parses_defaults_and_limits() {
@@ -617,5 +638,36 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn resolves_project_slug_from_env_reference() {
+        let _guard = env_lock().lock().expect("env lock");
+        let env_name = "SYMPHONY_TEST_PROJECT_SLUG";
+        unsafe {
+            std::env::set_var(env_name, "proj-from-env");
+        }
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": format!("${env_name}")
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.tracker.project_slug.as_deref(),
+            Some("proj-from-env")
+        );
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
     }
 }

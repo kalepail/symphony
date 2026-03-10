@@ -6,6 +6,14 @@ use crate::{
 };
 
 pub const LINEAR_GRAPHQL_TOOL: &str = "linear_graphql";
+const LINEAR_GRAPHQL_TOOL_DESCRIPTION: &str = concat!(
+    "Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.\n",
+    "Use one narrow operation per call.\n",
+    "When you have a ticket key like `SDF-6`, query `issue(id: $id)` directly; Linear accepts the human identifier there.\n",
+    "Create comments with `commentCreate(input: { issueId: $issueId, body: $body })`.\n",
+    "Move state by first querying `issue(id: $id) { team { states { nodes { id name type } } } }`, then calling `issueUpdate(id: $id, input: { stateId: $stateId })`.\n",
+    "Avoid broad search or schema introspection unless these direct recipes fail."
+);
 
 pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
     if config.tracker.kind.as_deref() != Some("linear") || config.tracker.api_key.is_none() {
@@ -14,7 +22,7 @@ pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
 
     vec![json!({
         "name": LINEAR_GRAPHQL_TOOL,
-        "description": "Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.",
+        "description": LINEAR_GRAPHQL_TOOL_DESCRIPTION,
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -147,16 +155,26 @@ fn tool_error_payload(error: TrackerError) -> Value {
                 "message": "Symphony is missing Linear auth. Set tracker.api_key in WORKFLOW.md or export LINEAR_API_KEY."
             }
         }),
-        TrackerError::LinearApiStatus(status) => json!({
-            "error": {
-                "message": format!("Linear GraphQL request failed with HTTP {status}."),
-                "status": status
-            }
-        }),
+        TrackerError::LinearApiStatus { status, body } => {
+            let parsed_body = parse_error_body(&body);
+            json!({
+                "error": {
+                    "message": format!("Linear GraphQL request failed with HTTP {status}."),
+                    "status": status,
+                    "response": parsed_body
+                }
+            })
+        }
         TrackerError::LinearApiRequest(reason) => json!({
             "error": {
                 "message": "Linear GraphQL request failed before receiving a successful response.",
                 "reason": reason
+            }
+        }),
+        TrackerError::LinearGraphqlErrors(body) => json!({
+            "error": {
+                "message": "Linear GraphQL request returned GraphQL errors.",
+                "response": parse_error_body(&body)
             }
         }),
         other => json!({
@@ -166,6 +184,10 @@ fn tool_error_payload(error: TrackerError) -> Value {
             }
         }),
     }
+}
+
+fn parse_error_body(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
 #[cfg(test)]
@@ -182,6 +204,9 @@ mod tests {
     use super::{LINEAR_GRAPHQL_TOOL, execute, tool_specs};
 
     struct StubTracker;
+    struct ErrorTracker {
+        error: TrackerError,
+    }
 
     #[async_trait]
     impl TrackerClient for StubTracker {
@@ -212,9 +237,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn accepts_multiple_operations() {
-        let config = ServiceConfig::from_map(
+    #[async_trait]
+    impl TrackerClient for ErrorTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn raw_graphql(
+            &self,
+            _query: &str,
+            _variables: serde_json::Value,
+        ) -> Result<serde_json::Value, TrackerError> {
+            Err(self.error.clone())
+        }
+    }
+
+    fn linear_config() -> ServiceConfig {
+        ServiceConfig::from_map(
             json!({
                 "tracker": {
                     "kind": "linear",
@@ -225,7 +278,12 @@ mod tests {
             .as_object()
             .expect("object"),
         )
-        .expect("config");
+        .expect("config")
+    }
+
+    #[tokio::test]
+    async fn accepts_multiple_operations() {
+        let config = linear_config();
 
         let payload = execute(
             &config,
@@ -245,18 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_raw_query_string_arguments() {
-        let config = ServiceConfig::from_map(
-            json!({
-                "tracker": {
-                    "kind": "linear",
-                    "api_key": "token",
-                    "project_slug": "proj"
-                }
-            })
-            .as_object()
-            .expect("object"),
-        )
-        .expect("config");
+        let config = linear_config();
 
         let payload = execute(
             &config,
@@ -287,5 +334,56 @@ mod tests {
         .expect("config");
 
         assert!(tool_specs(&config).is_empty());
+    }
+
+    #[test]
+    fn tool_description_includes_linear_recipes() {
+        let config = linear_config();
+        let specs = tool_specs(&config);
+        let description = specs[0]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("description");
+
+        assert!(description.contains("issue(id: $id)"));
+        assert!(description.contains("commentCreate"));
+        assert!(description.contains("issueUpdate"));
+    }
+
+    #[tokio::test]
+    async fn returns_http_error_response_body_to_model() {
+        let config = linear_config();
+        let tracker = ErrorTracker {
+            error: TrackerError::LinearApiStatus {
+                status: 400,
+                body: r#"{"errors":[{"message":"Field \"identifier\" is not defined by type \"IssueFilter\"."}]}"#
+                    .to_string(),
+            },
+        };
+
+        let payload = execute(
+            &config,
+            &tracker,
+            LINEAR_GRAPHQL_TOOL,
+            json!({
+                "query": "query Broken { issue(id: \"SDF-6\") { id } }"
+            }),
+        )
+        .await;
+
+        let rendered = payload
+            .get("contentItems")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .expect("rendered payload");
+
+        assert_eq!(
+            payload.get("success").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(rendered.contains("\"status\": 400"));
+        assert!(rendered.contains("IssueFilter"));
     }
 }

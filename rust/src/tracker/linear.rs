@@ -265,7 +265,10 @@ impl TrackerClient for LinearTracker {
                 status.as_u16(),
                 truncate_error_body(&body_text)
             );
-            return Err(TrackerError::LinearApiStatus(status.as_u16()));
+            return Err(TrackerError::LinearApiStatus {
+                status: status.as_u16(),
+                body: body_text,
+            });
         }
 
         let body = serde_json::from_str::<Value>(&body_text)

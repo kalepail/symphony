@@ -75,9 +75,9 @@ query CommentCreateInputShape {
 
 Use these progressively:
 
-- Start with `issue(id: $key)` when you have a ticket key such as `MT-686`.
-- Fall back to `issues(filter: ...)` when you need identifier search semantics.
-- Once you have the internal issue id, prefer `issue(id: $id)` for narrower reads.
+- Start with `issue(id: $key)` when you have a ticket key such as `MT-686`; Linear accepts the human identifier there.
+- Once you have the internal issue id, continue using `issue(id: $id)` for narrower reads.
+- Prefer targeted introspection over exploratory searches when you need an unfamiliar field or mutation shape.
 
 Lookup by issue key:
 
@@ -106,33 +106,6 @@ query IssueByKey($key: String!) {
         url
         title
       }
-    }
-  }
-}
-```
-
-Lookup by identifier filter:
-
-```graphql
-query IssueByIdentifier($identifier: String!) {
-  issues(filter: { identifier: { eq: $identifier } }, first: 1) {
-    nodes {
-      id
-      identifier
-      title
-      state {
-        id
-        name
-        type
-      }
-      project {
-        id
-        name
-      }
-      branchName
-      url
-      description
-      updatedAt
     }
   }
 }
