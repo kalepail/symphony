@@ -17,6 +17,7 @@ use tokio::{
 
 use crate::{
     config::ObservabilityConfig,
+    issue::Issue,
     orchestrator::{
         IssueDetail, OrchestratorHandle, PollingSnapshot, RecentEvent, RetrySnapshot, Snapshot,
         SnapshotCounts, TokenSnapshot,
@@ -61,7 +62,13 @@ pub struct AgentLimitsPayload {
 pub struct RunningEntryPayload {
     pub issue_id: String,
     pub issue_identifier: String,
+    pub title: String,
     pub state: String,
+    pub url: Option<String>,
+    pub project_url: Option<String>,
+    pub labels: Vec<String>,
+    pub due: Option<Value>,
+    pub deadline: Option<Value>,
     pub session_id: Option<String>,
     pub app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -220,7 +227,13 @@ impl Presenter {
                     RunningEntryPayload {
                         issue_id: entry.issue_id,
                         issue_identifier: entry.issue_identifier,
+                        title: entry.title,
                         state: entry.state,
+                        url: entry.url,
+                        project_url: entry.project_id.as_deref().map(todoist_project_url),
+                        labels: entry.labels,
+                        due: entry.due,
+                        deadline: entry.deadline,
                         session_id: entry.session_id,
                         app_server_pid: entry.codex_app_server_pid,
                         turn_count: entry.turn_count,
@@ -308,7 +321,7 @@ impl Presenter {
                 .map(Self::present_recent_event)
                 .collect(),
             last_error: detail.last_error,
-            tracked: json!({}),
+            tracked: tracked_issue_payload(detail.tracked_issue.as_ref()),
         }
     }
 
@@ -431,8 +444,9 @@ fn tokens_at_or_before(samples: &[(i64, u64)], timestamp: i64) -> u64 {
 }
 
 pub fn render_dashboard_html(payload: &StatePayload) -> String {
-    let initial_state =
-        escape_html(&serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()));
+    let initial_state = escape_json_for_script_tag(
+        &serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+    );
     format!(
         "<!doctype html>\
         <html lang=\"en\">\
@@ -448,7 +462,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
                 <div class=\"card\">\
                   <p class=\"eyebrow\">Symphony Observability</p>\
                   <h1>Rust Operations Dashboard</h1>\
-                  <p class=\"hero-copy\">Live orchestration state, retries, throughput, workflow health, and recent Codex activity for unattended runs.</p>\
+                  <p class=\"hero-copy\">Live Todoist-native orchestration state, task metadata, retries, throughput, workflow health, and recent Codex activity for unattended runs.</p>\
                   <p class=\"meta\">Generated at <span id=\"generated-at\"></span></p>\
                   <div class=\"link-row\">\
                     <a id=\"project-link\" class=\"pill pill-link\" target=\"_blank\" rel=\"noreferrer noopener\"></a>\
@@ -520,7 +534,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
                 </div>\
                 <table>\
                   <thead>\
-                    <tr><th>Issue</th><th>State</th><th>Session</th><th>Runtime / turns</th><th>Last Activity</th><th>Tokens</th><th>Workspace</th></tr>\
+                    <tr><th>Task</th><th>State</th><th>Session</th><th>Runtime / turns</th><th>Last Activity</th><th>Tokens</th><th>Workspace</th></tr>\
                   </thead>\
                   <tbody id=\"running-body\"></tbody>\
                 </table>\
@@ -828,7 +842,7 @@ fn normalize_status_lines(content: &str) -> String {
 fn running_table_header_row(running_event_width: usize) -> String {
     format!(
         "│ {} {} {} {} {} {} {}",
-        format_cell("ISSUE", RUNNING_ID_WIDTH),
+        format_cell("TASK", RUNNING_ID_WIDTH),
         format_cell("STATE", RUNNING_STATE_WIDTH),
         format_cell("SESSION", RUNNING_SESSION_WIDTH),
         format_cell("PID", RUNNING_PID_WIDTH),
@@ -1795,23 +1809,57 @@ fn slugify(value: &str) -> String {
         .collect()
 }
 
-fn escape_html(value: &str) -> String {
+fn escape_json_for_script_tag(value: &str) -> String {
     value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+}
+
+fn tracked_issue_payload(issue: Option<&Issue>) -> Value {
+    let Some(issue) = issue else {
+        return json!({});
+    };
+
+    let mut payload = serde_json::to_value(issue)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(project_id) = issue.project_id.as_deref() {
+        payload.insert(
+            "project_url".to_string(),
+            Value::String(todoist_project_url(project_id)),
+        );
+    }
+    Value::Object(payload)
 }
 
 pub fn humanize_blocking_reason(value: &str) -> &str {
-    match value {
-        "workflow_front_matter_not_a_map" => "workflow front matter must decode to a map",
-        "missing_tracker_api_key" => "tracker api key is missing",
-        "missing_tracker_project_id" => "tracker project id is missing",
-        "missing_tracker_kind" => "tracker kind is missing",
-        "missing_codex_command" => "codex command is missing",
-        other => other,
+    if value.starts_with("todoist_project_not_found ") {
+        "configured Todoist project was not found"
+    } else if value.starts_with("todoist_missing_required_section ") {
+        "Todoist workflow is missing a required section"
+    } else if value.starts_with("todoist_comment_too_large") {
+        "Todoist workpad comment exceeds the 15,000 character limit"
+    } else if value.starts_with("todoist_rate_limited") {
+        "Todoist rate limit reached; retrying after the server hint"
+    } else if value.starts_with("todoist_api_status ") {
+        "Todoist API returned a non-success status"
+    } else if value.starts_with("todoist_api_request ") {
+        "Todoist API request failed before a response was received"
+    } else {
+        match value {
+            "workflow_front_matter_not_a_map" => "workflow front matter must decode to a map",
+            "missing_tracker_api_key" => "Todoist API token is missing",
+            "missing_tracker_project_id" => "Todoist project id is missing",
+            "missing_tracker_kind" => "tracker kind is missing",
+            "missing_codex_command" => "codex command is missing",
+            "todoist_missing_current_user" => "Todoist current user lookup failed",
+            "todoist_comments_unavailable" => "Todoist comments are unavailable on this account",
+            "todoist_reminders_unavailable" => "Todoist reminders are unavailable on this account",
+            "todoist_unknown_payload" => "Todoist returned an unexpected payload shape",
+            other => other,
+        }
     }
 }
 
@@ -1951,7 +1999,11 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #1f1
 .meta-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .link-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .issue-stack, .detail-stack, .token-stack { display: grid; gap: 4px; }
+.issue-title { color: var(--muted); max-width: 34ch; }
+.issue-links, .issue-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .issue-link { color: var(--accent); text-decoration: none; font-size: 0.88rem; }
+.meta-chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 10px; font-size: 0.8rem; background: #efe6d7; color: var(--ink); }
+.meta-chip-muted { background: #f4ede1; color: var(--muted); }
 .numeric { font-variant-numeric: tabular-nums; }
 @media (max-width: 960px) {
   .hero, .grid, .meta-grid, .throughput-grid { grid-template-columns: 1fr; }
@@ -1995,6 +2047,41 @@ const DASHBOARD_JS: &str = r#"
     return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   }
 
+  function formatTodoistDate(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') {
+      if (value.date && value.string && value.string !== value.date) {
+        return `${value.string} (${value.date})`;
+      }
+      if (value.date) return value.date;
+      if (value.string) return value.string;
+      if (value.datetime) return value.datetime;
+    }
+    return '';
+  }
+
+  function renderTaskMeta(entry) {
+    const parts = [];
+    (entry.labels || []).forEach((label) => {
+      parts.push(`<span class="meta-chip">${escapeHtml(label)}</span>`);
+    });
+
+    const due = formatTodoistDate(entry.due);
+    if (due) {
+      parts.push(`<span class="meta-chip meta-chip-muted">Due ${escapeHtml(due)}</span>`);
+    }
+
+    const deadline = formatTodoistDate(entry.deadline);
+    if (deadline) {
+      parts.push(`<span class="meta-chip meta-chip-muted">Deadline ${escapeHtml(deadline)}</span>`);
+    }
+
+    return parts.length > 0
+      ? `<div class="issue-meta">${parts.join('')}</div>`
+      : '';
+  }
+
   function updateStatus(mode, label, copy) {
     const badge = document.getElementById('runtime-status');
     const labelNode = document.getElementById('runtime-status-label');
@@ -2007,12 +2094,21 @@ const DASHBOARD_JS: &str = r#"
 
   function renderRunningRows(payload) {
     if (!payload.running || payload.running.length === 0) {
-      return '<tr><td colspan="7" class="empty">No active sessions.</td></tr>';
+      return '<tr><td colspan="7" class="empty">No active task sessions.</td></tr>';
     }
     return payload.running.map((entry) => {
       const runtime = formatDuration(entry.runtime_seconds);
       const startedAt = entry.started_at || '';
       const lastEventAt = entry.last_event_at || 'n/a';
+      const links = [
+        `<a class="issue-link" href="/api/v1/${encodeURIComponent(entry.issue_identifier)}">Run JSON</a>`
+      ];
+      if (entry.url) {
+        links.push(`<a class="issue-link" href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer noopener">Open task</a>`);
+      }
+      if (entry.project_url) {
+        links.push(`<a class="issue-link" href="${escapeHtml(entry.project_url)}" target="_blank" rel="noreferrer noopener">Project board</a>`);
+      }
       const sessionButton = entry.session_id
         ? `<button type="button" class="subtle-button" data-copy="${escapeHtml(entry.session_id)}">Copy ID</button>`
         : '<span class="muted">n/a</span>';
@@ -2020,7 +2116,9 @@ const DASHBOARD_JS: &str = r#"
         <td>
           <div class="issue-stack">
             <span><strong>${escapeHtml(entry.issue_identifier)}</strong></span>
-            <a class="issue-link" href="/api/v1/${encodeURIComponent(entry.issue_identifier)}">JSON details</a>
+            <span class="issue-title">${escapeHtml(entry.title || 'Untitled task')}</span>
+            <div class="issue-links">${links.join('')}</div>
+            ${renderTaskMeta(entry)}
           </div>
         </td>
         <td><span class="state state-${slugify(entry.state)}">${escapeHtml(entry.state)}</span></td>
@@ -2065,7 +2163,7 @@ const DASHBOARD_JS: &str = r#"
     if (projectLink) {
       if (payload.links?.project_url) {
         projectLink.href = payload.links.project_url;
-        projectLink.textContent = 'Todoist Project';
+        projectLink.textContent = 'Todoist Board';
         projectLink.style.display = 'inline-flex';
       } else {
         projectLink.style.display = 'none';
@@ -2183,6 +2281,11 @@ const DASHBOARD_JS: &str = r#"
     fallbackPolling = null;
   }
 
+  function handleStreamPayload(event) {
+    applyState(JSON.parse(event.data));
+    updateStatus('online', 'Live', 'Connected to /api/v1/stream for live updates.');
+  }
+
   function connectStream() {
     if (!window.EventSource) {
       startFallbackPolling();
@@ -2193,10 +2296,8 @@ const DASHBOARD_JS: &str = r#"
       stopFallbackPolling();
       updateStatus('online', 'Live', 'Connected to /api/v1/stream for live updates.');
     };
-    stream.onmessage = (event) => {
-      applyState(JSON.parse(event.data));
-      updateStatus('online', 'Live', 'Connected to /api/v1/stream for live updates.');
-    };
+    stream.onmessage = handleStreamPayload;
+    stream.addEventListener('state', handleStreamPayload);
     stream.onerror = () => {
       if (stream) {
         stream.close();
@@ -2236,7 +2337,8 @@ mod tests {
 
     use crate::{
         config::ObservabilityConfig,
-        orchestrator::{Orchestrator, PollingSnapshot, SnapshotCounts, TokenSnapshot},
+        issue::Issue,
+        orchestrator::{IssueDetail, Orchestrator, PollingSnapshot, SnapshotCounts, TokenSnapshot},
         workflow::WorkflowStore,
     };
 
@@ -2300,8 +2402,60 @@ mod tests {
         let payload = sample_payload();
         let html = render_dashboard_html(&payload);
         assert!(html.contains("new EventSource('/api/v1/stream')"));
+        assert!(html.contains("stream.addEventListener('state', handleStreamPayload);"));
+        assert!(html.contains("\"generated_at\":\"2026-03-11T00:00:00Z\""));
+        assert!(!html.contains("&quot;generated_at&quot;"));
         assert!(html.contains("window.setInterval(updateRuntimeClocks, 1000)"));
         assert!(!html.contains("window.location.reload"));
+    }
+
+    #[test]
+    fn dashboard_html_mentions_todoist_task_links_and_metadata() {
+        let html = render_dashboard_html(&sample_payload());
+        assert!(html.contains("Open task"));
+        assert!(html.contains("Project board"));
+        assert!(html.contains("Due "));
+        assert!(html.contains("Deadline "));
+    }
+
+    #[test]
+    fn present_issue_detail_includes_todoist_tracked_metadata() {
+        let payload = super::Presenter::present_issue_detail(IssueDetail {
+            issue_identifier: "TD-123".to_string(),
+            issue_id: Some("123".to_string()),
+            status: "running".to_string(),
+            tracked_issue: Some(Issue {
+                id: "123".to_string(),
+                identifier: "TD-123".to_string(),
+                title: "Ship Todoist-native dashboard".to_string(),
+                state: "In Progress".to_string(),
+                url: Some("https://app.todoist.com/app/task/123".to_string()),
+                labels: vec!["frontend".to_string(), "todoist".to_string()],
+                project_id: Some("proj-1".to_string()),
+                due: Some(json!({"date": "2026-03-12", "string": "tomorrow"})),
+                deadline: Some(json!({"date": "2026-03-14"})),
+                ..Issue::default()
+            }),
+            workspace: crate::orchestrator::WorkspaceDetail {
+                path: "/tmp/symphony/TD-123".to_string(),
+            },
+            attempts: crate::orchestrator::AttemptDetail {
+                restart_count: 0,
+                current_retry_attempt: None,
+            },
+            running: None,
+            retry: None,
+            recent_events: Vec::new(),
+            last_error: None,
+        });
+
+        assert_eq!(payload.tracked["title"], "Ship Todoist-native dashboard");
+        assert_eq!(
+            payload.tracked["project_url"],
+            "https://app.todoist.com/app/project/proj-1"
+        );
+        assert_eq!(payload.tracked["labels"][0], "frontend");
+        assert_eq!(payload.tracked["due"]["date"], "2026-03-12");
     }
 
     #[test]
@@ -2457,6 +2611,14 @@ mod tests {
             humanize_blocking_reason("workflow_front_matter_not_a_map"),
             "workflow front matter must decode to a map"
         );
+        assert_eq!(
+            humanize_blocking_reason("todoist_comments_unavailable"),
+            "Todoist comments are unavailable on this account"
+        );
+        assert_eq!(
+            humanize_blocking_reason("todoist_project_not_found proj-123"),
+            "configured Todoist project was not found"
+        );
     }
 
     #[tokio::test]
@@ -2541,7 +2703,13 @@ mod tests {
             running: vec![RunningEntryPayload {
                 issue_id: "issue-123".to_string(),
                 issue_identifier: "ABC-123".to_string(),
+                title: "Review Todoist-native observability".to_string(),
                 state: "In Progress".to_string(),
+                url: Some("https://app.todoist.com/app/task/issue-123".to_string()),
+                project_url: Some("https://app.todoist.com/app/project/proj".to_string()),
+                labels: vec!["frontend".to_string(), "todoist".to_string()],
+                due: Some(json!({"date": "2026-03-12", "string": "tomorrow"})),
+                deadline: Some(json!({"date": "2026-03-14"})),
                 session_id: Some("sess-123".to_string()),
                 app_server_pid: Some(4242),
                 turn_count: 2,

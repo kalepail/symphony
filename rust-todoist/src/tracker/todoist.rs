@@ -554,12 +554,6 @@ impl TrackerClient for TodoistTracker {
             .await)
     }
 
-    async fn raw_graphql(&self, _query: &str, _variables: Value) -> Result<Value, TrackerError> {
-        Err(TrackerError::TrackerOperationUnsupported(
-            "raw_graphql".to_string(),
-        ))
-    }
-
     async fn get_current_user(&self) -> Result<Value, TrackerError> {
         self.request_json(Method::GET, "/user", None, None).await
     }

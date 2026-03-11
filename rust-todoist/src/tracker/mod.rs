@@ -60,11 +60,6 @@ pub trait TrackerClient: Send + Sync {
             "fetch_open_issues".to_string(),
         ))
     }
-    async fn raw_graphql(&self, _query: &str, _variables: Value) -> Result<Value, TrackerError> {
-        Err(TrackerError::TrackerOperationUnsupported(
-            "raw_graphql".to_string(),
-        ))
-    }
     async fn get_current_user(&self) -> Result<Value, TrackerError> {
         Err(TrackerError::TrackerOperationUnsupported(
             "get_current_user".to_string(),

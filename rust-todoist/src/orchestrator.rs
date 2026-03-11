@@ -79,6 +79,7 @@ struct RetryEntry {
     attempt: u32,
     due_at: Instant,
     identifier: String,
+    tracked_issue: Option<Issue>,
     error: Option<String>,
     cancel: CancellationToken,
 }
@@ -112,7 +113,13 @@ pub struct SnapshotCounts {
 pub struct RunningSnapshot {
     pub issue_id: String,
     pub issue_identifier: String,
+    pub title: String,
     pub state: String,
+    pub url: Option<String>,
+    pub project_id: Option<String>,
+    pub labels: Vec<String>,
+    pub due: Option<Value>,
+    pub deadline: Option<Value>,
     pub session_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -160,6 +167,7 @@ pub struct IssueDetail {
     pub issue_identifier: String,
     pub issue_id: Option<String>,
     pub status: String,
+    pub tracked_issue: Option<Issue>,
     pub workspace: WorkspaceDetail,
     pub attempts: AttemptDetail,
     pub running: Option<RunningDetail>,
@@ -665,6 +673,7 @@ async fn reconcile_stalled_runs(
                 1
             };
             let identifier = running.identifier.clone();
+            let tracked_issue = running.issue.clone();
             terminate_running_issue(state, issue_id.clone(), false, workflow_store).await;
             schedule_retry(
                 tx,
@@ -672,6 +681,7 @@ async fn reconcile_stalled_runs(
                 issue_id.clone(),
                 next_attempt,
                 identifier,
+                Some(tracked_issue),
                 Some(format!("stalled for {elapsed_ms}ms without codex activity")),
                 false,
             );
@@ -907,6 +917,7 @@ fn handle_worker_exit(
                 issue_id.to_string(),
                 1,
                 running.identifier.clone(),
+                Some(running.issue.clone()),
                 None,
                 true,
             );
@@ -927,6 +938,7 @@ fn handle_worker_exit(
                 issue_id.to_string(),
                 attempt,
                 running.identifier.clone(),
+                Some(running.issue.clone()),
                 Some(error.clone()),
                 false,
             );
@@ -999,6 +1011,7 @@ async fn handle_retry_issue_with_tracker(
                             issue.id.clone(),
                             retry_entry.attempt + 1,
                             issue.identifier.clone(),
+                            Some(issue.clone()),
                             Some("no available orchestrator slots".to_string()),
                             false,
                         );
@@ -1017,6 +1030,7 @@ async fn handle_retry_issue_with_tracker(
                 issue_id.to_string(),
                 retry_entry.attempt + 1,
                 retry_entry.identifier,
+                retry_entry.tracked_issue.clone(),
                 Some(format!("retry poll failed: {error}")),
                 false,
             );
@@ -1039,6 +1053,7 @@ fn schedule_retry(
     issue_id: String,
     attempt: u32,
     identifier: String,
+    tracked_issue: Option<Issue>,
     error: Option<String>,
     continuation: bool,
 ) {
@@ -1076,6 +1091,7 @@ fn schedule_retry(
             attempt,
             due_at: Instant::now() + Duration::from_millis(delay_ms),
             identifier: identifier.clone(),
+            tracked_issue,
             error: error.clone(),
             cancel,
         },
@@ -1194,7 +1210,13 @@ fn build_snapshot(state: &State) -> Snapshot {
             .map(|(issue_id, running)| RunningSnapshot {
                 issue_id: issue_id.clone(),
                 issue_identifier: running.identifier.clone(),
+                title: running.issue.title.clone(),
                 state: running.issue.state.clone(),
+                url: running.issue.url.clone(),
+                project_id: running.issue.project_id.clone(),
+                labels: running.issue.labels.clone(),
+                due: running.issue.due.clone(),
+                deadline: running.issue.deadline.clone(),
                 session_id: running.session_id.clone(),
                 codex_app_server_pid: running.codex_app_server_pid,
                 turn_count: running.turn_count,
@@ -1275,6 +1297,9 @@ fn build_issue_detail(
     let issue_id = running
         .map(|running| running.issue.id.clone())
         .or_else(|| retry_entry.map(|(issue_id, _)| issue_id.clone()));
+    let tracked_issue = running
+        .map(|running| running.issue.clone())
+        .or_else(|| retry.map(|retry| retry.tracked_issue.clone()).flatten());
     let status = if running.is_some() {
         "running"
     } else {
@@ -1286,6 +1311,7 @@ fn build_issue_detail(
         issue_identifier: identifier.to_string(),
         issue_id,
         status,
+        tracked_issue,
         workspace: WorkspaceDetail {
             path: workspace.display().to_string(),
         },
@@ -1588,6 +1614,7 @@ mod tests {
                 attempt: 1,
                 due_at: Instant::now(),
                 identifier: issue.identifier.clone(),
+                tracked_issue: Some(issue.clone()),
                 error: None,
                 cancel: CancellationToken::new(),
             },
@@ -1624,6 +1651,16 @@ mod tests {
                 attempt: 2,
                 due_at: Instant::now(),
                 identifier: "ABC-1".to_string(),
+                tracked_issue: Some(Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "Retry me".to_string(),
+                    state: "Rework".to_string(),
+                    labels: vec!["backend".to_string()],
+                    url: Some("https://app.todoist.com/app/task/issue-1".to_string()),
+                    project_id: Some("proj-1".to_string()),
+                    ..Issue::default()
+                }),
                 error: Some("boom".to_string()),
                 cancel: CancellationToken::new(),
             },
@@ -1631,6 +1668,13 @@ mod tests {
 
         let detail = build_issue_detail(&workflow_store, &state, "ABC-1").expect("detail");
         assert_eq!(detail.issue_id.as_deref(), Some("issue-1"));
+        assert_eq!(
+            detail
+                .tracked_issue
+                .as_ref()
+                .and_then(|issue| issue.project_id.as_deref()),
+            Some("proj-1")
+        );
     }
 
     struct StaticTracker {
@@ -1656,14 +1700,6 @@ mod tests {
             _issue_ids: &[String],
         ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
             Ok(self.by_id.clone())
-        }
-
-        async fn raw_graphql(
-            &self,
-            _query: &str,
-            _variables: serde_json::Value,
-        ) -> Result<serde_json::Value, crate::tracker::TrackerError> {
-            unreachable!()
         }
     }
 

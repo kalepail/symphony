@@ -229,12 +229,6 @@ impl TrackerClient for MemoryTracker {
         Ok(self.issues_from_state(&self.state()))
     }
 
-    async fn raw_graphql(&self, _query: &str, _variables: Value) -> Result<Value, TrackerError> {
-        Err(TrackerError::TrackerOperationUnsupported(
-            "memory tracker does not support raw_graphql".to_string(),
-        ))
-    }
-
     async fn get_current_user(&self) -> Result<Value, TrackerError> {
         Ok(self.state().current_user.clone())
     }

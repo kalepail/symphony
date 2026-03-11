@@ -1048,7 +1048,7 @@ mod tests {
     use super::{AppServerClient, CodexError, CodexEvent, extract_rate_limits, extract_usage};
 
     struct StubTracker {
-        raw_result: Result<Value, TrackerError>,
+        tool_result: Result<Value, TrackerError>,
     }
 
     #[async_trait]
@@ -1071,16 +1071,8 @@ mod tests {
             unreachable!()
         }
 
-        async fn raw_graphql(
-            &self,
-            _query: &str,
-            _variables: Value,
-        ) -> Result<Value, TrackerError> {
-            self.raw_result.clone()
-        }
-
         async fn get_current_user(&self) -> Result<Value, TrackerError> {
-            self.raw_result.clone()
+            self.tool_result.clone()
         }
     }
 
@@ -1127,7 +1119,7 @@ mod tests {
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
 
@@ -1161,7 +1153,7 @@ mod tests {
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
 
@@ -1293,7 +1285,7 @@ done
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
         let mut session = app.start_session(&workspace).await.expect("session");
@@ -1359,7 +1351,7 @@ done
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
         let mut session = app.start_session(&workspace).await.expect("session");
@@ -1427,7 +1419,7 @@ done
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
         let mut session = app.start_session(&workspace).await.expect("session");
@@ -1507,7 +1499,7 @@ done
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Ok(json!({ "data": {} })),
+                tool_result: Ok(json!({ "data": {} })),
             }),
         );
         let mut session = app.start_session(&workspace).await.expect("session");
@@ -1586,7 +1578,7 @@ done
         let app = AppServerClient::new(
             config,
             Arc::new(StubTracker {
-                raw_result: Err(TrackerError::TodoistApiRequest("boom".to_string())),
+                tool_result: Err(TrackerError::TodoistApiRequest("boom".to_string())),
             }),
         );
         let mut session = app.start_session(&workspace).await.expect("session");
