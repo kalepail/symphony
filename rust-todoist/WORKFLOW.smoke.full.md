@@ -1,8 +1,8 @@
 ---
 tracker:
-  kind: linear
-  api_key: $LINEAR_API_KEY
-  project_slug: "replace-me"
+  kind: todoist
+  api_key: $TODOIST_API_TOKEN
+  project_id: $SYMPHONY_SMOKE_PROJECT_ID
   active_states:
     - Todo
     - In Progress
@@ -20,16 +20,12 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
-    git clone --depth 1 git@github.com:your-org/your-repo.git .
-  before_remove: |
-    if [ -f rust/scripts/workspace_before_remove.sh ]; then
-      sh rust/scripts/workspace_before_remove.sh
-    fi
+    git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .
 agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=medium --model gpt-5.4 app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
@@ -38,7 +34,7 @@ server:
   port: 3000
 ---
 
-You are working on a Linear ticket `{{ issue.identifier }}`
+You are working on a Todoist task `{{ issue.identifier }}`
 
 {% if attempt %}
 Continuation context:
@@ -71,19 +67,30 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
-## Prerequisite: Linear MCP or `linear_graphql` tool is available
+## Smoke repo constraints
 
-The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
+This workflow targets `kalepail/symphony-smoke-lab`.
 
-## Linear GraphQL quick recipes
+- Default mutation target: `SMOKE_TARGET.md`.
+- Review/rework target when explicitly requested: `smoke/review-target.md`.
+- Default validation command for repo mutations: `sh scripts/validate-smoke-repo.sh`.
+- Pull request titles should begin with `[smoke]`.
+- Do not edit CI or workflow files in the smoke repo unless the issue explicitly asks for that path.
 
-When the session includes `linear_graphql`, prefer these exact narrow operations instead of exploratory searches:
+## Prerequisite: Todoist `todoist` tool is available
 
-- Fetch the current ticket directly with `issue(id: $id)` using the human identifier (for example `SDF-6`).
-- Create/update the persistent workpad comment with `commentCreate(input: { issueId: $issueId, body: $body })` and `commentUpdate(id: $commentId, input: { body: $body })`.
-- Resolve the destination workflow state by querying `issue(id: $id) { team { states { nodes { id name type } } } }`.
-- Move the issue with `issueUpdate(id: $id, input: { stateId: $stateId })`.
-- Keep each tool call to a single operation and avoid broad schema introspection or search queries unless these direct recipes fail.
+The agent should be able to talk to Todoist through the injected `todoist` tool. If it is unavailable, stop and ask the user to configure the Todoist-backed runtime correctly.
+
+## Todoist tool quick recipes
+
+When the session includes `todoist`, prefer these exact narrow operations instead of exploratory searches:
+
+- Derive the raw Todoist task id by stripping the `TD-` prefix from `{{ issue.identifier }}`.
+- Fetch the current task with `{"action":"get_task","task_id":"<task-id>"}`.
+- Find or reuse the persistent workpad comment with `{"action":"list_comments","task_id":"<task-id>"}`, then write it with `create_comment` or `update_comment`.
+- Resolve active workflow states by calling `{"action":"list_sections"}` for the configured project and matching by exact section name.
+- Move between active states with `{"action":"move_task","task_id":"<task-id>","section_id":"<section-id>"}` and use `{"action":"close_task","task_id":"<task-id>"}` for the final `Done` transition.
+- Keep each `todoist` call to one narrow operation and avoid broad listing calls unless these direct recipes fail.
 
 ## Default posture
 
@@ -92,22 +99,21 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
-- Treat a single persistent Linear comment as the source of truth for progress.
+- Treat a single persistent Todoist comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
-  file a separate Linear issue instead of expanding scope. The follow-up issue
+  create a separate Todoist task instead of expanding scope. The follow-up task
   must include a clear title, description, and acceptance criteria, be placed in
-  `Backlog`, be assigned to the same project as the current issue, link the
-  current issue as `related`, and use `blockedBy` when the follow-up depends on
-  the current issue.
+  the same project as the current task, and reference the current task in the
+  description because Todoist does not provide native related/blocker links.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
 
 ## Related skills
 
-- `linear`: interact with Linear.
+- `todoist`: interact with Todoist through the injected dynamic tool.
 - `commit`: produce clean, logical commits during implementation.
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
@@ -126,7 +132,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 
 ## Step 0: Determine current ticket state and route
 
-1. Fetch the issue by explicit ticket ID with `issue(id: "<ticket-identifier>")`.
+1. Derive the raw Todoist task id by stripping the `TD-` prefix from `{{ issue.identifier }}`, then fetch it with `{"action":"get_task","task_id":"<task-id>"}`.
 2. Read the current state.
 3. Route to the matching flow:
    - `Backlog` -> do not modify issue content/state; stop and wait for human to move it to `Todo`.
@@ -141,7 +147,8 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
 5. For `Todo` tickets, do startup sequencing in this exact order:
-   - `update_issue(..., state: "In Progress")`
+   - resolve the `In Progress` section id with `list_sections`
+   - `move_task(..., section_id: "<in-progress-section-id>")`
    - find/create `## Codex Workpad` bootstrap comment
    - only then begin analysis/planning/implementation work.
 6. Add a short comment if state and issue content are inconsistent, then proceed with the safest flow.
@@ -163,7 +170,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 5.  Ensure the workpad includes a compact environment stamp at the top as a code fence line:
     - Format: `<host>:<abs-workdir>@<short-sha>`
     - Example: `devbox-01:/home/dev-user/code/symphony-workspaces/MT-32@7bdde33bc`
-    - Do not include metadata already inferable from Linear issue fields (`issue ID`, `status`, `branch`, `PR link`).
+    - Do not include metadata already inferable from Todoist task fields (`task ID`, `status`, `branch`, `PR link`).
 6.  Add explicit acceptance criteria and TODOs in checklist form in the same comment.
     - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
     - If changes touch app files or app behavior, add explicit app-specific flow checks to `Acceptance Criteria` in the workpad (for example: launch path, changed interaction path, and expected result path).
@@ -318,7 +325,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - If issue state is `Backlog`, do not modify it; wait for human to move to `Todo`.
 - Do not edit the issue body/description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
-- If comment editing is unavailable in-session, fall back to Linear MCP or `linear_graphql`; only report blocked if both are unavailable.
+- If comment editing is unavailable in-session, fall back to Todoist `todoist` tool actions; only report blocked if they are unavailable.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
 - If out-of-scope improvements are found, create a separate Backlog issue rather
   than expanding current scope, and include a clear

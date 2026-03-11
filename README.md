@@ -34,6 +34,12 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+For the Todoist migration planning docs, see:
+
+- [docs/linear-to-todoist-prd.md](docs/linear-to-todoist-prd.md)
+- [docs/linear-to-todoist-spec.md](docs/linear-to-todoist-spec.md)
+- [docs/todoist-rust-runtime.md](docs/todoist-rust-runtime.md)
+
 ---
 
 ## License

@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
+  alias SymphonyElixir.Codex.DynamicTool
 
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
@@ -400,7 +401,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle approval request", issue)
+      dynamic_tool_specs =
+        DynamicTool.tool_specs(github_api_available?: false)
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Handle approval request", issue, dynamic_tool_specs: dynamic_tool_specs)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
