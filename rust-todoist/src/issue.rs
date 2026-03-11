@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockerRef {
@@ -24,6 +25,18 @@ pub struct Issue {
     pub blocked_by: Vec<BlockerRef>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub is_subtask: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee_id: Option<String>,
     #[serde(default = "default_assigned_to_worker")]

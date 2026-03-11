@@ -33,6 +33,8 @@ pub enum TrackerError {
     TodoistMissingRequiredSection(String),
     #[error("todoist_comments_unavailable")]
     TodoistCommentsUnavailable,
+    #[error("todoist_reminders_unavailable")]
+    TodoistRemindersUnavailable,
     #[error("todoist_comment_too_large limit={limit} actual={actual}")]
     TodoistCommentTooLarge { limit: usize, actual: usize },
     #[error("todoist_rate_limited retry_after={retry_after:?}")]
@@ -68,6 +70,21 @@ pub trait TrackerClient: Send + Sync {
             "get_current_user".to_string(),
         ))
     }
+    async fn list_projects(&self, _arguments: Value) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "list_projects".to_string(),
+        ))
+    }
+    async fn get_project(&self, _project_id: &str) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "get_project".to_string(),
+        ))
+    }
+    async fn list_collaborators(&self, _arguments: Value) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "list_collaborators".to_string(),
+        ))
+    }
     async fn list_tasks(&self, _arguments: Value) -> Result<Value, TrackerError> {
         Err(TrackerError::TrackerOperationUnsupported(
             "list_tasks".to_string(),
@@ -86,6 +103,11 @@ pub trait TrackerClient: Send + Sync {
     async fn get_section(&self, _section_id: &str) -> Result<Value, TrackerError> {
         Err(TrackerError::TrackerOperationUnsupported(
             "get_section".to_string(),
+        ))
+    }
+    async fn list_labels(&self, _arguments: Value) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "list_labels".to_string(),
         ))
     }
     async fn list_comments(&self, _arguments: Value) -> Result<Value, TrackerError> {
@@ -130,6 +152,30 @@ pub trait TrackerClient: Send + Sync {
     async fn create_task(&self, _arguments: Value) -> Result<Value, TrackerError> {
         Err(TrackerError::TrackerOperationUnsupported(
             "create_task".to_string(),
+        ))
+    }
+    async fn list_reminders(&self, _arguments: Value) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "list_reminders".to_string(),
+        ))
+    }
+    async fn create_reminder(&self, _arguments: Value) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "create_reminder".to_string(),
+        ))
+    }
+    async fn update_reminder(
+        &self,
+        _reminder_id: &str,
+        _arguments: Value,
+    ) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "update_reminder".to_string(),
+        ))
+    }
+    async fn delete_reminder(&self, _reminder_id: &str) -> Result<Value, TrackerError> {
+        Err(TrackerError::TrackerOperationUnsupported(
+            "delete_reminder".to_string(),
         ))
     }
 }

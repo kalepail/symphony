@@ -16,7 +16,7 @@ It currently follows the same high-level operating model:
 
 This Rust port is intended for trusted environments.
 
-- Codex is launched only inside sanitized per-issue workspaces.
+- Codex is launched only inside sanitized per-task workspaces.
 - Workspace paths are validated to stay under `workspace.root`.
 - Command and file-change approvals are only auto-approved when `codex.approval_policy: never`.
 - Tool `requestUserInput` prompts are answered non-interactively so unattended runs continue, while broader MCP elicitations and extra permission requests still fail hard.
@@ -146,7 +146,7 @@ Rust now covers both observability surfaces that mattered in Elixir and exceeds 
 │ Throughput: 18.2 tps
 │ Runtime: 00:12
 │ Tokens: in 11 | out 7 | total 18
-│ Project: https://linear.app/project/proj/issues
+│ Project: https://app.todoist.com/app/project/example-123
 │ Dashboard: http://127.0.0.1:4000/
 │ Next refresh: 5s
 │ Graph: ▁▂▃▄▅▆▇█

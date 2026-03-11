@@ -46,6 +46,15 @@ Primary external sources:
 - [Todoist API v1](https://developer.todoist.com/api/v1/)
 - [Todoist API token guide](https://www.todoist.com/help/articles/find-your-api-token-Jpzx9IIlB)
 - [Todoist usage limits](https://www.todoist.com/help/articles/usage-limits-in-todoist-e5rcSY)
+- [Introduction to tasks](https://www.todoist.com/help/articles/introduction-to-tasks-080OAXric)
+- [Introduction to sub-tasks](https://www.todoist.com/help/articles/introduction-to-sub-tasks-kMamDo)
+- [Introduction to sections](https://www.todoist.com/help/articles/introduction-to-sections-rOrK0aEn)
+- [Use the board layout in Todoist](https://www.todoist.com/help/articles/use-the-board-layout-in-todoist-AiAVsyEI)
+- [Introduction to comments and file uploads](https://www.todoist.com/help/articles/introduction-to-comments-and-file-uploads-CwiA50)
+- [Introduction to labels](https://www.todoist.com/help/articles/introduction-to-labels-dSo2eE)
+- [What are reminders?](https://www.todoist.com/help/articles/what-are-reminders-Mn0qQ0hh)
+- [Collaborate with friends or family in Todoist](https://www.todoist.com/help/articles/collaborate-with-friends-or-family-in-todoist-tzkGUy)
+- [Customize views in Todoist](https://www.todoist.com/help/articles/customize-views-in-todoist-AoHhBxFdZ)
 - [Official Todoist Python SDK docs](https://doist.github.io/todoist-api-python/)
 - [Official Todoist TypeScript SDK docs](https://doist.github.io/todoist-api-typescript/)
 - [Doist/todoist-api-python](https://github.com/Doist/todoist-api-python)
@@ -270,6 +279,125 @@ Official `/sync` documentation exposes caveats that affect the migration:
 These caveats are the main reason the migration will not use `/sync` as the primary operational
 surface.
 
+## Todoist-Native Domain Model
+
+The migration target is not "Linear fields backed by Todoist storage". It is a Todoist-first model
+that preserves Symphony's orchestration goals while using Todoist's native concepts correctly.
+
+### Primary Work Item: Top-Level Task
+
+The primary Symphony unit of work is a Todoist task with `parent_id = null`.
+
+Use top-level tasks for:
+
+- independently triaged work items
+- tasks that should move through workflow sections
+- tasks that should own a PR, workpad, and review/merge lifecycle
+
+Dispatch rule for v1:
+
+- the orchestrator auto-dispatches top-level tasks by default
+- subtasks remain visible to the tool and UI, but are not auto-dispatched unless a later explicit
+  configuration adds subtask execution
+
+### Workflow Stages: Sections
+
+Sections are the native Todoist mechanism for organizing project phases, and Todoist's board view
+renders sections as columns. That maps well to Symphony workflow states.
+
+Use sections for:
+
+- `Todo`
+- `In Progress`
+- `Human Review`
+- `Rework`
+- `Merging`
+- optional open terminal lanes such as `Cancelled` or `Duplicate`
+
+Do not use labels or comments as the primary workflow-state representation.
+
+Operator recommendation:
+
+- shared Symphony Todoist projects should default to Todoist board layout so section-based
+  workflow states are visible as columns
+
+### Child Steps and Delegation: Subtasks
+
+Todoist subtasks are native child work items, not a workaround.
+
+Use subtasks when:
+
+- the current task should be decomposed into explicit child steps
+- responsibility needs to be split inside one parent deliverable
+- a follow-up is subordinate to the same parent outcome rather than a separate backlog item
+
+Do not use subtasks by default for every follow-up. A new top-level task remains the default for
+independent out-of-scope work.
+
+Implementation rule:
+
+- `create_task` with `parent_id` creates a subtask
+- `move_task` with `parent_id` reparents an existing task
+- subtasks are visible through tool actions, but the orchestrator does not auto-dispatch them in v1
+
+### Metadata and Planning: Labels, Due Dates, Deadlines, and Reminders
+
+Todoist labels are orthogonal categorization, not workflow state.
+
+Use labels for:
+
+- repo or product area tagging
+- bug or feature classification
+- risk or waiting markers
+- human routing hints that are not equivalent to ownership
+
+Todoist due dates, deadlines, and reminders are also first-class native features.
+
+Use them for:
+
+- scheduling expectations
+- reminder notifications
+- human planning metadata
+- escalation or SLA-style context
+
+Do not overload sections with these meanings.
+
+### Ownership and Collaboration: Assignee and Collaborators
+
+Assignment in Todoist is meaningful in shared projects. Todoist supports one assignee per task and
+encourages clear ownership.
+
+Use:
+
+- collaborator membership to validate assignable users
+- `assignee_id` for the single responsible individual
+- comments and subtasks for broader collaboration or delegated child work
+
+### Discussion Surfaces: Task Comments vs Project Comments
+
+Todoist has both task comments and project comments. They are not interchangeable.
+
+Use task comments for:
+
+- the Symphony workpad
+- task-specific human or agent handoff
+- PR links, review notes, and execution history for a single work item
+
+Use project comments only for:
+
+- project-level operator notes
+- cross-task administrative discussion
+
+Hard rule:
+
+- Symphony's persistent `## Codex Workpad` must always be a task comment addressed by `task_id`,
+  never a project comment addressed by `project_id`
+
+### Optional Diagnostics: Activity Log
+
+Todoist activity is useful for audit and debugging, but it is not the source of truth for the
+orchestrator. It remains optional and plan-gated.
+
 ## Current Trunk Baseline
 
 The current Rust runtime already provides the service shape that `rust-todoist/` must preserve:
@@ -447,16 +575,24 @@ and dynamic-tool needs:
 - fetch candidate issues
 - fetch issues by states
 - fetch issue states by IDs
+- list projects
 - get current user
+- list collaborators
 - list sections
+- list labels
 - get task
 - list comments
 - create comment
 - update comment
+- move task
 - update task
 - close task
 - reopen task
 - create task
+- list reminders
+- create reminder
+- update reminder
+- delete reminder
 
 `create_task` is required because the current default workflow expects follow-up work to be filed
 instead of silently dropped.
@@ -482,6 +618,15 @@ Required fields:
 - `updated_at: Option<DateTime<Utc>>`
 - `assignee_id: Option<String>`
 - `assigned_to_worker: bool`
+
+Todoist-native enrichment fields:
+
+- `project_id: String`
+- `section_id: Option<String>`
+- `parent_id: Option<String>`
+- `is_subtask: bool`
+- `due: Option<TodoistDue>`
+- `deadline: Option<TodoistDeadline>`
 
 Compatibility-only fields:
 
@@ -567,6 +712,8 @@ On startup, the Todoist tracker must perform the following bootstrap sequence:
 7. fetch project collaborators if an explicit assignee is configured or shared-project assignment
    validation is required
 8. fetch `user_plan_limits` from `/sync` and validate that comments are available
+9. record whether reminders, deadlines, and activity are available so the tool surface can
+   advertise only supported features
 
 Bootstrapping must fail fast if:
 
@@ -660,6 +807,11 @@ Official constraints:
 - comment content is limited to `15,000` characters
 - comment listing requires exactly one of `task_id` or `project_id`
 
+Task-comment rule:
+
+- the Symphony workpad always uses `task_id`
+- project comments are reserved for project-level operator notes and are not valid workpad targets
+
 Workpad algorithm:
 
 1. list comments for `task_id`
@@ -707,10 +859,37 @@ issue relation graph, but Symphony should still preserve the ability to record f
 Required behavior:
 
 - `todoist.create_task` is a first-class tool action
-- created follow-up tasks go into the same Todoist project
-- created follow-up tasks default to the configured `Todo` section when available
-- the follow-up description must include a back-reference to the originating `TD-<task_id>`
+- created follow-up work goes into the same Todoist project unless the workflow explicitly chooses a
+  different project
+- independent follow-up work defaults to a new top-level task in the configured `Todo` section when
+  available
+- follow-up work may be created as a subtask only when it is clearly a child step of the current
+  task and should remain subordinate to it
+- the follow-up description must include a short back-reference to the originating `TD-<task_id>`
 - no blocker or related graph is required in v1
+
+### Labels, Due Dates, Deadlines, and Reminders
+
+Todoist-native metadata must remain usable, not merely preserved.
+
+Rules:
+
+- labels are available to the tool and preserved in the normalized model
+- labels must not be used as the primary workflow-state mechanism
+- due dates and deadlines should be preserved on reads and writable on task mutations
+- reminders should be exposed only when the account plan supports them
+- reminder failures or lack of reminder support must not block core orchestration
+
+### Projects and Collaborators
+
+The Todoist runtime is project-scoped for orchestration, but the tool surface should still expose
+enough project context to operate natively.
+
+Rules:
+
+- project metadata is part of startup bootstrap and observability linking
+- collaborator listing is required for shared-project assignment validation
+- project comments remain available to operators, but not as the workpad substrate
 
 ### Activities and Completed Tasks
 
@@ -756,18 +935,27 @@ The Todoist runtime keeps the host-side `github_api` tool and replaces the track
 
 Required actions:
 
+- `list_projects`
+- `get_project`
 - `get_current_user`
+- `list_collaborators`
 - `list_tasks`
 - `get_task`
 - `list_sections`
 - `get_section`
+- `list_labels`
 - `list_comments`
 - `create_comment`
 - `update_comment`
+- `move_task`
 - `update_task`
 - `close_task`
 - `reopen_task`
 - `create_task`
+- `list_reminders`
+- `create_reminder`
+- `update_reminder`
+- `delete_reminder`
 
 ### Design Rules
 
@@ -785,6 +973,7 @@ Required actions:
 - defaults to the configured project unless explicitly overridden
 - supports pagination parameters where useful
 - returns normalized Todoist task data
+- may include subtasks in tool reads; orchestrator candidate selection remains top-level only
 
 `get_task`
 
@@ -795,24 +984,42 @@ Required actions:
 
 - defaults to the configured project
 
+`list_labels`
+
+- returns personal labels and preserves label names as Todoist-native metadata
+
+`list_collaborators`
+
+- defaults to the configured project
+- is required for shared-project assignment inspection
+
 `list_comments`
 
 - requires exactly one of `task_id` or `project_id`
+- task comments are the required workpad surface
+- project comments are operator-only and must not be used for the persistent workpad
 
 `create_comment`
 
 - requires `content`
 - requires exactly one of `task_id` or `project_id`
 - rejects content over `15,000` characters
+- workpad creation must target `task_id`
 
 `update_comment`
 
 - requires `comment_id`
 - enforces the same content-size bound
 
+`move_task`
+
+- supports moving a task to a different `section_id`
+- supports changing `parent_id` when explicitly reparenting into or out of a subtask relationship
+
 `update_task`
 
-- supports content, description, section, priority, assignee, and labels
+- supports content, description, section, priority, assignee, labels, due data, and deadlines where
+  the API or account permits
 
 `close_task`
 
@@ -829,9 +1036,22 @@ Required actions:
   - `description`
   - `project_id`
   - `section_id`
+  - `parent_id`
   - `priority`
   - `labels`
   - `assignee_id`
+  - `due`
+  - `deadline`
+
+`list_reminders`
+
+- optionally filters by `task_id`
+- is advertised only when reminder support is available for the configured account
+
+`create_reminder`, `update_reminder`, `delete_reminder`
+
+- are available only when reminder support is available
+- must not be required for core orchestration correctness
 
 ### Error Mapping
 
@@ -862,6 +1082,9 @@ to support at minimum:
 - `current_user`
 - `collaborators`
 - `user_plan_limits`
+- `projects`
+- `labels`
+- `reminders`
 
 ### Required Behavior
 
@@ -872,12 +1095,17 @@ At minimum:
 
 - list/get tasks
 - list/get sections
+- list projects
+- list collaborators
+- list labels
 - list/create/update comments
+- move task
 - update task
 - close task
 - reopen task
 - create task
 - get current user
+- list/create/update/delete reminders where enabled
 
 This is required so:
 
@@ -1049,14 +1277,18 @@ Required changes:
 - project lookup
 - section pagination
 - task pagination
+- top-level task vs subtask normalization
 - comment pagination
 - current-user lookup
 - collaborator lookup
+- label listing
 - plan-limit bootstrap via `/sync`
 - assignee filtering
 - per-ID refresh with bounded concurrency
 - missing-ID refresh behavior
 - comment-size enforcement
+- task-comment vs project-comment targeting
+- due, deadline, and reminder handling
 - rate-limit and `retry_after` handling
 
 ### Dynamic Tool
@@ -1065,7 +1297,11 @@ Required changes:
 - strict action validation
 - transport error mapping
 - structured JSON output
+- project, collaborator, and label actions
 - `create_task` behavior
+- `create_task` with `parent_id` behavior
+- `move_task` reparent behavior
+- reminder action gating
 - preserved `github_api` behavior alongside the tracker tool
 
 ### `memory` Tracker
@@ -1073,13 +1309,16 @@ Required changes:
 - expanded fixture parsing
 - structured Todoist action support
 - deterministic comment mutation behavior
+- deterministic task-comment vs project-comment targeting
 - deterministic section move behavior
+- deterministic parent/subtask behavior
 - deterministic close/reopen behavior
 - deterministic current-user and plan-limit behavior
 
 ### Orchestrator
 
 - candidate dispatch from active sections
+- candidate dispatch excludes subtasks by default
 - no blocker gating by default
 - startup cleanup using open project items
 - running reconciliation for:
@@ -1105,7 +1344,8 @@ Required changes:
 
 - Todoist workflow sample renders correctly
 - continuation copy is tracker-neutral or Todoist-first
-- workpad marker reuse works with Todoist comments
+- workpad marker reuse works with Todoist task comments
+- default workflow explains when to create a top-level task vs a subtask
 - workpad compaction prevents oversized comments
 - default workflow no longer contains unsupported tracker steps
 
@@ -1116,6 +1356,7 @@ Required changes:
 - item detail endpoint by synthetic identifier
 - refresh endpoint
 - Todoist task and project links
+- rendered metadata includes labels and due/deadline context where available
 - Todoist-specific blocking reasons
 
 ### Smoke and CI
@@ -1143,9 +1384,9 @@ Required changes:
 ### Phase 3. Todoist Tracker Client
 
 1. add `tracker/todoist.rs`
-2. implement project, section, task, comment, collaborator, and user reads
+2. implement project, section, task, comment, collaborator, label, reminder, and user reads
 3. implement `/sync` bootstrap for `user_plan_limits`
-4. implement update, close, reopen, and create-task mutations
+4. implement update, move, close, reopen, reminder, and create-task mutations
 5. implement bounded per-ID refresh
 
 ### Phase 4. Dynamic Tool

@@ -22,8 +22,10 @@ const GITHUB_API_TOOL_DESCRIPTION: &str = concat!(
 );
 const TODOIST_TOOL_DESCRIPTION: &str = concat!(
     "Execute a structured Todoist API action using Symphony's configured tracker auth.\n",
-    "Supported actions: get_current_user, list_tasks, get_task, list_sections, get_section, ",
-    "list_comments, create_comment, update_comment, update_task, move_task, close_task, reopen_task, create_task.\n",
+    "Supported actions: list_projects, get_project, get_current_user, list_collaborators, ",
+    "list_tasks, get_task, list_sections, get_section, list_labels, list_comments, create_comment, ",
+    "update_comment, update_task, move_task, close_task, reopen_task, create_task, list_reminders, ",
+    "create_reminder, update_reminder, delete_reminder.\n",
     "Use this tool instead of raw HTTP. Keep each call narrow and specific."
 );
 
@@ -58,6 +60,10 @@ pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
                     "project_id": {
                         "type": ["string", "number", "null"],
                         "description": "Optional project identifier; defaults to tracker.project_id where applicable."
+                    },
+                    "reminder_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Reminder identifier for update_reminder and delete_reminder."
                     }
                 }
             }
@@ -148,7 +154,14 @@ async fn execute_todoist(
         })?;
 
     match action {
+        "list_projects" => tracker.list_projects(Value::Object(args)).await,
+        "get_project" => {
+            tracker
+                .get_project(&required_id(&args, "project_id")?)
+                .await
+        }
         "get_current_user" => tracker.get_current_user().await,
+        "list_collaborators" => tracker.list_collaborators(Value::Object(args)).await,
         "list_tasks" => tracker.list_tasks(Value::Object(args)).await,
         "get_task" => tracker.get_task(&required_id(&args, "task_id")?).await,
         "list_sections" => tracker.list_sections(Value::Object(args)).await,
@@ -157,6 +170,7 @@ async fn execute_todoist(
                 .get_section(&required_id(&args, "section_id")?)
                 .await
         }
+        "list_labels" => tracker.list_labels(Value::Object(args)).await,
         "list_comments" => tracker.list_comments(Value::Object(args)).await,
         "create_comment" => tracker.create_comment(Value::Object(args)).await,
         "update_comment" => {
@@ -176,6 +190,19 @@ async fn execute_todoist(
         "close_task" => tracker.close_task(&required_id(&args, "task_id")?).await,
         "reopen_task" => tracker.reopen_task(&required_id(&args, "task_id")?).await,
         "create_task" => tracker.create_task(Value::Object(args)).await,
+        "list_reminders" => tracker.list_reminders(Value::Object(args)).await,
+        "create_reminder" => tracker.create_reminder(Value::Object(args)).await,
+        "update_reminder" => {
+            let reminder_id = required_id(&args, "reminder_id")?;
+            tracker
+                .update_reminder(&reminder_id, Value::Object(args))
+                .await
+        }
+        "delete_reminder" => {
+            tracker
+                .delete_reminder(&required_id(&args, "reminder_id")?)
+                .await
+        }
         other => Err(TrackerError::TrackerOperationUnsupported(format!(
             "unsupported todoist action `{other}`"
         ))),
@@ -417,6 +444,11 @@ fn tool_error_payload(error: TrackerError) -> Value {
                 "message": "Todoist comments are unavailable for this account or plan."
             }
         }),
+        TrackerError::TodoistRemindersUnavailable => json!({
+            "error": {
+                "message": "Todoist reminders are unavailable for this account or plan."
+            }
+        }),
         TrackerError::TodoistCommentTooLarge { limit, actual } => json!({
             "error": {
                 "message": format!("Todoist comment content exceeds the {limit}-character limit."),
@@ -475,5 +507,211 @@ fn tool_error_payload(error: TrackerError) -> Value {
                 "reason": error
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use crate::{
+        config::ServiceConfig,
+        issue::Issue,
+        tracker::{TrackerClient, TrackerError},
+    };
+
+    use super::{TODOIST_TOOL, execute, tool_specs};
+
+    struct StubTodoistTracker;
+
+    #[async_trait]
+    impl TrackerClient for StubTodoistTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn list_projects(&self, _arguments: Value) -> Result<Value, TrackerError> {
+            Ok(json!({ "results": [{"id": "proj-1"}], "next_cursor": null }))
+        }
+
+        async fn get_project(&self, project_id: &str) -> Result<Value, TrackerError> {
+            Ok(json!({ "id": project_id, "name": "Project" }))
+        }
+
+        async fn create_reminder(&self, arguments: Value) -> Result<Value, TrackerError> {
+            Ok(json!({ "created": true, "task_id": arguments["task_id"] }))
+        }
+
+        async fn update_reminder(
+            &self,
+            reminder_id: &str,
+            arguments: Value,
+        ) -> Result<Value, TrackerError> {
+            Ok(
+                json!({ "updated": true, "id": reminder_id, "minute_offset": arguments["minute_offset"] }),
+            )
+        }
+
+        async fn delete_reminder(&self, reminder_id: &str) -> Result<Value, TrackerError> {
+            Ok(json!({ "deleted": true, "id": reminder_id }))
+        }
+    }
+
+    struct ReminderErrorTracker;
+
+    #[async_trait]
+    impl TrackerClient for ReminderErrorTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn create_reminder(&self, _arguments: Value) -> Result<Value, TrackerError> {
+            Err(TrackerError::TodoistRemindersUnavailable)
+        }
+    }
+
+    fn test_config() -> ServiceConfig {
+        ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config")
+    }
+
+    fn payload_body(result: &Value) -> Value {
+        let text = result["contentItems"][0]["text"].as_str().expect("text");
+        serde_json::from_str(text).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn tool_specs_describe_expanded_todoist_surface() {
+        let specs = tool_specs(&test_config());
+        let todoist = specs
+            .into_iter()
+            .find(|spec| spec["name"] == TODOIST_TOOL)
+            .expect("todoist tool");
+        let description = todoist["description"].as_str().expect("description");
+
+        assert!(description.contains("list_projects"));
+        assert!(description.contains("list_collaborators"));
+        assert!(description.contains("list_labels"));
+        assert!(description.contains("create_reminder"));
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_routes_project_and_reminder_actions() {
+        let config = test_config();
+        let tracker = StubTodoistTracker;
+
+        let projects = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "list_projects"}),
+        )
+        .await;
+        assert!(projects["success"].as_bool().expect("success"));
+        assert_eq!(payload_body(&projects)["results"][0]["id"], "proj-1");
+
+        let project = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "get_project", "project_id": "proj-9"}),
+        )
+        .await;
+        assert_eq!(payload_body(&project)["id"], "proj-9");
+
+        let reminder = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "update_reminder", "reminder_id": "rem-1", "minute_offset": 15}),
+        )
+        .await;
+        assert_eq!(payload_body(&reminder)["id"], "rem-1");
+
+        let deleted = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "delete_reminder", "reminder_id": "rem-2"}),
+        )
+        .await;
+        assert_eq!(payload_body(&deleted)["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_maps_reminder_availability_errors() {
+        let config = test_config();
+        let tracker = ReminderErrorTracker;
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "create_reminder", "task_id": "task-1"}),
+        )
+        .await;
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "Todoist reminders are unavailable for this account or plan."
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_requires_reminder_id_for_update() {
+        let config = test_config();
+        let tracker = StubTodoistTracker;
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "update_reminder", "minute_offset": 10}),
+        )
+        .await;
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "`todoist.reminder_id` is required"
+        );
     }
 }

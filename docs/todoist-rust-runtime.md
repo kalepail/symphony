@@ -45,6 +45,14 @@ Official Todoist references:
 - [Todoist API v1](https://developer.todoist.com/api/v1/)
 - [Find your API token](https://www.todoist.com/help/articles/find-your-api-token-Jpzx9IIlB)
 - [Usage limits in Todoist](https://www.todoist.com/help/articles/usage-limits-in-todoist-e5rcSY)
+- [Introduction to tasks](https://www.todoist.com/help/articles/introduction-to-tasks-080OAXric)
+- [Introduction to sub-tasks](https://www.todoist.com/help/articles/introduction-to-sub-tasks-kMamDo)
+- [Introduction to sections](https://www.todoist.com/help/articles/introduction-to-sections-rOrK0aEn)
+- [Use the board layout in Todoist](https://www.todoist.com/help/articles/use-the-board-layout-in-todoist-AiAVsyEI)
+- [Introduction to comments and file uploads](https://www.todoist.com/help/articles/introduction-to-comments-and-file-uploads-CwiA50)
+- [Introduction to labels](https://www.todoist.com/help/articles/introduction-to-labels-dSo2eE)
+- [What are reminders?](https://www.todoist.com/help/articles/what-are-reminders-Mn0qQ0hh)
+- [Collaborate with friends or family in Todoist](https://www.todoist.com/help/articles/collaborate-with-friends-or-family-in-todoist-tzkGUy)
 - [Official Todoist Python SDK docs](https://doist.github.io/todoist-api-python/)
 - [Official Todoist TypeScript SDK docs](https://doist.github.io/todoist-api-typescript/)
 
@@ -124,6 +132,20 @@ The final spec now locks the implementation choice:
 
 ## Todoist-Native Runtime Model
 
+### Core Object Model
+
+- top-level tasks are the primary Symphony work items
+- sections are workflow lanes and map naturally to Todoist board columns
+- subtasks are real child work items for decomposition or delegated child steps, not the default
+  representation for unrelated backlog work
+- labels are orthogonal metadata, not workflow state
+- due dates, deadlines, and reminders are planning metadata that should be surfaced when available
+- assignment and collaborators define ownership in shared projects
+
+Operator recommendation:
+
+- shared Symphony Todoist projects should use Todoist board layout by default
+
 ### Tracker Contract
 
 `rust-todoist/WORKFLOW.md` should support:
@@ -151,6 +173,7 @@ tracker:
 - active workflow states -> Todoist section names
 - `Done` -> close task
 - `Cancelled` / `Duplicate` -> explicit open-task sections
+- orchestrator dispatch targets top-level tasks by default, not subtasks
 
 ### Identifier Model
 
@@ -166,6 +189,11 @@ Preserve the single persistent comment model with:
 
 - marker header: `## Codex Workpad`
 - optional secondary marker: `<!-- symphony:workpad -->`
+
+Hard rule:
+
+- the workpad is always a task comment addressed by `task_id`
+- project comments remain available only for project-level operator discussion
 
 Because Todoist comments are limited to 15,000 characters, `rust-todoist/` must use bounded
 workpad compaction rather than append-only growth.
@@ -213,14 +241,19 @@ assignee semantics differ on shared vs non-shared projects.
 
 Preserve `github_api` and replace `linear_graphql` with a structured `todoist` tool covering:
 
+- list/get projects
 - get current user
+- list collaborators
 - list/get tasks
 - list/get sections
+- list labels
 - list/create/update comments
+- move task
 - update task
 - close task
 - reopen task
-- create task for follow-up work
+- create task for follow-up work or subtasks via `parent_id`
+- list/create/update/delete reminders when the account plan supports reminders
 
 ## Recommended Migration Shape
 
