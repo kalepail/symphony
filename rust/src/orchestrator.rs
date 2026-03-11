@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::sleep,
 };
@@ -28,10 +28,12 @@ use crate::{
 #[derive(Clone)]
 pub struct OrchestratorHandle {
     tx: mpsc::Sender<Command>,
+    updates: watch::Receiver<u64>,
 }
 
 pub struct Orchestrator {
     tx: mpsc::Sender<Command>,
+    updates: watch::Receiver<u64>,
     join: JoinHandle<()>,
 }
 
@@ -112,6 +114,7 @@ pub struct RunningSnapshot {
     pub issue_identifier: String,
     pub state: String,
     pub session_id: Option<String>,
+    pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
     pub last_event: Option<String>,
     pub last_message: Option<String>,
@@ -179,6 +182,7 @@ pub struct AttemptDetail {
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningDetail {
     pub session_id: Option<String>,
+    pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
     pub state: String,
     pub started_at: DateTime<Utc>,
@@ -247,6 +251,7 @@ impl Orchestrator {
         let tracker =
             build_tracker_client(effective.config.clone()).map_err(|error| error.to_string())?;
         let (tx, mut rx) = mpsc::channel(256);
+        let (updates_tx, updates_rx) = watch::channel(0u64);
         let join_tx = tx.clone();
         let join = tokio::spawn(async move {
             let mut state = State {
@@ -255,6 +260,7 @@ impl Orchestrator {
                 max_retry_backoff_ms: effective.config.agent.max_retry_backoff_ms,
                 ..State::default()
             };
+            let mut update_version = 0u64;
 
             startup_terminal_cleanup(&workflow_store, tracker.as_ref()).await;
             schedule_tick(&join_tx, 0);
@@ -262,16 +268,26 @@ impl Orchestrator {
             while let Some(command) = rx.recv().await {
                 match command {
                     Command::Tick => {
-                        run_tick(&workflow_store, &join_tx, &mut state).await;
+                        run_tick(
+                            &workflow_store,
+                            &join_tx,
+                            &mut state,
+                            &updates_tx,
+                            &mut update_version,
+                        )
+                        .await;
                     }
                     Command::WorkerUpdate { issue_id, event } => {
                         integrate_worker_update(&mut state, &issue_id, *event);
+                        notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::WorkerExit { issue_id, result } => {
                         handle_worker_exit(&mut state, &join_tx, &issue_id, result);
+                        notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::RetryIssue { issue_id } => {
                         handle_retry_issue(&workflow_store, &join_tx, &mut state, &issue_id).await;
+                        notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::Snapshot { reply } => {
                         let _ = reply.send(build_snapshot(&state));
@@ -293,22 +309,29 @@ impl Orchestrator {
                             requested_at: Utc::now(),
                             operations: vec!["poll", "reconcile"],
                         });
+                        notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::Shutdown => {
                         shutdown_running(state.running.into_values().collect()).await;
                         shutdown_retries(state.retry_attempts.into_values().collect());
+                        notify_observers(&updates_tx, &mut update_version);
                         break;
                     }
                 }
             }
         });
 
-        Ok(Self { tx, join })
+        Ok(Self {
+            tx,
+            updates: updates_rx,
+            join,
+        })
     }
 
     pub fn handle(&self) -> OrchestratorHandle {
         OrchestratorHandle {
             tx: self.tx.clone(),
+            updates: self.updates.clone(),
         }
     }
 
@@ -319,6 +342,10 @@ impl Orchestrator {
 }
 
 impl OrchestratorHandle {
+    pub fn subscribe_observability(&self) -> watch::Receiver<u64> {
+        self.updates.clone()
+    }
+
     pub async fn snapshot(&self) -> Option<Snapshot> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -350,11 +377,18 @@ impl OrchestratorHandle {
     }
 }
 
-async fn run_tick(workflow_store: &WorkflowStore, tx: &mpsc::Sender<Command>, state: &mut State) {
+async fn run_tick(
+    workflow_store: &WorkflowStore,
+    tx: &mpsc::Sender<Command>,
+    state: &mut State,
+    updates: &watch::Sender<u64>,
+    update_version: &mut u64,
+) {
     workflow_store.refresh_if_changed();
     refresh_runtime_config(workflow_store, state);
     state.poll_check_in_progress = true;
     state.next_poll_due_at = None;
+    notify_observers(updates, update_version);
 
     reconcile_running_issues(workflow_store, tx, state).await;
 
@@ -372,6 +406,7 @@ async fn run_tick(workflow_store: &WorkflowStore, tx: &mpsc::Sender<Command>, st
                             error!("dispatch=status=blocked reason={error}");
                             schedule_next_tick(tx, state);
                             state.poll_check_in_progress = false;
+                            notify_observers(updates, update_version);
                             return;
                         }
                     };
@@ -410,6 +445,12 @@ async fn run_tick(workflow_store: &WorkflowStore, tx: &mpsc::Sender<Command>, st
 
     state.poll_check_in_progress = false;
     schedule_next_tick(tx, state);
+    notify_observers(updates, update_version);
+}
+
+fn notify_observers(updates: &watch::Sender<u64>, update_version: &mut u64) {
+    *update_version = update_version.wrapping_add(1);
+    let _ = updates.send(*update_version);
 }
 
 fn schedule_next_tick(tx: &mpsc::Sender<Command>, state: &mut State) {
@@ -1108,6 +1149,7 @@ fn build_snapshot(state: &State) -> Snapshot {
                 issue_identifier: running.identifier.clone(),
                 state: running.issue.state.clone(),
                 session_id: running.session_id.clone(),
+                codex_app_server_pid: running.codex_app_server_pid,
                 turn_count: running.turn_count,
                 last_event: running.last_codex_event.clone(),
                 last_message: running.last_codex_message.clone(),
@@ -1208,6 +1250,7 @@ fn build_issue_detail(
         },
         running: running.map(|running| RunningDetail {
             session_id: running.session_id.clone(),
+            codex_app_server_pid: running.codex_app_server_pid,
             turn_count: running.turn_count,
             state: running.issue.state.clone(),
             started_at: running.started_at,

@@ -12,6 +12,7 @@ use thiserror::Error;
 pub struct ServiceConfig {
     pub tracker: TrackerConfig,
     pub polling: PollingConfig,
+    pub observability: ObservabilityConfig,
     pub workspace: WorkspaceConfig,
     pub hooks: HookConfig,
     pub agent: AgentConfig,
@@ -34,6 +35,13 @@ pub struct TrackerConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PollingConfig {
     pub interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    pub terminal_enabled: bool,
+    pub refresh_ms: u64,
+    pub render_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +105,7 @@ impl ServiceConfig {
     pub fn from_map(config: &Map<String, Value>) -> Result<Self, ConfigError> {
         let tracker = parse_tracker_config(config.get("tracker"))?;
         let polling = parse_polling_config(config.get("polling"))?;
+        let observability = parse_observability_config(config.get("observability"))?;
         let workspace = parse_workspace_config(config.get("workspace"))?;
         let hooks = parse_hook_config(config.get("hooks"))?;
         let agent = parse_agent_config(config.get("agent"))?;
@@ -106,6 +115,7 @@ impl ServiceConfig {
         Ok(Self {
             tracker,
             polling,
+            observability,
             workspace,
             hooks,
             agent,
@@ -204,6 +214,24 @@ fn parse_polling_config(value: Option<&Value>) -> Result<PollingConfig, ConfigEr
     Ok(PollingConfig {
         interval_ms: parse_positive_u64(map.get("interval_ms"), "polling.interval_ms")?
             .unwrap_or(30_000),
+    })
+}
+
+fn parse_observability_config(value: Option<&Value>) -> Result<ObservabilityConfig, ConfigError> {
+    let map = as_object(value, "observability")?;
+    Ok(ObservabilityConfig {
+        terminal_enabled: parse_bool(
+            map.get("terminal_enabled"),
+            "observability.terminal_enabled",
+        )?
+        .unwrap_or(true),
+        refresh_ms: parse_positive_u64(map.get("refresh_ms"), "observability.refresh_ms")?
+            .unwrap_or(1_000),
+        render_interval_ms: parse_positive_u64(
+            map.get("render_interval_ms"),
+            "observability.render_interval_ms",
+        )?
+        .unwrap_or(250),
     })
 }
 
@@ -381,6 +409,19 @@ fn optional_string(value: Option<&Value>, field: &str) -> Result<Option<String>,
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.to_string())),
         _ => Err(ConfigError::Invalid(format!("{field} must be a string"))),
+    }
+}
+
+fn parse_bool(value: Option<&Value>, field: &str) -> Result<Option<bool>, ConfigError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(ConfigError::Invalid(format!("{field} must be a boolean"))),
+        },
+        _ => Err(ConfigError::Invalid(format!("{field} must be a boolean"))),
     }
 }
 
@@ -639,6 +680,34 @@ mod tests {
         assert_eq!(config.codex.turn_timeout_ms, 3_600_000);
         assert_eq!(config.codex.read_timeout_ms, 5_000);
         assert_eq!(config.codex.stall_timeout_ms, 300_000);
+        assert!(config.observability.terminal_enabled);
+        assert_eq!(config.observability.refresh_ms, 1_000);
+        assert_eq!(config.observability.render_interval_ms, 250);
+    }
+
+    #[test]
+    fn preserves_explicit_observability_values() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "observability": {
+                    "terminal_enabled": false,
+                    "refresh_ms": 2_500,
+                    "render_interval_ms": 500
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert!(!config.observability.terminal_enabled);
+        assert_eq!(config.observability.refresh_ms, 2_500);
+        assert_eq!(config.observability.render_interval_ms, 500);
     }
 
     #[test]

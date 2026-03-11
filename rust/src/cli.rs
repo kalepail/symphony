@@ -6,6 +6,7 @@ use tracing::info;
 use crate::{
     http::HttpServer,
     logging,
+    observability::TerminalDashboard,
     orchestrator::Orchestrator,
     workflow::{WorkflowError, WorkflowStore},
 };
@@ -60,11 +61,18 @@ async fn run_with_args(args: Args) -> Result<(), String> {
         }
         None => None,
     };
+    let terminal_dashboard = TerminalDashboard::start(
+        handle.clone(),
+        workflow_store.clone(),
+        startup_config.observability.clone(),
+        http.as_ref().map(HttpServer::local_addr),
+    );
 
     tokio::signal::ctrl_c()
         .await
         .map_err(|error| error.to_string())?;
 
+    terminal_dashboard.shutdown().await;
     if let Some(server) = http {
         server.abort();
     }

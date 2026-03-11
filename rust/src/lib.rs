@@ -5,6 +5,7 @@ pub mod dynamic_tool;
 pub mod http;
 pub mod issue;
 pub mod logging;
+pub mod observability;
 pub mod orchestrator;
 pub mod prompt;
 pub mod tracker;

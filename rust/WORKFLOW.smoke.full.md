@@ -273,6 +273,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
+    - Verify there is exactly one surviving open PR for the current rerun branch before handoff. If no open PR exists, or only closed PRs are attached, stay active and recreate/reopen the correct PR instead of handing off.
 12. Only then move issue to `Human Review` or the review-equivalent state.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to the review-equivalent state with the blocker brief and explicit unblock actions.
     - Exception: if GitHub publish work is blocked only by transient transport failures, keep the issue active, document the evidence in the workpad, and allow the next continuation turn to retry instead of handing off early.
@@ -294,7 +295,10 @@ Use this only when completion is blocked by missing required tools or missing au
 
 1. Treat `Rework` as a full approach reset, not incremental patching.
 2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
-3. Close the existing PR tied to the issue.
+3. Close only PRs that are truly superseded by the new rerun attempt.
+   - At most one PR may survive a rerun handoff.
+   - Preserve the newest valid open PR once it has the intended diff, passing checks, and no actionable feedback.
+   - Do not close the final good PR just because earlier rerun PRs were retired.
 4. Remove the existing `## Codex Workpad` comment from the issue.
 5. Create a fresh branch from `origin/main`.
 6. Start over from the normal kickoff flow:
@@ -308,7 +312,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Acceptance criteria and required ticket-provided validation items are complete.
 - Validation/tests are green for the latest commit.
 - PR feedback sweep is complete and no actionable comments remain.
-- PR checks are green, branch is pushed, and PR is linked on the issue.
+- PR checks are green, branch is pushed, and exactly one open PR for the current rerun is linked on the issue.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation/media requirements from Step 2 are complete.
 
@@ -316,6 +320,7 @@ Use this only when completion is blocked by missing required tools or missing au
 
 - If the branch PR is already closed/merged, do not reuse that branch or prior implementation state for continuation.
 - For closed/merged branch PRs, create a new branch from `origin/main` and restart from reproduction/planning as if starting fresh.
+- Never leave an issue in `Human Review` or `Merging` without an open PR that matches the current rerun branch. If the only linked PRs are closed, reopen the correct PR or create a fresh replacement before handoff.
 - If issue state is `Backlog`, do not modify it; wait for human to move to `Todo`.
 - Do not edit the issue body/description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.

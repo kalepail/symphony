@@ -48,18 +48,33 @@ This verifies both the `gh` path and the direct GitHub REST fallback against the
 - Minimal live smoke: [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md)
 - Full live smoke: [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md)
 
+## Observability Evidence
+
+Each live smoke should capture both operator surfaces while the run is active:
+
+- Terminal dashboard evidence:
+  - header with agents/max, runtime, tokens, project URL, and next refresh
+  - running or backoff row for the active smoke issue
+- Web dashboard evidence:
+  - live status badge connected to `/api/v1/stream`
+  - runtime and throughput cards
+  - running session row with JSON details link
+
+If the stream degrades, also capture the polling-fallback badge state. For one unavailable-path check, capture the terminal offline frame and the web fallback/offline badge behavior.
+
 ## Smoke Matrix
 
 1. `smoke-minimal`
    - Workflow: `WORKFLOW.smoke.minimal.md`
-   - Proves: live Linear polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, `linear_graphql` comment, `Done` transition, workspace cleanup
+   - Proves: live Linear polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, `linear_graphql` comment, `Done` transition, workspace cleanup, terminal/web observability during a live run
    - Expected repo effect: one appended bullet in `SMOKE_TARGET.md`
 
 2. `smoke-pr`
    - Workflow: `WORKFLOW.smoke.full.md`
    - Seed the issue in `Todo`
    - Issue body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR to the Linear issue
-  - Expected outcome: issue reaches `Human Review` with a green PR
+   - Expected outcome: issue reaches `Human Review` with a green PR
+   - Expected observability: SSE dashboard stays live during publish; terminal dashboard shows live activity and any retry pressure without flooding
 
 3. `smoke-rework`
    - Start from a `smoke-pr` PR in the team's review handoff state
@@ -110,6 +125,7 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 - Keep this repo disposable. Branch churn, PR churn, and squash merges are expected.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
+- Capture `/api/v1/state` and at least one `/api/v1/stream` event payload during full observability parity runs so API, web, and terminal evidence line up.
 - Treat one-off GitHub transport, DNS, or temporary `403` failures as transient smoke noise first; retry the failing operation, then try Symphony's host-side `github_api` tool when available, then the direct GitHub REST fallback before classifying the run as blocked.
 - Prefer Symphony's host-side `github_api` tool not only for PR creation but also for post-publish metadata writes such as adding the `symphony` label, because in-session `gh auth token` can be unavailable even when host GitHub auth is healthy.
 - Do not let a lower-privilege fallback interface redefine the primary GitHub path as permanently blocked. If `gh` has valid repo access and the failure is transient transport noise, leave the issue active and let the next continuation turn retry publish work.
