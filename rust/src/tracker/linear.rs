@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 use crate::{
@@ -209,27 +210,41 @@ impl TrackerClient for LinearTracker {
         &self,
         issue_ids: &[String],
     ) -> Result<Vec<Issue>, TrackerError> {
-        if issue_ids.is_empty() {
+        let unique_issue_ids = dedupe_issue_ids(issue_ids);
+        if unique_issue_ids.is_empty() {
             return Ok(Vec::new());
         }
         let assignee_filter = self.resolve_assignee_filter().await?;
-        let variables = json!({
-            "ids": issue_ids,
-            "first": issue_ids.len().min(PAGE_SIZE),
-            "relationFirst": PAGE_SIZE
-        });
-        let body = self.raw_graphql(QUERY_BY_IDS, variables).await?;
-        let nodes = body
-            .get("data")
-            .and_then(|data| data.get("issues"))
-            .and_then(|issues| issues.get("nodes"))
-            .and_then(Value::as_array)
-            .ok_or(TrackerError::LinearUnknownPayload)?;
+        let mut issues = Vec::new();
 
-        Ok(nodes
-            .iter()
-            .filter_map(|node| normalize_issue(node, assignee_filter.as_ref()))
-            .collect())
+        for chunk in unique_issue_ids.chunks(PAGE_SIZE) {
+            let variables = json!({
+                "ids": chunk,
+                "first": chunk.len(),
+                "relationFirst": PAGE_SIZE
+            });
+            let body = self.raw_graphql(QUERY_BY_IDS, variables).await?;
+            let nodes = body
+                .get("data")
+                .and_then(|data| data.get("issues"))
+                .and_then(|issues| issues.get("nodes"))
+                .and_then(Value::as_array)
+                .ok_or(TrackerError::LinearUnknownPayload)?;
+
+            let issues_by_id: HashMap<String, Issue> = nodes
+                .iter()
+                .filter_map(|node| normalize_issue(node, assignee_filter.as_ref()))
+                .map(|issue| (issue.id.clone(), issue))
+                .collect();
+
+            for issue_id in chunk {
+                if let Some(issue) = issues_by_id.get(issue_id) {
+                    issues.push(issue.clone());
+                }
+            }
+        }
+
+        Ok(issues)
     }
 
     async fn raw_graphql(&self, query: &str, variables: Value) -> Result<Value, TrackerError> {
@@ -402,9 +417,30 @@ fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn dedupe_issue_ids(issue_ids: &[String]) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(issue_ids.len());
+    let mut unique = Vec::with_capacity(issue_ids.len());
+    for issue_id in issue_ids {
+        if seen.insert(issue_id.clone()) {
+            unique.push(issue_id.clone());
+        }
+    }
+    unique
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{
+        Json, Router, extract::State, http::StatusCode as HttpStatusCode, response::IntoResponse,
+        routing::post,
+    };
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use crate::{config::ServiceConfig, tracker::TrackerClient};
 
@@ -489,5 +525,449 @@ mod tests {
             .await
             .expect("empty result");
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_candidate_issues_preserves_pagination_order() {
+        let server = MockLinearServer::start(vec![
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "1",
+                                    "identifier": "ABC-1",
+                                    "title": "First",
+                                    "state": { "name": "Todo" },
+                                    "assignee": { "id": "user-1" },
+                                    "labels": { "nodes": [] },
+                                    "inverseRelations": { "nodes": [] }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": true,
+                                "endCursor": "cursor-1"
+                            }
+                        }
+                    }
+                }),
+            ),
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "2",
+                                    "identifier": "ABC-2",
+                                    "title": "Second",
+                                    "state": { "name": "In Progress" },
+                                    "assignee": { "id": "user-1" },
+                                    "labels": { "nodes": [] },
+                                    "inverseRelations": { "nodes": [] }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "endCursor": null
+                            }
+                        }
+                    }
+                }),
+            ),
+        ])
+        .await;
+
+        let config = test_config(
+            &server.endpoint(),
+            json!({
+                "project_slug": "proj"
+            }),
+        );
+        let tracker = LinearTracker::new(config);
+        let issues = tracker.fetch_candidate_issues().await.expect("issues");
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.identifier.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ABC-1", "ABC-2"]
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["variables"]["after"], json!(null));
+        assert_eq!(requests[1]["variables"]["after"], json!("cursor-1"));
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .expect("query")
+                .contains("slugId")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_candidate_issues_with_assignee_me_marks_only_viewer_items_dispatchable() {
+        let server = MockLinearServer::start(vec![
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "viewer": { "id": "user-me" }
+                    }
+                }),
+            ),
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "1",
+                                    "identifier": "ABC-1",
+                                    "title": "Mine",
+                                    "state": { "name": "Todo" },
+                                    "assignee": { "id": "user-me" },
+                                    "labels": { "nodes": [] },
+                                    "inverseRelations": { "nodes": [] }
+                                },
+                                {
+                                    "id": "2",
+                                    "identifier": "ABC-2",
+                                    "title": "Not mine",
+                                    "state": { "name": "Todo" },
+                                    "assignee": { "id": "user-other" },
+                                    "labels": { "nodes": [] },
+                                    "inverseRelations": { "nodes": [] }
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "endCursor": null
+                            }
+                        }
+                    }
+                }),
+            ),
+        ])
+        .await;
+
+        let config = test_config(
+            &server.endpoint(),
+            json!({
+                "project_slug": "proj",
+                "assignee": "me"
+            }),
+        );
+        let tracker = LinearTracker::new(config);
+        let issues = tracker.fetch_candidate_issues().await.expect("issues");
+
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].assigned_to_worker);
+        assert!(!issues[1].assigned_to_worker);
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .expect("query")
+                .contains("viewer")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_candidate_issues_requires_end_cursor_when_has_next_page() {
+        let server = MockLinearServer::start(vec![MockResponse::json(
+            HttpStatusCode::OK,
+            json!({
+                "data": {
+                    "issues": {
+                        "nodes": [],
+                        "pageInfo": {
+                            "hasNextPage": true,
+                            "endCursor": null
+                        }
+                    }
+                }
+            }),
+        )])
+        .await;
+
+        let config = test_config(&server.endpoint(), json!({ "project_slug": "proj" }));
+        let tracker = LinearTracker::new(config);
+        let error = tracker
+            .fetch_candidate_issues()
+            .await
+            .expect_err("missing cursor");
+
+        assert!(matches!(
+            error,
+            crate::tracker::TrackerError::LinearMissingEndCursor
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_graphql_maps_non_200_and_graphql_errors() {
+        let status_server = MockLinearServer::start(vec![MockResponse::json(
+            HttpStatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "message": "boom" }),
+        )])
+        .await;
+        let status_config =
+            test_config(&status_server.endpoint(), json!({ "project_slug": "proj" }));
+        let status_tracker = LinearTracker::new(status_config);
+        let status_error = status_tracker
+            .raw_graphql("query Test { viewer { id } }", json!({}))
+            .await
+            .expect_err("status error");
+        match status_error {
+            crate::tracker::TrackerError::LinearApiStatus { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("boom"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        status_server.abort();
+
+        let graphql_server = MockLinearServer::start(vec![MockResponse::json(
+            HttpStatusCode::OK,
+            json!({
+                "errors": [{ "message": "nope" }]
+            }),
+        )])
+        .await;
+        let graphql_config = test_config(
+            &graphql_server.endpoint(),
+            json!({ "project_slug": "proj" }),
+        );
+        let graphql_tracker = LinearTracker::new(graphql_config);
+        let graphql_error = graphql_tracker
+            .raw_graphql("query Test { viewer { id } }", json!({}))
+            .await
+            .expect_err("graphql error");
+        match graphql_error {
+            crate::tracker::TrackerError::LinearGraphqlErrors(body) => {
+                assert!(body.contains("nope"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        graphql_server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_by_ids_batches_requests_beyond_page_size() {
+        let issue_ids = (1..=55)
+            .map(|index| format!("issue-{index}"))
+            .collect::<Vec<_>>();
+        let first_batch = issue_ids[..50].to_vec();
+        let second_batch = issue_ids[50..].to_vec();
+        let issue_node = |issue_id: &str| {
+            let suffix = issue_id.trim_start_matches("issue-");
+            json!({
+                "id": issue_id,
+                "identifier": format!("ABC-{suffix}"),
+                "title": format!("Issue {suffix}"),
+                "state": { "name": "In Progress" },
+                "labels": { "nodes": [] },
+                "inverseRelations": { "nodes": [] }
+            })
+        };
+        let server = MockLinearServer::start(vec![
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": first_batch.iter().map(|issue_id| issue_node(issue_id)).collect::<Vec<_>>()
+                        }
+                    }
+                }),
+            ),
+            MockResponse::json(
+                HttpStatusCode::OK,
+                json!({
+                    "data": {
+                        "issues": {
+                            "nodes": second_batch.iter().map(|issue_id| issue_node(issue_id)).collect::<Vec<_>>()
+                        }
+                    }
+                }),
+            ),
+        ])
+        .await;
+
+        let config = test_config(&server.endpoint(), json!({ "project_slug": "proj" }));
+        let tracker = LinearTracker::new(config);
+        let issues = tracker
+            .fetch_issue_states_by_ids(&issue_ids)
+            .await
+            .expect("issues");
+
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            issue_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["variables"]["ids"], json!(first_batch));
+        assert_eq!(requests[0]["variables"]["first"], json!(50));
+        assert_eq!(requests[0]["variables"]["relationFirst"], json!(50));
+        assert_eq!(requests[1]["variables"]["ids"], json!(second_batch));
+        assert_eq!(requests[1]["variables"]["first"], json!(5));
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .expect("query")
+                .contains("SymphonyLinearIssuesById")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_candidate_issues_with_assignee_me_requires_viewer_identity() {
+        let server = MockLinearServer::start(vec![MockResponse::json(
+            HttpStatusCode::OK,
+            json!({
+                "data": {
+                    "viewer": {}
+                }
+            }),
+        )])
+        .await;
+
+        let config = test_config(
+            &server.endpoint(),
+            json!({
+                "project_slug": "proj",
+                "assignee": "me"
+            }),
+        );
+        let tracker = LinearTracker::new(config);
+        let error = tracker
+            .fetch_candidate_issues()
+            .await
+            .expect_err("missing viewer id");
+
+        assert!(matches!(
+            error,
+            crate::tracker::TrackerError::MissingViewerIdentity
+        ));
+
+        server.abort();
+    }
+
+    fn test_config(endpoint: &str, tracker_overrides: serde_json::Value) -> ServiceConfig {
+        let mut tracker = json!({
+            "kind": "linear",
+            "api_key": "token",
+            "project_slug": "proj",
+            "endpoint": endpoint
+        });
+        if let (Some(base), Some(overrides)) =
+            (tracker.as_object_mut(), tracker_overrides.as_object())
+        {
+            for (key, value) in overrides {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+
+        ServiceConfig::from_map(
+            json!({
+                "tracker": tracker
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config")
+    }
+
+    struct MockLinearServer {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        join: JoinHandle<()>,
+    }
+
+    impl MockLinearServer {
+        async fn start(responses: Vec<MockResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let app = Router::new()
+                .route("/", post(mock_linear_handler))
+                .with_state(MockLinearState {
+                    requests: Arc::clone(&requests),
+                    responses: Arc::new(Mutex::new(responses.into())),
+                });
+            let join = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+
+            Self {
+                endpoint: format!("http://{addr}/"),
+                requests,
+                join,
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            self.endpoint.clone()
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.requests.lock().expect("requests").clone()
+        }
+
+        fn abort(self) {
+            self.join.abort();
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockLinearState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        responses: Arc<Mutex<VecDeque<MockResponse>>>,
+    }
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: HttpStatusCode,
+        body: Value,
+    }
+
+    impl MockResponse {
+        fn json(status: HttpStatusCode, body: Value) -> Self {
+            Self { status, body }
+        }
+    }
+
+    async fn mock_linear_handler(
+        State(state): State<MockLinearState>,
+        Json(payload): Json<Value>,
+    ) -> impl IntoResponse {
+        state.requests.lock().expect("requests").push(payload);
+        let response = state
+            .responses
+            .lock()
+            .expect("responses")
+            .pop_front()
+            .expect("mock response");
+        (response.status, Json(response.body)).into_response()
     }
 }

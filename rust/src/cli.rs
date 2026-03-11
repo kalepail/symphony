@@ -118,11 +118,23 @@ fn acknowledgement_banner() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        env,
+        sync::{Mutex, OnceLock},
+    };
+
     use clap::Parser;
+    use tempfile::tempdir;
 
     use super::{
-        ACKNOWLEDGEMENT_FLAG, Args, acknowledgement_banner, require_guardrails_acknowledgement,
+        ACKNOWLEDGEMENT_FLAG, Args, acknowledgement_banner, default_workflow_path,
+        require_guardrails_acknowledgement, run_with_args,
     };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn acknowledgement_flag_is_required() {
@@ -154,5 +166,43 @@ mod tests {
         let banner = acknowledgement_banner();
         assert!(banner.contains("Symphony Rust is not a supported product"));
         assert!(banner.contains(ACKNOWLEDGEMENT_FLAG));
+    }
+
+    #[test]
+    fn default_workflow_path_uses_current_directory() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let previous = env::current_dir().expect("cwd");
+        env::set_current_dir(dir.path()).expect("set cwd");
+        let cwd = env::current_dir().expect("resolved cwd");
+
+        let workflow_path = default_workflow_path();
+
+        env::set_current_dir(previous).expect("restore cwd");
+        assert_eq!(workflow_path, cwd.join("WORKFLOW.md"));
+    }
+
+    #[test]
+    fn missing_default_workflow_file_fails_startup() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let previous = env::current_dir().expect("cwd");
+        env::set_current_dir(dir.path()).expect("set cwd");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(run_with_args(Args {
+            acknowledge_preview: true,
+            port: None,
+            host: None,
+            logs_root: Some(dir.path().join("logs")),
+            workflow_path: None,
+        }));
+
+        env::set_current_dir(previous).expect("restore cwd");
+        let error = result.expect_err("missing workflow");
+        assert!(error.contains("missing_workflow_file"));
     }
 }

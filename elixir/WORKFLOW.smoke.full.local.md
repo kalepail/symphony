@@ -1,8 +1,7 @@
 ---
 tracker:
   kind: linear
-  api_key: $LINEAR_API_KEY
-  project_slug: "replace-me"
+  project_slug: "83ff967bb174"
   active_states:
     - Todo
     - In Progress
@@ -17,25 +16,23 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: /Users/kalepail/tmp/elixir-symphony-workspaces
 hooks:
   after_create: |
-    git clone --depth 1 git@github.com:your-org/your-repo.git .
+    git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .
   before_remove: |
-    if [ -f rust/scripts/workspace_before_remove.sh ]; then
-      sh rust/scripts/workspace_before_remove.sh
-    fi
+    cd /Users/kalepail/Desktop/symphony/elixir && mise exec -- mix workspace.before_remove --repo kalepail/symphony-smoke-lab
 agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=medium --model gpt-5.4 app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
 server:
-  port: 3000
+  port: 3001
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
@@ -47,7 +44,7 @@ Continuation context:
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
 - Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
-{% endif %}
+  {% endif %}
 
 Issue context:
 Identifier: {{ issue.identifier }}
@@ -71,19 +68,19 @@ Instructions:
 
 Work only in the provided repository copy. Do not touch any other path.
 
+## Smoke repo constraints
+
+This workflow targets `kalepail/symphony-smoke-lab`.
+
+- Default mutation target: `SMOKE_TARGET.md`.
+- Review/rework target when explicitly requested: `smoke/review-target.md`.
+- Default validation command for repo mutations: `sh scripts/validate-smoke-repo.sh`.
+- Pull request titles should begin with `[smoke]`.
+- Do not edit CI or workflow files in the smoke repo unless the issue explicitly asks for that path.
+
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
 The agent should be able to talk to Linear, either via a configured Linear MCP server or injected `linear_graphql` tool. If none are present, stop and ask the user to configure Linear.
-
-## Linear GraphQL quick recipes
-
-When the session includes `linear_graphql`, prefer these exact narrow operations instead of exploratory searches:
-
-- Fetch the current ticket directly with `issue(id: $id)` using the human identifier (for example `SDF-6`).
-- Create/update the persistent workpad comment with `commentCreate(input: { issueId: $issueId, body: $body })` and `commentUpdate(id: $commentId, input: { body: $body })`.
-- Resolve the destination workflow state by querying `issue(id: $id) { team { states { nodes { id name type } } } }`.
-- Move the issue with `issueUpdate(id: $id, input: { stateId: $stateId })`.
-- Keep each tool call to a single operation and avoid broad schema introspection or search queries unless these direct recipes fail.
 
 ## Default posture
 
@@ -119,21 +116,21 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` (or the team's equivalent review state, such as `In Review`) -> PR is attached and validated; waiting on human approval.
+- `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` -> terminal state; no further action required.
 
 ## Step 0: Determine current ticket state and route
 
-1. Fetch the issue by explicit ticket ID with `issue(id: "<ticket-identifier>")`.
+1. Fetch the issue by explicit ticket ID.
 2. Read the current state.
 3. Route to the matching flow:
    - `Backlog` -> do not modify issue content/state; stop and wait for human to move it to `Todo`.
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` or review-equivalent state -> wait and poll for decision/review updates.
+   - `Human Review` -> wait and poll for decision/review updates.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
@@ -179,7 +176,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 
 ## PR feedback sweep protocol (required)
 
-When a ticket has an attached PR, run this protocol before moving to the team's review handoff state:
+When a ticket has an attached PR, run this protocol before moving to `Human Review`:
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
@@ -198,17 +195,7 @@ When a ticket has an attached PR, run this protocol before moving to the team's 
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
-- Treat GitHub DNS failures, connection resets, TLS/transport failures, HTTP 5xx, rate limits, and temporary `403`/abuse-protection responses as transient unless repeated evidence proves otherwise.
-- Retry transient GitHub operations at least twice with a short backoff before escalating, then retry through an alternate interface (`gh`, Symphony's host-side `github_api` tool when available, direct GitHub REST via `curl`, GitHub MCP, or direct git remote flow) before concluding the operation is blocked.
-- If `gh auth status -h github.com` is healthy and repo read operations succeed, treat `gh` as the primary GitHub interface for blocker classification.
-- If Symphony exposes a `github_api` tool, prefer it as the next publish fallback after transient `gh` transport failures because it runs host-side and avoids in-session DNS/auth drift.
-- If Symphony exposes a `github_api` tool, prefer it for post-publish GitHub metadata writes as well (labels, PR metadata refresh, and other REST mutations) because host-side auth is often available even when in-session `gh auth token` is not.
-- If `gh` transport is flaky but the `github_api` tool is unavailable, or `curl https://api.github.com/repos/<owner>/<repo>` succeeds with `GH_TOKEN`/`GITHUB_TOKEN` (or a token obtained from `gh auth token`), treat direct GitHub REST as the next publish fallback before GitHub MCP.
-- If the primary `gh` path only fails with transient transport errors, keep the ticket in its active state and let a continuation turn retry publish/review work. Do not hand the ticket off to review solely because a lower-privilege fallback interface also failed.
-- After documenting a transient GitHub publish failure and exhausting the required retry/fallback sequence, end the current turn promptly while keeping the ticket active so the next continuation turn can retry from the saved workpad state.
-- Treat GitHub MCP `403 Resource not accessible by personal access token` responses as evidence about that fallback interface only; they do not prove the primary `gh` path lacks the required permissions.
-- Never classify a GitHub blocker from a single failed command. Record the exact failing command and stderr/API response in the workpad first.
-- Do not move to `Human Review` or the review-equivalent state for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad, and the remaining blocker is a durable auth/permission problem rather than a transient transport failure.
+- Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
 - If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
@@ -229,30 +216,16 @@ Use this only when completion is blocked by missing required tools or missing au
     - Never leave completed work unchecked in the plan.
     - For tickets that started as `Todo` with an attached PR, run the full PR feedback sweep protocol immediately after kickoff and before new feature work.
 5.  Run validation/tests required for the scope.
-    - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/`Testing` requirements when present; treat unmet items as incomplete work.
+    - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
     - Prefer a targeted proof that directly demonstrates the behavior you changed.
-    - You may make temporary local proof edits to validate assumptions when this increases confidence.
+    - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
     - Revert every temporary proof edit before commit/push.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
-    - If app-touching, run runtime validation and capture supporting media when the necessary tooling is available before handoff.
+    - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
-    - If `gh pr create` fails with transient transport noise after the branch is already pushed, create the PR through Symphony's `github_api` tool when available; otherwise use direct GitHub REST before falling back to GitHub MCP.
-    - `github_api` publish fallback:
-      - create the PR with `POST /repos/<owner>/<repo>/pulls` and JSON body fields `title`, `head`, `base`, and `body`.
-      - add the `symphony` label with `POST /repos/<owner>/<repo>/issues/<pr-number>/labels` and JSON body `{ "labels": ["symphony"] }`.
-      - re-read the PR with `GET /repos/<owner>/<repo>/pulls/<pr-number>` and check status with `GET /repos/<owner>/<repo>/commits/<head-sha>/check-runs`.
-    - Direct REST publish fallback:
-      - obtain a token from `GH_TOKEN` or `GITHUB_TOKEN`; if neither is set but `gh auth token` works, export one of them and continue.
-      - create the PR with `curl` to `POST https://api.github.com/repos/<owner>/<repo>/pulls` using JSON body fields `title`, `head`, `base`, and `body`.
-      - add the `symphony` label with `POST https://api.github.com/repos/<owner>/<repo>/issues/<pr-number>/labels`.
-      - re-read the PR with `GET https://api.github.com/repos/<owner>/<repo>/pulls/<pr-number>` and check status with `GET https://api.github.com/repos/<owner>/<repo>/commits/<head-sha>/check-runs`.
     - Ensure the GitHub PR has label `symphony` (add it if missing).
-    - For label writes, try Symphony's host-side `github_api` tool first with `POST /repos/<owner>/<repo>/issues/<pr-number>/labels` and JSON body `{ "labels": ["symphony"] }`.
-    - If the host-side `github_api` tool is unavailable or the label write fails with durable host-side auth/permission evidence, retry with `gh pr edit <pr-number> --add-label symphony`, then `gh issue edit <pr-number> --add-label symphony` because the PR is also an issue.
-    - Do not treat an in-session `gh auth token` failure by itself as proof that labeling is blocked when the host-side `github_api` tool is available.
-    - Re-read PR metadata after each label attempt; only treat labeling as blocked after the retry/fallback sequence fails with documented output.
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
@@ -267,17 +240,16 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review` or the review-equivalent state.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to the review-equivalent state with the blocker brief and explicit unblock actions.
-    - Exception: if GitHub publish work is blocked only by transient transport failures, keep the issue active, document the evidence in the workpad, and allow the next continuation turn to retry instead of handing off early.
+12. Only then move issue to `Human Review`.
+    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
-    - Then move to the review-equivalent state.
+    - Then move to `Human Review`.
 
 ## Step 3: Human Review and merge handling
 
-1. When the issue is in `Human Review` or the review-equivalent state, do not code or change ticket content.
+1. When the issue is in `Human Review`, do not code or change ticket content.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
@@ -296,7 +268,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Create a new bootstrap `## Codex Workpad` comment.
    - Build a fresh plan/checklist and execute end-to-end.
 
-## Completion bar before review handoff
+## Completion bar before Human Review
 
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
 - Acceptance criteria and required ticket-provided validation items are complete.
@@ -304,7 +276,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - PR feedback sweep is complete and no actionable comments remain.
 - PR checks are green, branch is pushed, and PR is linked on the issue.
 - Required PR metadata is present (`symphony` label).
-- If app-touching, runtime validation/media requirements from Step 2 are complete.
+- If app-touching, runtime validation/media requirements from `App runtime validation (required)` are complete.
 
 ## Guardrails
 
@@ -313,15 +285,15 @@ Use this only when completion is blocked by missing required tools or missing au
 - If issue state is `Backlog`, do not modify it; wait for human to move to `Todo`.
 - Do not edit the issue body/description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
-- If comment editing is unavailable in-session, fall back to Linear MCP or `linear_graphql`; only report blocked if both are unavailable.
+- If comment editing is unavailable in-session, use the update script. Only report blocked if both MCP editing and script-based editing are unavailable.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
 - If out-of-scope improvements are found, create a separate Backlog issue rather
   than expanding current scope, and include a clear
   title/description/acceptance criteria, same-project assignment, a `related`
   link to the current issue, and `blockedBy` when the follow-up depends on the
   current issue.
-- Do not move to `Human Review` or the review-equivalent state unless the `Completion bar before review handoff` is satisfied.
-- In `Human Review` or the review-equivalent state, do not make changes; wait and poll.
+- Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
+- In `Human Review`, do not make changes; wait and poll.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

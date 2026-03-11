@@ -534,6 +534,7 @@ mod tests {
 
     use super::ServiceConfig;
     use serde_json::json;
+    use tempfile::tempdir;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -606,6 +607,71 @@ mod tests {
         assert_eq!(
             config.codex.turn_sandbox_policy.get("networkAccess"),
             Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn codex_defaults_match_spec() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.codex.approval_policy,
+            json!({
+                "reject": {
+                    "sandbox_approval": true,
+                    "rules": true,
+                    "mcp_elicitations": true
+                }
+            })
+        );
+        assert_eq!(config.codex.thread_sandbox, json!("workspace-write"));
+        assert_eq!(config.codex.turn_timeout_ms, 3_600_000);
+        assert_eq!(config.codex.read_timeout_ms, 5_000);
+        assert_eq!(config.codex.stall_timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn preserves_explicit_codex_passthrough_values() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "codex": {
+                    "approval_policy": "future-policy",
+                    "thread_sandbox": "future-sandbox",
+                    "turn_sandbox_policy": {
+                        "type": "futureSandbox",
+                        "flag": true
+                    }
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.codex.approval_policy, json!("future-policy"));
+        assert_eq!(config.codex.thread_sandbox, json!("future-sandbox"));
+        assert_eq!(
+            config.codex.turn_sandbox_policy,
+            json!({
+                "type": "futureSandbox",
+                "flag": true
+            })
         );
     }
 
@@ -719,6 +785,38 @@ mod tests {
             config.tracker.project_slug.as_deref(),
             Some("proj-from-env")
         );
+
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn resolves_workspace_root_from_env_reference() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let env_name = "SYMPHONY_TEST_WORKSPACE_ROOT";
+        unsafe {
+            std::env::set_var(env_name, dir.path());
+        }
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": {
+                    "root": format!("${env_name}")
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.workspace.root, dir.path());
 
         unsafe {
             std::env::remove_var(env_name);

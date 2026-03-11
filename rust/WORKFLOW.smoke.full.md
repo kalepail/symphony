@@ -25,7 +25,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=medium --model gpt-5.4 app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
@@ -205,8 +205,11 @@ Use this only when completion is blocked by missing required tools or missing au
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
 - Treat GitHub DNS failures, connection resets, TLS/transport failures, HTTP 5xx, rate limits, and temporary `403`/abuse-protection responses as transient unless repeated evidence proves otherwise.
-- Retry transient GitHub operations at least twice with a short backoff before escalating, then retry through an alternate interface (`gh`, GitHub MCP, or direct git remote flow) before concluding the operation is blocked.
+- Retry transient GitHub operations at least twice with a short backoff before escalating, then retry through an alternate interface (`gh`, Symphony's host-side `github_api` tool when available, direct GitHub REST via `curl`, GitHub MCP, or direct git remote flow) before concluding the operation is blocked.
 - If `gh auth status -h github.com` is healthy and repo read operations succeed, treat `gh` as the primary GitHub interface for blocker classification.
+- If Symphony exposes a `github_api` tool, prefer it as the next publish fallback after transient `gh` transport failures because it runs host-side and avoids in-session DNS/auth drift.
+- If Symphony exposes a `github_api` tool, prefer it for post-publish GitHub metadata writes as well (labels, PR metadata refresh, and other REST mutations) because host-side auth is often available even when in-session `gh auth token` is not.
+- If `gh` transport is flaky but the `github_api` tool is unavailable, or `curl https://api.github.com/repos/<owner>/<repo>` succeeds with `GH_TOKEN`/`GITHUB_TOKEN` (or a token obtained from `gh auth token`), treat direct GitHub REST as the next publish fallback before GitHub MCP.
 - If the primary `gh` path only fails with transient transport errors, keep the ticket in its active state and let a continuation turn retry publish/review work. Do not hand the ticket off to review solely because a lower-privilege fallback interface also failed.
 - After documenting a transient GitHub publish failure and exhausting the required retry/fallback sequence, end the current turn promptly while keeping the ticket active so the next continuation turn can retry from the saved workpad state.
 - Treat GitHub MCP `403 Resource not accessible by personal access token` responses as evidence about that fallback interface only; they do not prove the primary `gh` path lacks the required permissions.
@@ -241,8 +244,20 @@ Use this only when completion is blocked by missing required tools or missing au
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
+    - If `gh pr create` fails with transient transport noise after the branch is already pushed, create the PR through Symphony's `github_api` tool when available; otherwise use direct GitHub REST before falling back to GitHub MCP.
+    - `github_api` publish fallback:
+      - create the PR with `POST /repos/<owner>/<repo>/pulls` and JSON body fields `title`, `head`, `base`, and `body`.
+      - add the `symphony` label with `POST /repos/<owner>/<repo>/issues/<pr-number>/labels` and JSON body `{ "labels": ["symphony"] }`.
+      - re-read the PR with `GET /repos/<owner>/<repo>/pulls/<pr-number>` and check status with `GET /repos/<owner>/<repo>/commits/<head-sha>/check-runs`.
+    - Direct REST publish fallback:
+      - obtain a token from `GH_TOKEN` or `GITHUB_TOKEN`; if neither is set but `gh auth token` works, export one of them and continue.
+      - create the PR with `curl` to `POST https://api.github.com/repos/<owner>/<repo>/pulls` using JSON body fields `title`, `head`, `base`, and `body`.
+      - add the `symphony` label with `POST https://api.github.com/repos/<owner>/<repo>/issues/<pr-number>/labels`.
+      - re-read the PR with `GET https://api.github.com/repos/<owner>/<repo>/pulls/<pr-number>` and check status with `GET https://api.github.com/repos/<owner>/<repo>/commits/<head-sha>/check-runs`.
     - Ensure the GitHub PR has label `symphony` (add it if missing).
-    - For label writes, try `gh pr edit <pr-number> --add-label symphony` first; if that fails, retry and then try `gh issue edit <pr-number> --add-label symphony` because the PR is also an issue.
+    - For label writes, try Symphony's host-side `github_api` tool first with `POST /repos/<owner>/<repo>/issues/<pr-number>/labels` and JSON body `{ "labels": ["symphony"] }`.
+    - If the host-side `github_api` tool is unavailable or the label write fails with durable host-side auth/permission evidence, retry with `gh pr edit <pr-number> --add-label symphony`, then `gh issue edit <pr-number> --add-label symphony` because the PR is also an issue.
+    - Do not treat an in-session `gh auth token` failure by itself as proof that labeling is blocked when the host-side `github_api` tool is available.
     - Re-read PR metadata after each label attempt; only treat labeling as blocked after the retry/fallback sequence fails with documented output.
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.

@@ -271,12 +271,20 @@ fn parse_workflow(raw: &str) -> Result<WorkflowDefinition, WorkflowError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        env, fs,
+        sync::{Mutex, OnceLock},
+    };
 
     use serde_json::Value;
     use tempfile::tempdir;
 
     use super::{WorkflowError, fingerprint_for, parse_workflow};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn parses_prompt_only_workflows() {
@@ -338,5 +346,66 @@ mod tests {
 
         assert_ne!(first.content_hash, second.content_hash);
         assert_eq!(first.len, second.len);
+    }
+
+    #[test]
+    fn bundled_workflows_load_successfully() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative_path in [
+            "WORKFLOW.md",
+            "WORKFLOW.local.md",
+            "WORKFLOW.smoke.full.md",
+            "WORKFLOW.smoke.minimal.md",
+        ] {
+            let workflow_path = manifest_dir.join(relative_path);
+            let loaded = super::WorkflowStore::load_path(&workflow_path).unwrap_or_else(|error| {
+                panic!("failed to load {}: {error}", workflow_path.display())
+            });
+            assert!(
+                !loaded.definition.prompt_template.is_empty(),
+                "expected non-empty prompt in {}",
+                workflow_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_workflows_are_dispatch_ready_with_test_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        let workspace_root = tempdir().expect("tempdir");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        unsafe {
+            env::set_var("LINEAR_API_KEY", "token");
+            env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
+            env::set_var("SYMPHONY_SMOKE_PROJECT_SLUG", "smoke-proj");
+        }
+
+        for relative_path in [
+            "WORKFLOW.md",
+            "WORKFLOW.local.md",
+            "WORKFLOW.smoke.full.md",
+            "WORKFLOW.smoke.minimal.md",
+        ] {
+            let workflow_path = manifest_dir.join(relative_path);
+            let loaded = super::WorkflowStore::load_path(&workflow_path).unwrap_or_else(|error| {
+                panic!("failed to load {}: {error}", workflow_path.display())
+            });
+            loaded
+                .config
+                .validate_dispatch_ready()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} should be dispatch-ready: {error}",
+                        workflow_path.display()
+                    )
+                });
+        }
+
+        unsafe {
+            env::remove_var("LINEAR_API_KEY");
+            env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+            env::remove_var("SYMPHONY_SMOKE_PROJECT_SLUG");
+        }
     }
 }

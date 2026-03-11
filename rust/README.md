@@ -105,16 +105,17 @@ Notes:
 - Optional HTTP observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now includes lightweight live polling with an online/offline status badge.
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.
 - The sample `before_remove` hook uses [`rust/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) to close open GitHub PRs for the current branch when `gh` is installed and authenticated. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
-- [`rust/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for `gh` auth, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
+- [`rust/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
+- When Symphony exposes the host-side `github_api` tool, prefer it for both PR creation and post-publish metadata writes such as applying the `symphony` label. This avoids the in-session `gh auth token` drift that can appear even when host GitHub auth is healthy.
 
 ## Canonical Linear Workflow
 
-For parity with the original Elixir implementation and the root [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the recommended Linear board layout is:
+For parity with the original Elixir implementation and the root [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the dedicated smoke workflow now uses this Linear board layout:
 
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
 
-`Human Review`, `Rework`, and `Merging` are part of the original workflow contract, not optional naming flourishes. If a team currently uses `In Review` instead of `Human Review`, treat that as a temporary compatibility mapping rather than the canonical target layout.
+`Human Review`, `Rework`, and `Merging` are part of the original workflow contract, not optional naming flourishes. Compatibility mappings such as `In Review` remain supported for migration, but parity smokes should use the canonical state names above.
 
 ## Testing
 
