@@ -18,7 +18,9 @@ pub struct Issue {
     pub state: String,
     pub branch_name: Option<String>,
     pub url: Option<String>,
+    #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
     pub blocked_by: Vec<BlockerRef>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,

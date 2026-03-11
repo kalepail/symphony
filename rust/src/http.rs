@@ -166,10 +166,17 @@ impl HttpServer {
 
 fn app_router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(dashboard))
-        .route("/api/v1/state", get(api_state))
-        .route(ISSUE_ROUTE, get(api_issue))
-        .route("/api/v1/refresh", post(api_refresh))
+        .route("/", get(dashboard).fallback(api_method_not_allowed))
+        .route(
+            "/api/v1/state",
+            get(api_state).fallback(api_method_not_allowed),
+        )
+        .route(ISSUE_ROUTE, get(api_issue).fallback(api_method_not_allowed))
+        .route(
+            "/api/v1/refresh",
+            post(api_refresh).fallback(api_method_not_allowed),
+        )
+        .fallback(api_not_found)
         .with_state(state)
 }
 
@@ -221,6 +228,22 @@ async fn api_refresh(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+async fn api_method_not_allowed() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(json!({ "error": { "code": "method_not_allowed", "message": "Method not allowed" } })),
+    )
+        .into_response()
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": { "code": "not_found", "message": "Route not found" } })),
+    )
+        .into_response()
 }
 
 fn state_payload(snapshot: Snapshot, workflow_store: &WorkflowStore) -> StatePayload {
@@ -1604,6 +1627,69 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload["queued"], true);
         assert_eq!(payload["operations"], json!(["poll", "reconcile"]));
+
+        orchestrator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn api_refresh_rejects_get_with_method_not_allowed_payload() {
+        let (orchestrator, workflow_store) = test_runtime(false).await;
+        let app = app_router(AppState {
+            orchestrator: orchestrator.handle(),
+            workflow_store: workflow_store.clone(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
+
+        orchestrator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn api_unknown_route_returns_not_found_payload() {
+        let (orchestrator, workflow_store) = test_runtime(false).await;
+        let app = app_router(AppState {
+            orchestrator: orchestrator.handle(),
+            workflow_store: workflow_store.clone(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/does/not/exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["error"]["code"], "not_found");
 
         orchestrator.shutdown().await;
     }

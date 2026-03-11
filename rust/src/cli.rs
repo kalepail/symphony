@@ -109,7 +109,7 @@ fn acknowledgement_banner() -> String {
     content.extend(
         lines
             .iter()
-            .map(|line| format!("│ {} │", format!("{line:<width$}", width = width))),
+            .map(|line| format!("│ {line:<width$} │", width = width)),
     );
     content.push(spacer);
     content.push(bottom);

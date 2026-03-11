@@ -13,6 +13,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 const DEFAULT_LOG_RELATIVE_PATH: &str = "log/symphony.log";
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 5;
+const DEFAULT_LOG_FILTER: &str = "info";
+const SYMPHONY_LOG_TARGETS: &[&str] = &["symphony=info", "symphony_rust=info"];
 
 pub fn init(logs_root: Option<&Path>) -> Result<PathBuf, String> {
     let logs_root = match logs_root {
@@ -24,7 +26,7 @@ pub fn init(logs_root: Option<&Path>) -> Result<PathBuf, String> {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = build_filter();
     let sink = RotatingFileSink::new(log_file.clone(), DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES);
     fmt()
         .with_env_filter(filter)
@@ -44,6 +46,39 @@ pub fn default_log_file(logs_root: &Path) -> PathBuf {
 
 fn default_logs_root() -> Result<PathBuf, String> {
     env::current_dir().map_err(|error| error.to_string())
+}
+
+fn build_filter() -> EnvFilter {
+    let default_spec = build_filter_spec(None);
+    match env::var("RUST_LOG") {
+        Ok(value) => EnvFilter::try_new(build_filter_spec(Some(&value)))
+            .unwrap_or_else(|_| EnvFilter::new(default_spec)),
+        Err(_) => EnvFilter::new(default_spec),
+    }
+}
+
+fn build_filter_spec(env_spec: Option<&str>) -> String {
+    let base = env_spec
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_LOG_FILTER);
+    let mut directives = vec![base.to_string()];
+    for target in SYMPHONY_LOG_TARGETS {
+        let target_name = target.split('=').next().unwrap_or(target);
+        if !has_target_directive(base, target_name) {
+            directives.push((*target).to_string());
+        }
+    }
+
+    directives.join(",")
+}
+
+fn has_target_directive(spec: &str, target_name: &str) -> bool {
+    spec.split(',').map(str::trim).any(|directive| {
+        directive == target_name
+            || directive.starts_with(&format!("{target_name}="))
+            || directive.starts_with(&format!("{target_name}["))
+    })
 }
 
 #[derive(Clone)]
@@ -183,7 +218,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{RotatingFileSink, default_log_file};
+    use super::{RotatingFileSink, build_filter_spec, default_log_file};
 
     #[test]
     fn default_log_file_uses_log_subdirectory() {
@@ -233,5 +268,29 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).expect("current"), "bbbb");
         assert!(!path.with_extension("log.1").exists());
+    }
+
+    #[test]
+    fn build_filter_spec_keeps_symphony_targets_visible_by_default() {
+        assert_eq!(
+            build_filter_spec(None),
+            "info,symphony=info,symphony_rust=info"
+        );
+        assert_eq!(
+            build_filter_spec(Some("warn")),
+            "warn,symphony=info,symphony_rust=info"
+        );
+    }
+
+    #[test]
+    fn build_filter_spec_respects_explicit_symphony_directives() {
+        assert_eq!(
+            build_filter_spec(Some("warn,symphony=trace")),
+            "warn,symphony=trace,symphony_rust=info"
+        );
+        assert_eq!(
+            build_filter_spec(Some("warn,symphony=trace,symphony_rust=debug")),
+            "warn,symphony=trace,symphony_rust=debug"
+        );
     }
 }

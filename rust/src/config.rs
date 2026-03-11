@@ -25,6 +25,7 @@ pub struct TrackerConfig {
     pub endpoint: String,
     pub api_key: Option<String>,
     pub project_slug: Option<String>,
+    pub fixture_path: Option<PathBuf>,
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
@@ -86,6 +87,8 @@ pub enum ConfigError {
     MissingTrackerApiKey,
     #[error("missing_tracker_project_slug")]
     MissingTrackerProjectSlug,
+    #[error("missing_tracker_fixture_path")]
+    MissingTrackerFixturePath,
     #[error("missing_codex_command")]
     MissingCodexCommand,
 }
@@ -118,14 +121,21 @@ impl ServiceConfig {
             .as_deref()
             .ok_or(ConfigError::MissingTrackerKind)?;
 
-        if kind != "linear" {
-            return Err(ConfigError::UnsupportedTrackerKind(kind.to_string()));
-        }
-        if self.tracker.api_key.is_none() {
-            return Err(ConfigError::MissingTrackerApiKey);
-        }
-        if self.tracker.project_slug.is_none() {
-            return Err(ConfigError::MissingTrackerProjectSlug);
+        match kind {
+            "linear" => {
+                if self.tracker.api_key.is_none() {
+                    return Err(ConfigError::MissingTrackerApiKey);
+                }
+                if self.tracker.project_slug.is_none() {
+                    return Err(ConfigError::MissingTrackerProjectSlug);
+                }
+            }
+            "memory" => {
+                if self.tracker.fixture_path.is_none() {
+                    return Err(ConfigError::MissingTrackerFixturePath);
+                }
+            }
+            other => return Err(ConfigError::UnsupportedTrackerKind(other.to_string())),
         }
         if self.codex.command.is_empty() {
             return Err(ConfigError::MissingCodexCommand);
@@ -172,6 +182,9 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
             .unwrap_or_else(|| "https://api.linear.app/graphql".to_string()),
         api_key,
         project_slug: resolve_env_string(map.get("project_slug"), "tracker.project_slug")?,
+        fixture_path: optional_string(map.get("fixture_path"), "tracker.fixture_path")?.map(
+            |path| resolve_path_value(Some(path.as_str()), PathBuf::from("memory_issues.json")),
+        ),
         assignee,
         active_states: parse_string_list(
             map.get("active_states"),
@@ -594,6 +607,47 @@ mod tests {
             config.codex.turn_sandbox_policy.get("networkAccess"),
             Some(&json!(false))
         );
+    }
+
+    #[test]
+    fn memory_tracker_requires_fixture_path() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let error = config.validate_dispatch_ready().unwrap_err();
+        assert!(matches!(
+            error,
+            super::ConfigError::MissingTrackerFixturePath
+        ));
+    }
+
+    #[test]
+    fn memory_tracker_accepts_fixture_path() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": "/tmp/memory-tracker.json"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.tracker.fixture_path.as_deref(),
+            Some(std::path::Path::new("/tmp/memory-tracker.json"))
+        );
+        config.validate_dispatch_ready().expect("dispatch ready");
     }
 
     #[test]

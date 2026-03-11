@@ -19,8 +19,28 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - `SYMPHONY_WORKSPACE_ROOT`
 - `SYMPHONY_SMOKE_PROJECT_SLUG`
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
+- File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_SLUG` should point at a dedicated Linear project reserved for Symphony smoke runs.
+
+## Canonical Linear Columns
+
+For exact parity with the original Elixir workflow and [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the dedicated smoke Linear setup should mirror this board organization:
+
+- Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
+- Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
+
+Compatibility substitutes such as `In Review` are acceptable only as a temporary bridge while the smoke team/project is being brought into the canonical layout.
+
+## Operator Preflight
+
+Before any PR-oriented live smoke (`smoke-pr`, `smoke-rework`, `smoke-merge`, or `parity-smoke`), confirm the local GitHub CLI can see the smoke repo and required label:
+
+```bash
+sh scripts/github_publish_preflight.sh --repo kalepail/symphony-smoke-lab --label symphony
+```
+
+This does not prove PR creation will never hit a transient network error, but it catches missing `gh` auth, repo visibility issues, and missing label setup before the live run starts.
 
 ## Workflow Files
 
@@ -38,13 +58,13 @@ This document defines the live smoke matrix for the Rust runtime against the ded
    - Workflow: `WORKFLOW.smoke.full.md`
    - Seed the issue in `Todo`
    - Issue body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR to the Linear issue
-   - Expected outcome: issue reaches `Human Review` with a green PR
+   - Expected outcome: issue reaches the team's review handoff state (`Human Review` or equivalent such as `In Review`) with a green PR
 
 3. `smoke-rework`
-   - Start from a `smoke-pr` PR in `Human Review`
+   - Start from a `smoke-pr` PR in the team's review handoff state
    - Add at least one actionable PR review comment that requires a concrete repo change
    - Move the issue to `Rework`
-   - Expected outcome: the agent addresses or explicitly replies to the feedback, reruns validation, updates the PR, and returns the issue to `Human Review`
+   - Expected outcome: the agent addresses or explicitly replies to the feedback, reruns validation, updates the PR, and returns the issue to the team's review handoff state
 
 4. `smoke-merge`
    - Start from a reviewed and approved `smoke-pr`
@@ -89,3 +109,6 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 - Keep this repo disposable. Branch churn, PR churn, and squash merges are expected.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
+- Treat one-off GitHub transport, DNS, or temporary `403` failures as transient smoke noise first; retry the failing operation and an alternate GitHub interface before classifying the run as blocked.
+- Do not let a lower-privilege fallback interface redefine the primary GitHub path as permanently blocked. If `gh` has valid repo access and the failure is transient transport noise, leave the issue active and let the next continuation turn retry publish work.
+- Once the required retry/fallback evidence is captured for a transient publish failure, prefer ending the current turn and letting Symphony schedule a continuation turn rather than burning tokens in prolonged same-turn reasoning.

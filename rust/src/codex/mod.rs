@@ -1106,6 +1106,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn app_server_rejects_workspace_root_and_outside_workspace_root() {
+        let dir = tempdir().expect("tempdir");
+        let workspace_root = dir.path().join("workspaces");
+        let outside_workspace = dir.path().join("outside");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        fs::create_dir_all(&outside_workspace).expect("outside workspace");
+        let script = dir.path().join("fake-codex.sh");
+        write_executable(&script, "#!/bin/sh\nexit 0\n");
+
+        let config = sample_config(&workspace_root.join("MT-ROOT"), &script, None);
+        let app = AppServerClient::new(
+            config,
+            Arc::new(StubTracker {
+                raw_result: Ok(json!({ "data": {} })),
+            }),
+        );
+
+        let root_error = match app.start_session(&workspace_root).await {
+            Ok(_) => panic!("expected workspace root to be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(root_error, CodexError::InvalidWorkspaceCwd(_)));
+
+        let outside_error = match app.start_session(&outside_workspace).await {
+            Ok(_) => panic!("expected outside workspace to be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(outside_error, CodexError::InvalidWorkspaceCwd(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_server_rejects_symlink_escape_workspace_paths() {
+        let dir = tempdir().expect("tempdir");
+        let workspace_root = dir.path().join("workspaces");
+        let outside_workspace = dir.path().join("outside");
+        let symlink_workspace = workspace_root.join("MT-SYM");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        fs::create_dir_all(&outside_workspace).expect("outside workspace");
+        std::os::unix::fs::symlink(&outside_workspace, &symlink_workspace).expect("symlink");
+        let script = dir.path().join("fake-codex.sh");
+        write_executable(&script, "#!/bin/sh\nexit 0\n");
+
+        let config = sample_config(&workspace_root.join("MT-SYM"), &script, None);
+        let app = AppServerClient::new(
+            config,
+            Arc::new(StubTracker {
+                raw_result: Ok(json!({ "data": {} })),
+            }),
+        );
+
+        let error = match app.start_session(&symlink_workspace).await {
+            Ok(_) => panic!("expected symlink escape to be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CodexError::InvalidWorkspaceCwd(_)));
+    }
+
     #[test]
     fn ignores_unscoped_generic_usage_payloads() {
         let usage = extract_usage(&json!({

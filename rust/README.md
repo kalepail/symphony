@@ -27,6 +27,7 @@ If you need a stricter posture, tighten the Codex approval and sandbox settings 
 - `WORKFLOW.md` loader with YAML front matter, content-hash reload detection, and last-known-good fallback
 - Typed config layer with defaults, `$VAR` resolution, path normalization, and stricter validation for state limits and hook timeouts
 - Linear polling, pagination, issue-state refresh, and startup terminal cleanup
+- Optional deterministic `memory` tracker for local/system tests without live Linear
 - Workspace hooks: `after_create`, `before_run`, `after_run`, `before_remove`
 - Codex app-server client over stdio with:
   - `initialize` / `initialized` / `thread/start` / `turn/start`
@@ -91,8 +92,10 @@ No description provided.
 
 Notes:
 
-- The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the same stronger unattended workflow contract as the Elixir sample: explicit workpad discipline, PR feedback sweeps, rework/reset behavior, and a completion bar before `Human Review`.
+- The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the same stronger unattended workflow contract as the Elixir sample: explicit workpad discipline, PR feedback sweeps, rework/reset behavior, and a completion bar before the canonical review handoff state `Human Review`. Alternate review states such as `In Review` are treated as migration-compatibility shims when the exact original state layout is unavailable.
+- `tracker.kind` supports `linear` for live runs and `memory` for deterministic local/system tests backed by a fixture file.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
+- `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
@@ -100,13 +103,27 @@ Notes:
 - `linear_graphql` accepts raw GraphQL strings or `{ query, variables }` objects, includes exact `issue`/`commentCreate`/`issueUpdate` recipes in the tool description, and now preserves Linear HTTP/GraphQL error payloads in tool output so Codex can recover from validation failures.
 - Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
 - Optional HTTP observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now includes lightweight live polling with an online/offline status badge.
-- Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`.
+- Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.
 - The sample `before_remove` hook uses [`rust/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) to close open GitHub PRs for the current branch when `gh` is installed and authenticated. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
+- [`rust/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for `gh` auth, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
+
+## Canonical Linear Workflow
+
+For parity with the original Elixir implementation and the root [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the recommended Linear board layout is:
+
+- Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
+- Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
+
+`Human Review`, `Rework`, and `Merging` are part of the original workflow contract, not optional naming flourishes. If a team currently uses `In Review` instead of `Human Review`, treat that as a temporary compatibility mapping rather than the canonical target layout.
 
 ## Testing
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
+sh -n scripts/workspace_before_remove.sh
+sh -n scripts/github_publish_preflight.sh
 ```
 
 ## Live Smoke Workflows

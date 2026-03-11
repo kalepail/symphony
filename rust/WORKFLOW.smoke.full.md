@@ -125,7 +125,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `Human Review` (or the team's equivalent review state, such as `In Review`) -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` -> terminal state; no further action required.
@@ -139,7 +139,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
+   - `Human Review` or review-equivalent state -> wait and poll for decision/review updates.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
@@ -185,7 +185,7 @@ When the session includes `linear_graphql`, prefer these exact narrow operations
 
 ## PR feedback sweep protocol (required)
 
-When a ticket has an attached PR, run this protocol before moving to `Human Review`:
+When a ticket has an attached PR, run this protocol before moving to the team's review handoff state:
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
@@ -204,7 +204,14 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
-- Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
+- Treat GitHub DNS failures, connection resets, TLS/transport failures, HTTP 5xx, rate limits, and temporary `403`/abuse-protection responses as transient unless repeated evidence proves otherwise.
+- Retry transient GitHub operations at least twice with a short backoff before escalating, then retry through an alternate interface (`gh`, GitHub MCP, or direct git remote flow) before concluding the operation is blocked.
+- If `gh auth status -h github.com` is healthy and repo read operations succeed, treat `gh` as the primary GitHub interface for blocker classification.
+- If the primary `gh` path only fails with transient transport errors, keep the ticket in its active state and let a continuation turn retry publish/review work. Do not hand the ticket off to review solely because a lower-privilege fallback interface also failed.
+- After documenting a transient GitHub publish failure and exhausting the required retry/fallback sequence, end the current turn promptly while keeping the ticket active so the next continuation turn can retry from the saved workpad state.
+- Treat GitHub MCP `403 Resource not accessible by personal access token` responses as evidence about that fallback interface only; they do not prove the primary `gh` path lacks the required permissions.
+- Never classify a GitHub blocker from a single failed command. Record the exact failing command and stderr/API response in the workpad first.
+- Do not move to `Human Review` or the review-equivalent state for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad, and the remaining blocker is a durable auth/permission problem rather than a transient transport failure.
 - If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
@@ -235,6 +242,8 @@ Use this only when completion is blocked by missing required tools or missing au
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - Ensure the GitHub PR has label `symphony` (add it if missing).
+    - For label writes, try `gh pr edit <pr-number> --add-label symphony` first; if that fails, retry and then try `gh issue edit <pr-number> --add-label symphony` because the PR is also an issue.
+    - Re-read PR metadata after each label attempt; only treat labeling as blocked after the retry/fallback sequence fails with documented output.
 9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
@@ -249,16 +258,17 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
+12. Only then move issue to `Human Review` or the review-equivalent state.
+    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to the review-equivalent state with the blocker brief and explicit unblock actions.
+    - Exception: if GitHub publish work is blocked only by transient transport failures, keep the issue active, document the evidence in the workpad, and allow the next continuation turn to retry instead of handing off early.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
-    - Then move to `Human Review`.
+    - Then move to the review-equivalent state.
 
 ## Step 3: Human Review and merge handling
 
-1. When the issue is in `Human Review`, do not code or change ticket content.
+1. When the issue is in `Human Review` or the review-equivalent state, do not code or change ticket content.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
@@ -277,7 +287,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Create a new bootstrap `## Codex Workpad` comment.
    - Build a fresh plan/checklist and execute end-to-end.
 
-## Completion bar before Human Review
+## Completion bar before review handoff
 
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
 - Acceptance criteria and required ticket-provided validation items are complete.
@@ -301,8 +311,8 @@ Use this only when completion is blocked by missing required tools or missing au
   title/description/acceptance criteria, same-project assignment, a `related`
   link to the current issue, and `blockedBy` when the follow-up depends on the
   current issue.
-- Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
+- Do not move to `Human Review` or the review-equivalent state unless the `Completion bar before review handoff` is satisfied.
+- In `Human Review` or the review-equivalent state, do not make changes; wait and poll.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

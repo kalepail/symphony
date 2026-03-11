@@ -1,4 +1,5 @@
 pub mod linear;
+pub mod memory;
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ pub enum TrackerError {
     MissingTrackerApiKey,
     #[error("missing_tracker_project_slug")]
     MissingTrackerProjectSlug,
+    #[error("missing_tracker_fixture_path")]
+    MissingTrackerFixturePath,
     #[error("linear_api_request {0}")]
     LinearApiRequest(String),
     #[error("linear_api_status {status}")]
@@ -27,6 +30,12 @@ pub enum TrackerError {
     LinearMissingEndCursor,
     #[error("missing_linear_viewer_identity")]
     MissingViewerIdentity,
+    #[error("memory_fixture_io path={path} error={error}")]
+    MemoryFixtureIo { path: String, error: String },
+    #[error("memory_fixture_parse path={path} error={error}")]
+    MemoryFixtureParse { path: String, error: String },
+    #[error("tracker_operation_unsupported {0}")]
+    TrackerOperationUnsupported(String),
 }
 
 #[async_trait]
@@ -47,6 +56,7 @@ pub trait TrackerClient: Send + Sync {
 pub fn build_tracker_client(config: ServiceConfig) -> Result<Arc<dyn TrackerClient>, TrackerError> {
     match config.tracker.kind.as_deref() {
         Some("linear") => Ok(Arc::new(linear::LinearTracker::new(config))),
+        Some("memory") => Ok(Arc::new(memory::MemoryTracker::new(config))),
         Some(other) => Err(TrackerError::UnsupportedTrackerKind(other.to_string())),
         None => Err(TrackerError::UnsupportedTrackerKind(
             "<missing>".to_string(),

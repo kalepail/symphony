@@ -437,6 +437,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_path_is_deterministic_per_issue_identifier() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": { "root": dir.path() }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT/Det".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let first = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        let second = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            first.path.file_name().and_then(|name| name.to_str()),
+            Some("MT_Det")
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_empty_directory_when_no_bootstrap_hook_is_configured() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": { "root": dir.path() }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-EMPTY".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        let mut entries = tokio::fs::read_dir(&workspace.path)
+            .await
+            .expect("read dir");
+
+        assert!(entries.next_entry().await.expect("entry").is_none());
+    }
+
+    #[tokio::test]
+    async fn surfaces_after_create_hook_failures() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": { "after_create": "echo nope && exit 17" }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-FAIL".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let error = Workspace::create_for_issue(&config, &issue)
+            .await
+            .unwrap_err();
+
+        match error {
+            WorkspaceError::HookFailed {
+                hook,
+                status,
+                output,
+            } => {
+                assert_eq!(hook, "after_create");
+                assert_eq!(status, 17);
+                assert!(output.contains("nope"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_after_create_hook_timeouts() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": {
+                    "timeout_ms": 10,
+                    "after_create": "sleep 1"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-TIMEOUT".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let error = Workspace::create_for_issue(&config, &issue)
+            .await
+            .unwrap_err();
+
+        match error {
+            WorkspaceError::HookTimeout { hook, timeout_ms } => {
+                assert_eq!(hook, "after_create");
+                assert_eq!(timeout_ms, 10);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn before_remove_hook_failures_do_not_block_workspace_removal() {
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("before-remove.marker");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": {
+                    "before_remove": format!("printf 'ran' > '{}' && exit 17", marker.display())
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-BEFORE-REMOVE".to_string(),
+            title: "Title".to_string(),
+            state: "Done".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        tokio::fs::write(workspace.path.join("README.md"), "present")
+            .await
+            .expect("write");
+
+        Workspace::remove_for_identifier(&config, &issue.identifier)
+            .await
+            .expect("remove");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&marker).await.expect("marker"),
+            "ran"
+        );
+        assert!(!workspace.path.exists());
+    }
+
+    #[tokio::test]
     async fn rejects_symlink_escape() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().join("workspaces");
