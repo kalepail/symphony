@@ -453,7 +453,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
           <head>\
             <meta charset=\"utf-8\">\
             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-            <title>Symphony Observability</title>\
+            <title>Symphony Todoist Observability</title>\
             <style>{}</style>\
           </head>\
           <body>\
@@ -461,7 +461,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
               <section class=\"hero\">\
                 <div class=\"card\">\
                   <p class=\"eyebrow\">Symphony Observability</p>\
-                  <h1>Rust Operations Dashboard</h1>\
+                  <h1>Todoist Operations Dashboard</h1>\
                   <p class=\"hero-copy\">Live Todoist-native orchestration state, task metadata, retries, throughput, workflow health, and recent Codex activity for unattended runs.</p>\
                   <p class=\"meta\">Generated at <span id=\"generated-at\"></span></p>\
                   <div class=\"link-row\">\
