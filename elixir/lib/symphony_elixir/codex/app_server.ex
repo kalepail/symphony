@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
+          dynamic_tool_specs: [map()],
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -26,7 +27,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace) do
+    with {:ok, session} <- start_session(workspace, opts) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -35,20 +36,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec start_session(Path.t()) :: {:ok, session()} | {:error, term()}
-  def start_session(workspace) do
+  @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
+  def start_session(workspace, opts \\ []) do
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace),
          {:ok, port} <- start_port(expanded_workspace) do
       metadata = port_metadata(port)
+      dynamic_tool_specs = Keyword.get(opts, :dynamic_tool_specs, DynamicTool.tool_specs())
 
       with {:ok, session_policies} <- session_policies(expanded_workspace),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <-
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_specs) do
         {:ok,
          %{
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: session_policies.approval_policy == "never",
+           dynamic_tool_specs: dynamic_tool_specs,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -69,6 +73,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
+          dynamic_tool_specs: _dynamic_tool_specs,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace
@@ -229,14 +234,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_specs) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_specs)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         dynamic_tool_specs
+       ) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
@@ -244,7 +254,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => Path.expand(workspace),
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => dynamic_tool_specs
       }
     })
 
