@@ -170,7 +170,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 5.  Ensure the workpad includes a compact environment stamp at the top as a code fence line:
     - Format: `<host>:<abs-workdir>@<short-sha>`
     - Example: `devbox-01:/home/dev-user/code/symphony-workspaces/MT-32@7bdde33bc`
-    - Do not include metadata already inferable from Todoist task fields (`task ID`, `status`, `branch`, `PR link`).
+    - Do not include metadata already inferable from Todoist task fields (`task ID`, `status`, `branch`).
 6.  Add explicit acceptance criteria and TODOs in checklist form in the same comment.
     - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
     - If changes touch app files or app behavior, add explicit app-specific flow checks to `Acceptance Criteria` in the workpad (for example: launch path, changed interaction path, and expected result path).
@@ -188,7 +188,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 
 When a ticket has an attached PR, run this protocol before moving to the team's review handoff state:
 
-1. Identify the PR number from task links/attachments.
+1. Identify the PR number from the task-scoped workpad comment. If native task-link metadata is present, use it as supplemental confirmation rather than the source of truth.
 2. Gather feedback from all channels:
    - Top-level PR comments (`gh pr view --comments`).
    - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
@@ -244,7 +244,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - If app-touching, run runtime validation and capture supporting media when the necessary tooling is available before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8.  Attach PR URL to the task (prefer attachment; use the workpad comment only if attachment is unavailable).
+8.  Record the surviving PR URL in the task-scoped workpad comment. If the runtime later exposes native task-link metadata, keep that metadata aligned as supplemental evidence.
     - If `gh pr create` fails with transient transport noise after the branch is already pushed, create the PR through Symphony's `github_api` tool when available; otherwise use direct GitHub REST before falling back to GitHub MCP.
     - `github_api` publish fallback:
       - create the PR with `POST /repos/<owner>/<repo>/pulls` and JSON body fields `title`, `head`, `base`, and `body`.
@@ -264,7 +264,7 @@ Use this only when completion is blocked by missing required tools or missing au
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
     - Add final handoff notes (commit + validation summary) in the same workpad comment.
-    - Do not include PR URL in the workpad comment; keep PR linkage on the task via attachment/link fields.
+    - Keep the current surviving PR URL in the workpad comment handoff notes so the task retains a canonical PR reference inside Todoist.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
 11. Before moving to `Human Review`, poll PR feedback and checks:
@@ -313,7 +313,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Acceptance criteria and required ticket-provided validation items are complete.
 - Validation/tests are green for the latest commit.
 - PR feedback sweep is complete and no actionable comments remain.
-- PR checks are green, branch is pushed, and exactly one open PR for the current rerun is linked on the task.
+- PR checks are green, branch is pushed, and exactly one open PR for the current rerun is referenced in the workpad comment.
 - Required PR metadata is present (`symphony` label).
 - If app-touching, runtime validation/media requirements from Step 2 are complete.
 

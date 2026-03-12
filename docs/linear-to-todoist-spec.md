@@ -392,6 +392,8 @@ Hard rule:
 
 - Symphony's persistent `## Codex Workpad` must always be a task comment addressed by `task_id`,
   never a project comment addressed by `project_id`
+- until Symphony grows a first-class Todoist-native external-link field, the surviving PR URL in
+  that task-scoped workpad comment is the canonical tracker-side PR reference
 
 ### Optional Diagnostics: Activity Log
 

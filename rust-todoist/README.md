@@ -156,7 +156,7 @@ Rust now covers both observability surfaces that mattered in Elixir and exceeds 
 ### Captured Evidence: Web
 
 ```text
-Rust Operations Dashboard
+Todoist Operations Dashboard
 - Live SSE status badge with polling fallback
 - Running / Retrying / Total Tokens / Runtime cards
 - Throughput card and 10-minute graph card
