@@ -50,19 +50,19 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "type" => "inputText",
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
                "supportedTools" => ["linear_graphql"]
              }
            }
+
+    assert response["contentItems"] == [
+             %{
+               "type" => "inputText",
+               "text" => response["output"]
+             }
+           ]
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do
@@ -84,15 +84,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert_received {:linear_client_called, "query Viewer { viewer { id } }", %{"includeTeams" => false}, []}
 
     assert response["success"] == true
-
-    assert [
-             %{
-               "type" => "inputText",
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
+    assert Jason.decode!(response["output"]) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
+    assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do
@@ -157,13 +150,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => "`linear_graphql` requires a non-empty `query` string."
              }
@@ -182,14 +169,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "type" => "inputText",
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "data" => nil,
              "errors" => [%{"message" => "Unknown field `nope`"}]
            }
@@ -220,14 +200,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "type" => "inputText",
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => "`linear_graphql` requires a non-empty `query` string."
              }
@@ -257,13 +230,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => "`linear_graphql` expects either a GraphQL query string or an object with `query` and optional `variables`."
              }
@@ -282,13 +249,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => "`linear_graphql.variables` must be a JSON object when provided."
              }
@@ -305,13 +266,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert missing_token["success"] == false
 
-    assert [
-             %{
-               "text" => missing_token_text
-             }
-           ] = missing_token["contentItems"]
-
-    assert Jason.decode!(missing_token_text) == %{
+    assert Jason.decode!(missing_token["output"]) == %{
              "error" => %{
                "message" => "Symphony is missing Linear auth. Set `linear.api_key` in `WORKFLOW.md` or export `LINEAR_API_KEY`."
              }
@@ -324,13 +279,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_status, 503}} end
       )
 
-    assert [
-             %{
-               "text" => status_error_text
-             }
-           ] = status_error["contentItems"]
-
-    assert Jason.decode!(status_error_text) == %{
+    assert Jason.decode!(status_error["output"]) == %{
              "error" => %{
                "message" => "Linear GraphQL request failed with HTTP 503.",
                "status" => 503
@@ -344,13 +293,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_request, :timeout}} end
       )
 
-    assert [
-             %{
-               "text" => request_error_text
-             }
-           ] = request_error["contentItems"]
-
-    assert Jason.decode!(request_error_text) == %{
+    assert Jason.decode!(request_error["output"]) == %{
              "error" => %{
                "message" => "Linear GraphQL request failed before receiving a successful response.",
                "reason" => ":timeout"
@@ -368,13 +311,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert response["success"] == false
 
-    assert [
-             %{
-               "text" => text
-             }
-           ] = response["contentItems"]
-
-    assert Jason.decode!(text) == %{
+    assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => "Linear GraphQL tool execution failed.",
                "reason" => ":boom"
@@ -391,12 +328,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       )
 
     assert response["success"] == true
-
-    assert [
-             %{
-               "text" => ":ok"
-             }
-           ] = response["contentItems"]
+    assert response["output"] == ":ok"
   end
 
   test "github_api normalizes arguments and returns successful responses as tool text" do
