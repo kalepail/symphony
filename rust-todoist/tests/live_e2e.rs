@@ -4,7 +4,8 @@ use chrono::Utc;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use symphony_rust_todoist::{
-    orchestrator::Orchestrator, workflow::WorkflowStore, workspace::workspace_path_for_identifier,
+    orchestrator::Orchestrator, runtime_env, workflow::WorkflowStore,
+    workspace::workspace_path_for_identifier,
 };
 use tempfile::tempdir;
 use tokio::time::sleep;
@@ -14,20 +15,23 @@ const RESULT_FILE: &str = "LIVE_E2E_RESULT.txt";
 #[tokio::test]
 #[ignore = "requires live Todoist and Codex access"]
 async fn completes_a_real_todoist_task_end_to_end() {
-    if env::var("SYMPHONY_RUN_LIVE_E2E").ok().as_deref() != Some("1") {
-        eprintln!("skipping live e2e; set SYMPHONY_RUN_LIVE_E2E=1");
+    let manifest_workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("WORKFLOW.md");
+    runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
+
+    if runtime_env::get("SYMPHONY_RUN_LIVE_E2E").as_deref() != Some("1") {
+        eprintln!("skipping live e2e; set SYMPHONY_RUN_LIVE_E2E=1 in rust-todoist/.env.local or export it");
         return;
     }
 
-    let token = match env::var("TODOIST_API_TOKEN") {
-        Ok(value) if !value.trim().is_empty() => value,
+    let token = match runtime_env::get("TODOIST_API_TOKEN") {
+        Some(value) if !value.trim().is_empty() => value,
         _ => {
             eprintln!("skipping live e2e; TODOIST_API_TOKEN is missing");
             return;
         }
     };
-    let project_id = match env::var("SYMPHONY_SMOKE_PROJECT_ID") {
-        Ok(value) if !value.trim().is_empty() => value,
+    let project_id = match runtime_env::get("SYMPHONY_SMOKE_PROJECT_ID") {
+        Some(value) if !value.trim().is_empty() => value,
         _ => {
             eprintln!("skipping live e2e; SYMPHONY_SMOKE_PROJECT_ID is missing");
             return;
@@ -45,8 +49,8 @@ async fn completes_a_real_todoist_task_end_to_end() {
     );
 
     let client = Client::new();
-    let base_url = env::var("TODOIST_API_BASE_URL")
-        .unwrap_or_else(|_| "https://api.todoist.com/api/v1".to_string());
+    let base_url = runtime_env::get("TODOIST_API_BASE_URL")
+        .unwrap_or_else(|| "https://api.todoist.com/api/v1".to_string());
     let todo_section_id = todo_section_id(&client, &base_url, &token, &project_id).await;
     let run_id = format!(
         "symphony-rust-todoist-live-e2e-{}",

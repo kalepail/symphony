@@ -12,7 +12,10 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
 
-use crate::config::{ConfigError, ServiceConfig};
+use crate::{
+    config::{ConfigError, ServiceConfig},
+    runtime_env,
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkflowDefinition {
@@ -179,6 +182,7 @@ impl WorkflowStore {
     }
 
     pub fn load_path(path: &Path) -> Result<LoadedWorkflow, WorkflowError> {
+        runtime_env::load_dotenv_for_workflow(path).map_err(WorkflowError::InvalidConfig)?;
         let raw = fs::read_to_string(path).map_err(|error| WorkflowError::MissingWorkflowFile {
             path: path.to_path_buf(),
             reason: error.to_string(),
@@ -353,7 +357,6 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for relative_path in [
             "WORKFLOW.md",
-            "WORKFLOW.local.md",
             "WORKFLOW.smoke.full.md",
             "WORKFLOW.smoke.minimal.md",
         ] {
@@ -383,7 +386,6 @@ mod tests {
 
         for relative_path in [
             "WORKFLOW.md",
-            "WORKFLOW.local.md",
             "WORKFLOW.smoke.full.md",
             "WORKFLOW.smoke.minimal.md",
         ] {

@@ -32,6 +32,7 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    [Harness engineering](https://openai.com/index/harness-engineering/).
 2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
    set it as the `LINEAR_API_KEY` environment variable.
+   - For local runs, copy [`.env.example`](./.env.example) to `.env` or `.env.local`.
 3. Copy this directory's `WORKFLOW.md` to your repo.
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
@@ -74,6 +75,8 @@ Pass a custom workflow file path to `./bin/symphony` when starting the service:
 ```
 
 If no path is passed, Symphony defaults to `./WORKFLOW.md`.
+The Elixir runtime also loads `.env` and `.env.local` from the workflow directory before parsing
+`WORKFLOW.md`, with exported shell variables taking precedence.
 
 Optional flags:
 
@@ -178,7 +181,6 @@ resources and launch a real `codex app-server` session:
 
 ```bash
 cd elixir
-export LINEAR_API_KEY=...
 make e2e
 ```
 
@@ -186,6 +188,9 @@ Optional environment variables:
 
 - `SYMPHONY_LIVE_LINEAR_TEAM_KEY` defaults to `SYME2E`
 - `SYMPHONY_LIVE_SSH_WORKER_HOSTS` uses those SSH hosts when set, as a comma-separated list
+
+`make e2e` now sources `elixir/.env` and `elixir/.env.local` before checking `LINEAR_API_KEY`, so
+keeping your live Linear token in one of those files is enough for the local harness.
 
 `make e2e` runs two live scenarios:
 - one with a local worker

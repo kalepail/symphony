@@ -126,10 +126,7 @@ fn acknowledgement_banner() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        sync::{Mutex, OnceLock},
-    };
+    use std::env;
 
     use clap::Parser;
     use tempfile::tempdir;
@@ -138,11 +135,7 @@ mod tests {
         ACKNOWLEDGEMENT_FLAG, Args, acknowledgement_banner, default_workflow_path,
         require_guardrails_acknowledgement, run_with_args,
     };
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::runtime_env;
 
     #[test]
     fn acknowledgement_flag_is_required() {
@@ -178,7 +171,9 @@ mod tests {
 
     #[test]
     fn default_workflow_path_uses_current_directory() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let previous = env::current_dir().expect("cwd");
         env::set_current_dir(dir.path()).expect("set cwd");
@@ -192,7 +187,9 @@ mod tests {
 
     #[test]
     fn missing_default_workflow_file_fails_startup() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let previous = env::current_dir().expect("cwd");
         env::set_current_dir(dir.path()).expect("set cwd");
@@ -212,5 +209,98 @@ mod tests {
         env::set_current_dir(previous).expect("restore cwd");
         let error = result.expect_err("missing workflow");
         assert!(error.contains("missing_workflow_file"));
+    }
+
+    #[test]
+    fn loads_dotenv_from_workflow_directory() {
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        let dotenv_path = dir.path().join(".env");
+        std::fs::write(&workflow_path, "---\ntracker:\n  kind: linear\n---\n").expect("workflow");
+        std::fs::write(
+            &dotenv_path,
+            "LINEAR_API_KEY=dotenv-token\nSYMPHONY_WORKSPACE_ROOT=/tmp/dotenv-workspaces\n",
+        )
+        .expect("dotenv");
+        unsafe {
+            env::remove_var("LINEAR_API_KEY");
+            env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+        }
+        runtime_env::clear_for_tests();
+
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+
+        assert_eq!(
+            runtime_env::get("LINEAR_API_KEY").as_deref(),
+            Some("dotenv-token")
+        );
+        assert_eq!(
+            runtime_env::get("SYMPHONY_WORKSPACE_ROOT").as_deref(),
+            Some("/tmp/dotenv-workspaces")
+        );
+        assert!(env::var("LINEAR_API_KEY").is_err());
+        assert!(env::var("SYMPHONY_WORKSPACE_ROOT").is_err());
+
+        runtime_env::clear_for_tests();
+    }
+
+    #[test]
+    fn dotenv_local_overrides_dotenv_when_shell_env_is_absent() {
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, "---\ntracker:\n  kind: linear\n---\n").expect("workflow");
+        std::fs::write(dir.path().join(".env"), "LINEAR_API_KEY=base-token\n").expect("env");
+        std::fs::write(
+            dir.path().join(".env.local"),
+            "LINEAR_API_KEY=local-token\n",
+        )
+        .expect("env.local");
+        unsafe {
+            env::remove_var("LINEAR_API_KEY");
+        }
+        runtime_env::clear_for_tests();
+
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+
+        assert_eq!(
+            runtime_env::get("LINEAR_API_KEY").as_deref(),
+            Some("local-token")
+        );
+        assert!(env::var("LINEAR_API_KEY").is_err());
+
+        runtime_env::clear_for_tests();
+    }
+
+    #[test]
+    fn existing_shell_env_wins_over_dotenv_files() {
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, "---\ntracker:\n  kind: linear\n---\n").expect("workflow");
+        std::fs::write(dir.path().join(".env"), "LINEAR_API_KEY=dotenv-token\n").expect("env");
+        unsafe {
+            env::set_var("LINEAR_API_KEY", "shell-token");
+        }
+        runtime_env::clear_for_tests();
+
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+
+        assert_eq!(
+            runtime_env::get("LINEAR_API_KEY").as_deref(),
+            Some("shell-token")
+        );
+
+        unsafe {
+            env::remove_var("LINEAR_API_KEY");
+        }
+        runtime_env::clear_for_tests();
     }
 }

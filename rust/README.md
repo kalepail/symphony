@@ -57,6 +57,7 @@ cargo run -- --i-understand-that-this-will-be-running-without-the-usual-guardrai
 ```
 
 If no path is provided, Symphony uses `./WORKFLOW.md` from the current working directory.
+`rust/` now also loads `.env` and `.env.local` from the workflow directory before parsing `WORKFLOW.md`, with exported shell variables taking precedence. Copy [`.env.example`](./.env.example) to `.env` for local setup.
 
 Press `Ctrl+C` to stop the service.
 
@@ -181,3 +182,10 @@ Tracked live-smoke workflow files now live alongside the main workflow:
 - [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
 - [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
 - [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`.
+
+Rust's Linear smoke setup intentionally differs from Elixir's `test/symphony_elixir/live_e2e_test.exs` harness:
+
+- Rust smoke runs target a dedicated pre-seeded Linear project via `SYMPHONY_SMOKE_PROJECT_SLUG`.
+- Elixir live E2E creates a disposable Linear project and issue at runtime, so it only needs `LINEAR_API_KEY` plus an optional team override `SYMPHONY_LIVE_LINEAR_TEAM_KEY`.
+
+That means the env surfaces are different because the smoke shapes are different, not because the Linear adapter expects different core auth.

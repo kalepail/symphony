@@ -23,6 +23,8 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_SLUG` should point at a dedicated Linear project reserved for Symphony smoke runs.
+This is intentionally different from Elixir's repo-owned `live_e2e_test`, which creates a disposable
+Linear project from `SYMPHONY_LIVE_LINEAR_TEAM_KEY` instead of reusing a fixed project slug.
 
 ## Canonical Linear Columns
 

@@ -67,6 +67,7 @@ Environment files:
 - `rust-todoist/` now loads `.env` and `.env.local` from the workflow directory before parsing `WORKFLOW.md`.
 - Existing shell environment variables still win over file-loaded values.
 - `.env.local` overrides `.env` for keys that are not already exported in the shell.
+- The ignored live E2E harness reads `SYMPHONY_RUN_LIVE_E2E`, `TODOIST_API_TOKEN`, and `SYMPHONY_SMOKE_PROJECT_ID` from the same files, so you do not need separate shell exports.
 - Copy [`.env.example`](./.env.example) to `.env` for local setup.
 
 ## Configuration

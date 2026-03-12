@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::runtime_env;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub tracker: TrackerConfig,
@@ -481,10 +483,10 @@ fn parse_i64(value: Option<&Value>, field: &str) -> Result<Option<i64>, ConfigEr
 fn resolve_secret(value: Option<&Value>, env_name: &str) -> Result<Option<String>, ConfigError> {
     let value = optional_string(value, env_name)?;
     Ok(match value {
-        None => normalize_string(env::var(env_name).ok()),
+        None => normalize_string(runtime_env::get(env_name)),
         Some(value) => {
             if let Some(reference) = env_reference(&value) {
-                normalize_string(env::var(reference).ok())
+                normalize_string(runtime_env::get(reference))
             } else {
                 normalize_string(Some(value))
             }
@@ -498,7 +500,7 @@ fn resolve_env_string(value: Option<&Value>, field: &str) -> Result<Option<Strin
         None => None,
         Some(value) => {
             if let Some(reference) = env_reference(&value) {
-                normalize_string(env::var(reference).ok())
+                normalize_string(runtime_env::get(reference))
             } else {
                 normalize_string(Some(value))
             }
@@ -525,7 +527,7 @@ fn resolve_path_value(value: Option<&str>, default: PathBuf) -> PathBuf {
     let raw = value
         .and_then(|value| {
             env_reference(value)
-                .map(|name| env::var(name).ok())
+                .map(runtime_env::get)
                 .unwrap_or_else(|| Some(value.to_string()))
         })
         .filter(|value| !value.is_empty())
@@ -583,6 +585,7 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::ServiceConfig;
+    use crate::runtime_env;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -835,6 +838,51 @@ mod tests {
             Some(std::path::Path::new("/tmp/memory-tracker.json"))
         );
         config.validate_dispatch_ready().expect("dispatch ready");
+    }
+
+    #[test]
+    fn config_reads_runtime_env_overlay_without_exporting_process_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, "---\ntracker:\n  kind: linear\n---\n").expect("workflow");
+        std::fs::write(
+            dir.path().join(".env"),
+            "LINEAR_API_KEY=dotenv-token\nSYMPHONY_WORKSPACE_ROOT=/tmp/overlay-root\n",
+        )
+        .expect("dotenv");
+        unsafe {
+            std::env::remove_var("LINEAR_API_KEY");
+            std::env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+        }
+        runtime_env::clear_for_tests();
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "$LINEAR_API_KEY",
+                    "project_slug": "proj"
+                },
+                "workspace": {
+                    "root": "$SYMPHONY_WORKSPACE_ROOT"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.tracker.api_key.as_deref(), Some("dotenv-token"));
+        assert_eq!(
+            config.workspace.root,
+            std::path::Path::new("/tmp/overlay-root")
+        );
+        assert!(std::env::var("LINEAR_API_KEY").is_err());
+        assert!(std::env::var("SYMPHONY_WORKSPACE_ROOT").is_err());
+
+        runtime_env::clear_for_tests();
     }
 
     #[test]
