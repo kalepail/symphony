@@ -9,6 +9,25 @@ use thiserror::Error;
 use crate::config::ServiceConfig;
 use crate::issue::Issue;
 
+pub const TODOIST_COMMENT_SIZE_LIMIT: usize = 15_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackerCapabilities {
+    pub comments: bool,
+    pub reminders: bool,
+    pub activity_log: bool,
+}
+
+impl TrackerCapabilities {
+    pub const fn full() -> Self {
+        Self {
+            comments: true,
+            reminders: true,
+            activity_log: true,
+        }
+    }
+}
+
 #[derive(Debug, Error, Clone)]
 pub enum TrackerError {
     #[error("unsupported_tracker_kind {0}")]
@@ -56,6 +75,9 @@ pub enum TrackerError {
 
 #[async_trait]
 pub trait TrackerClient: Send + Sync {
+    async fn capabilities(&self) -> Result<TrackerCapabilities, TrackerError> {
+        Ok(TrackerCapabilities::full())
+    }
     async fn validate_startup(&self) -> Result<(), TrackerError> {
         Ok(())
     }

@@ -416,7 +416,11 @@ mod tests {
             &fixture_path,
             r#"{
   "tasks": [],
-  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"},
+    {"id":"sec-in-progress","project_id":"proj","name":"In Progress"},
+    {"id":"sec-done","project_id":"proj","name":"Done"}
+  ],
   "user_plan_limits": {"comments": true}
 }"#,
         )

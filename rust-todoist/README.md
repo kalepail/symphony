@@ -31,6 +31,7 @@ If you need a stricter posture, tighten the Codex approval and sandbox settings 
 - Todoist polling, pagination, task-state refresh, and open-project startup cleanup
 - Optional deterministic `memory` tracker for local/system tests without live Todoist
 - Workspace hooks: `after_create`, `before_run`, `after_run`, `before_remove`
+- Optional SSH worker distribution with per-host concurrency caps, retry host affinity, and remote workspace sweeping
 - Codex app-server client over stdio with:
   - `initialize` / `initialized` / `thread/start` / `turn/start`
   - separate stdout protocol parsing and stderr diagnostics
@@ -39,6 +40,7 @@ If you need a stricter posture, tighten the Codex approval and sandbox settings 
   - token and rate-limit extraction
 - Single-authority orchestrator with:
   - bounded concurrency
+  - least-loaded worker-host selection across local and SSH-backed workers
   - retry queue and exponential backoff
   - continuation retries after clean worker exit
   - reconciliation for stall detection and tracker state changes
@@ -93,6 +95,11 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+worker:
+  ssh_hosts:
+    - builder-a
+    - builder-b:2222
+  max_concurrent_agents_per_host: 2
 codex:
   command: codex app-server
 ---
@@ -116,16 +123,19 @@ Notes:
 - If `tracker.assignee` is configured, the project must support assignment and any explicit assignee id must be a valid Todoist collaborator for that shared project.
 - When `tracker.label` is configured, `todoist.create_task` automatically inherits that label so follow-up tasks stay inside the same runtime ownership boundary.
 - Top-level `todoist.create_task` calls default into the project's `Todo` section when no `section_id` is supplied. Use `parent_id` only for true subtasks.
+- `tracker.terminal_states` defaults to Todoist-native terminal names for reconciliation, but startup only requires non-`Done` terminal sections when the workflow explicitly configures them as open sections.
 - Todoist comments must be available on the connected account or plan. Symphony validates that at startup because task-scoped workpad comments are part of the core runtime contract.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
 - `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
+- `worker.ssh_hosts` enables distributed execution over SSH. When configured, Symphony picks the least-loaded host, applies `worker.max_concurrent_agents_per_host` as a per-host cap when present, preserves host affinity across retries, and sweeps stale remote workspaces during startup. Host strings may include an explicit port, for example `builder-b:2222`.
+- Remote workspace paths preserve the configured `workspace.root` string, including `~`, so operator surfaces and cleanup use the same logical path that remote hooks and Codex sessions receive.
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
 - The Rust implementation watches `WORKFLOW.md` and reloads the last good config without restart. Invalid reloads are logged and block new dispatches until fixed.
 - `todoist` exposes structured actions such as `get_task`, `list_sections`, `list_comments`, `create_project_comment`, `delete_comment`, `get_workpad`, `upsert_workpad`, `delete_workpad`, `list_tasks`, `list_activities`, `update_task`, `move_task`, and `close_task`, and preserves Todoist HTTP error payloads in tool output so Codex can recover from validation failures.
-  Task comment requests use `task_id`, while Todoist comment responses identify those same comments with `item_id`. The default workflow uses the dedicated workpad actions so the persistent `## Codex Workpad` stays on one task comment instead of drifting across multiple comments. `close_task` is guarded by Symphony and only succeeds from `Merging` after the linked GitHub PR is verified as merged.
+  Task comment requests use `task_id`, while Todoist comment responses identify those same comments with `item_id`. The default workflow uses the dedicated workpad actions so the persistent `## Codex Workpad` stays on one task comment instead of drifting across multiple comments. Equivalent duplicate workpads are repaired back to one canonical comment, oversized workpads are compacted before they hit Todoist's comment limit, and `close_task` is guarded by Symphony and only succeeds from `Merging` after the linked GitHub PR is verified as merged.
 - Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
 - Optional web observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now uses live SSE updates, keeps runtime clocks moving client-side, and falls back to `/api/v1/state` polling if the stream is unavailable. The terminal dashboard is enabled independently through `observability.terminal_enabled`.
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.

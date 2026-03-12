@@ -18,6 +18,7 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - `TODOIST_API_TOKEN`
 - `SYMPHONY_WORKSPACE_ROOT`
 - `SYMPHONY_SMOKE_PROJECT_ID`
+- For remote-worker smoke, SSH access from the Symphony host to every configured `worker.ssh_hosts` target, with the same repo/bootstrap prerequisites available on those hosts
 - If `tracker.assignee` will be set, a Todoist project that supports assignment and exposes the intended assignee as a collaborator
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
 - For the direct GitHub REST fallback, either `GH_TOKEN` / `GITHUB_TOKEN` is exported or `gh auth token` succeeds on the host
@@ -68,6 +69,7 @@ Each live smoke should capture both operator surfaces while the run is active:
   - live status badge connected to `/api/v1/stream`
   - runtime and throughput cards
   - running session row with JSON details link
+- When the run is remote, also capture the worker host and remote workspace location shown in the running session row and issue detail view
 
 If the stream degrades, also capture the polling-fallback badge state. For one unavailable-path check, capture the terminal offline frame and the web fallback/offline badge behavior.
 
@@ -108,6 +110,11 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
    - merge outcome
    - cleanup behavior, including workspace removal and disposable smoke-branch pruning
 
+6. `smoke-remote-worker`
+   - Run `WORKFLOW.smoke.full.md` or an equivalent bounded scenario with `worker.ssh_hosts` configured
+   - Expected outcome: dispatch lands on one remote worker, observability shows the selected `worker_host`, retries preserve host affinity when they occur, and remote workspace cleanup removes the remote directory after completion
+   - Expected observability: `/api/v1/state`, `/api/v1/<issue_identifier>`, and the dashboard running row all show the same worker host and logical remote workspace path
+
 ## Suggested Issue Template For `smoke-pr`
 
 Use this structure in the Todoist task description:
@@ -139,6 +146,7 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
 - Capture `/api/v1/state` and at least one `/api/v1/stream` event payload during full observability parity runs so API, web, and terminal evidence line up.
+- For remote-worker smoke, capture the selected worker host in the dashboard plus the corresponding remote workspace path before cleanup and confirm that the directory is gone after the run finishes.
 - Treat one-off GitHub transport, DNS, or temporary `403` failures as transient smoke noise first; retry the failing operation, then try Symphony's host-side `github_api` tool when available, then the direct GitHub REST fallback before classifying the run as blocked.
 - Prefer Symphony's host-side `github_api` tool not only for PR creation but also for post-publish metadata writes such as adding the `symphony` label, because in-session `gh auth token` can be unavailable even when host GitHub auth is healthy.
 - Do not let a lower-privilege fallback interface redefine the primary GitHub path as permanently blocked. If `gh` has valid repo access and the failure is transient transport noise, leave the issue active and let the next continuation turn retry publish work.

@@ -14,7 +14,7 @@ use crate::{
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
     tracker::{
-        TrackerClient, TrackerError,
+        TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
         todoist::{normalize_task, todoist_task_url},
     },
 };
@@ -276,14 +276,123 @@ impl MemoryTracker {
             Err(TrackerError::TodoistActivityLogUnavailable)
         }
     }
+
+    fn capabilities_from_state(&self, state: &MemoryState) -> TrackerCapabilities {
+        TrackerCapabilities {
+            comments: state
+                .user_plan_limits
+                .get("comments")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            reminders: state
+                .user_plan_limits
+                .get("reminders")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            activity_log: state
+                .user_plan_limits
+                .get("activity_log")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }
+    }
+
+    fn ensure_task_is_mutable_in_scope(&self, task: &Value) -> Result<(), TrackerError> {
+        let task_id = json_id(task.get("id")).unwrap_or_else(|| "unknown".to_string());
+        let configured_project_id = self.current_project_id();
+        let task_project_id = task
+            .get("project_id")
+            .and_then(json_id_from_value)
+            .ok_or_else(|| {
+                TrackerError::TrackerOperationUnsupported(format!(
+                    "Todoist task `{task_id}` is missing a project_id and cannot be mutated safely."
+                ))
+            })?;
+        if task_project_id != configured_project_id {
+            return Err(TrackerError::TrackerOperationUnsupported(format!(
+                "Todoist task `{task_id}` belongs to project `{task_project_id}`, outside configured project `{configured_project_id}`."
+            )));
+        }
+
+        if let Some(runtime_label) = self.runtime_label_filter() {
+            let in_scope = task
+                .get("labels")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|label| label.eq_ignore_ascii_case(runtime_label.as_str()))
+                });
+            if !in_scope {
+                return Err(TrackerError::TrackerOperationUnsupported(format!(
+                    "Todoist task `{task_id}` is outside runtime label scope `{runtime_label}`."
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_project_in_scope(&self, project_id: &str, action: &str) -> Result<(), TrackerError> {
+        let configured_project_id = self.current_project_id();
+        if project_id != configured_project_id {
+            return Err(TrackerError::TrackerOperationUnsupported(format!(
+                "{action} cannot target Todoist project `{project_id}` outside configured project `{configured_project_id}`."
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_section_in_scope(
+        &self,
+        state: &MemoryState,
+        section_id: &str,
+        action: &str,
+    ) -> Result<(), TrackerError> {
+        let project_id = state
+            .sections
+            .iter()
+            .find(|section| json_id(section.get("id")).as_deref() == Some(section_id))
+            .and_then(|section| section.get("project_id").and_then(json_id_from_value))
+            .ok_or_else(|| not_found("section", section_id))?;
+        self.ensure_project_in_scope(&project_id, action)
+    }
+
+    fn ensure_parent_task_in_scope(
+        &self,
+        state: &MemoryState,
+        parent_id: &str,
+        action: &str,
+    ) -> Result<(), TrackerError> {
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| json_id(task.get("id")).as_deref() == Some(parent_id))
+            .ok_or_else(|| not_found("task", parent_id))?;
+        self.ensure_task_is_mutable_in_scope(task)
+            .map_err(|error| match error {
+                TrackerError::TrackerOperationUnsupported(message) => {
+                    TrackerError::TrackerOperationUnsupported(format!(
+                        "{action} parent task rejected: {message}"
+                    ))
+                }
+                other => other,
+            })
+    }
 }
 
 #[async_trait]
 impl TrackerClient for MemoryTracker {
+    async fn capabilities(&self) -> Result<TrackerCapabilities, TrackerError> {
+        Ok(self.capabilities_from_state(&self.state()))
+    }
+
     async fn validate_startup(&self) -> Result<(), TrackerError> {
         let state = self.state();
         self.assignee_filter_value_validated(&state)?;
         self.ensure_comments_available(&state)?;
+        validate_required_open_sections(&self.config, &state.sections)?;
         Ok(())
     }
 
@@ -610,11 +719,25 @@ impl TrackerClient for MemoryTracker {
         self.ensure_comments_available(&state)?;
         let target = comment_target(&arguments)?;
         let content = required_string(&arguments, "content", "create_comment")?;
-        if content.len() > 15_000 {
+        if content.len() > TODOIST_COMMENT_SIZE_LIMIT {
             return Err(TrackerError::TodoistCommentTooLarge {
-                limit: 15_000,
+                limit: TODOIST_COMMENT_SIZE_LIMIT,
                 actual: content.len(),
             });
+        }
+        if target == "project_id" {
+            let project_id = arguments
+                .get("project_id")
+                .and_then(json_id_from_value)
+                .ok_or(TrackerError::MissingTrackerProjectId)?;
+            self.ensure_project_in_scope(&project_id, "create_comment")?;
+        } else if let Some(task_id) = arguments.get("task_id").and_then(json_id_from_value) {
+            let task = state
+                .tasks
+                .iter()
+                .find(|task| json_id(task.get("id")).as_deref() == Some(task_id.as_str()))
+                .ok_or_else(|| not_found("task", &task_id))?;
+            self.ensure_task_is_mutable_in_scope(task)?;
         }
         let mut comment = Map::new();
         comment.insert(
@@ -674,9 +797,9 @@ impl TrackerClient for MemoryTracker {
         let mut state = self.state();
         self.ensure_comments_available(&state)?;
         let content = required_string(&arguments, "content", "update_comment")?;
-        if content.len() > 15_000 {
+        if content.len() > TODOIST_COMMENT_SIZE_LIMIT {
             return Err(TrackerError::TodoistCommentTooLarge {
-                limit: 15_000,
+                limit: TODOIST_COMMENT_SIZE_LIMIT,
                 actual: content.len(),
             });
         }
@@ -706,7 +829,20 @@ impl TrackerClient for MemoryTracker {
 
     async fn update_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
         let mut state = self.state();
+        let existing = state
+            .tasks
+            .iter()
+            .find(|task| json_id(task.get("id")).as_deref() == Some(task_id))
+            .cloned()
+            .ok_or_else(|| not_found("task", task_id))?;
+        self.ensure_task_is_mutable_in_scope(&existing)?;
         let labels_updated = arguments.get("labels").is_some();
+        if let Some(section_id) = arguments.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&state, &section_id, "update_task")?;
+        }
+        if let Some(project_id) = arguments.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "update_task")?;
+        }
         let task_value = {
             let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
             let updates = sanitize_action_arguments(
@@ -749,6 +885,13 @@ impl TrackerClient for MemoryTracker {
 
     async fn move_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
         let mut state = self.state();
+        let existing = state
+            .tasks
+            .iter()
+            .find(|task| json_id(task.get("id")).as_deref() == Some(task_id))
+            .cloned()
+            .ok_or_else(|| not_found("task", task_id))?;
+        self.ensure_task_is_mutable_in_scope(&existing)?;
         let updates =
             sanitize_action_arguments(arguments, &["project_id", "section_id", "parent_id"]);
         let Some(updates) = updates.as_object() else {
@@ -760,6 +903,15 @@ impl TrackerClient for MemoryTracker {
             return Err(TrackerError::TrackerOperationUnsupported(
                 "`section_id`, `project_id`, or `parent_id` is required for move_task".to_string(),
             ));
+        }
+        if let Some(project_id) = updates.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "move_task")?;
+        }
+        if let Some(section_id) = updates.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&state, &section_id, "move_task")?;
+        }
+        if let Some(parent_id) = updates.get("parent_id").and_then(json_id_from_value) {
+            self.ensure_parent_task_in_scope(&state, &parent_id, "move_task")?;
         }
         let task_value = {
             let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
@@ -781,6 +933,13 @@ impl TrackerClient for MemoryTracker {
 
     async fn close_task(&self, task_id: &str) -> Result<Value, TrackerError> {
         let mut state = self.state();
+        let existing = state
+            .tasks
+            .iter()
+            .find(|task| json_id(task.get("id")).as_deref() == Some(task_id))
+            .cloned()
+            .ok_or_else(|| not_found("task", task_id))?;
+        self.ensure_task_is_mutable_in_scope(&existing)?;
         let task_value = {
             let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
             task.insert("checked".to_string(), Value::Bool(true));
@@ -804,6 +963,13 @@ impl TrackerClient for MemoryTracker {
 
     async fn reopen_task(&self, task_id: &str) -> Result<Value, TrackerError> {
         let mut state = self.state();
+        let existing = state
+            .tasks
+            .iter()
+            .find(|task| json_id(task.get("id")).as_deref() == Some(task_id))
+            .cloned()
+            .ok_or_else(|| not_found("task", task_id))?;
+        self.ensure_task_is_mutable_in_scope(&existing)?;
         let task_value = {
             let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
             task.insert("checked".to_string(), Value::Bool(false));
@@ -830,6 +996,13 @@ impl TrackerClient for MemoryTracker {
             .get("project_id")
             .and_then(json_id_from_value)
             .unwrap_or_else(|| self.current_project_id());
+        self.ensure_project_in_scope(&project_id, "create_task")?;
+        if let Some(section_id) = arguments.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&state, &section_id, "create_task")?;
+        }
+        if let Some(parent_id) = arguments.get("parent_id").and_then(json_id_from_value) {
+            self.ensure_parent_task_in_scope(&state, &parent_id, "create_task")?;
+        }
         let mut task = Map::new();
         task.insert("id".to_string(), Value::String(id.clone()));
         task.insert("content".to_string(), Value::String(content));
@@ -852,6 +1025,7 @@ impl TrackerClient for MemoryTracker {
                 "assignee_id",
                 "due",
                 "deadline",
+                "origin_task_id",
             ],
         )
         .as_object()
@@ -860,6 +1034,12 @@ impl TrackerClient for MemoryTracker {
                 task.insert(key.clone(), value.clone());
             }
         }
+        let origin_task_id = task.remove("origin_task_id").and_then(|value| match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        });
+        maybe_add_origin_back_reference(&mut task, origin_task_id.as_deref());
         if task.get("parent_id").is_none() && task.get("section_id").is_none() {
             if let Some(section_id) = self.default_todo_section_id(&state, &project_id) {
                 task.insert("section_id".to_string(), Value::String(section_id));
@@ -1539,6 +1719,64 @@ fn sanitize_action_arguments(arguments: Value, allowed_keys: &[&str]) -> Value {
     Value::Object(map)
 }
 
+fn validate_required_open_sections(
+    config: &ServiceConfig,
+    sections: &[Value],
+) -> Result<(), TrackerError> {
+    let available: BTreeSet<String> = sections
+        .iter()
+        .filter_map(|section| section.get("name").and_then(Value::as_str))
+        .map(normalize_state_name)
+        .collect();
+    let mut required = config.tracker.active_states.clone();
+    if config.tracker.terminal_states_explicit {
+        required.extend(
+            config
+                .tracker
+                .terminal_states
+                .iter()
+                .filter(|state| normalize_state_name(state) != "done")
+                .cloned(),
+        );
+    }
+
+    for state in &required {
+        let key = normalize_state_name(&state);
+        if !key.is_empty() && !available.contains(&key) {
+            return Err(TrackerError::TodoistMissingRequiredSection(state.clone()));
+        }
+    }
+
+    Ok(())
+}
+
+fn maybe_add_origin_back_reference(task: &mut Map<String, Value>, origin_task_id: Option<&str>) {
+    let Some(origin_task_id) = origin_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let origin_reference = format!("TD-{origin_task_id}");
+    let existing = task
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let existing_lower = existing.to_ascii_lowercase();
+    let origin_lower = origin_reference.to_ascii_lowercase();
+    if existing_lower.contains(origin_lower.as_str()) {
+        return;
+    }
+
+    let description = if existing.is_empty() {
+        format!("Origin: {origin_reference}")
+    } else {
+        format!("{existing}\n\nOrigin: {origin_reference}")
+    };
+    task.insert("description".to_string(), Value::String(description));
+}
+
 fn default_task_scope_project_id(tracker: &MemoryTracker, arguments: &Value) -> Option<String> {
     let has_explicit_scope = ["project_id", "section_id", "parent_id", "label", "ids"]
         .iter()
@@ -1742,7 +1980,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use crate::{config::ServiceConfig, tracker::TrackerClient};
+    use crate::{
+        config::ServiceConfig,
+        tracker::{TrackerCapabilities, TrackerClient},
+    };
 
     use super::MemoryTracker;
 
@@ -2196,6 +2437,251 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "todoist_assignee_not_resolvable assignee=user-2 project_id=proj"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_tracker_capabilities_reflect_plan_limits() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": true, "reminders": false, "activity_log": false}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let capabilities = tracker.capabilities().await.expect("capabilities");
+
+        assert_eq!(
+            capabilities,
+            TrackerCapabilities {
+                comments: true,
+                reminders: false,
+                activity_log: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_requires_non_done_terminal_sections() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "active_states": ["Todo"],
+                    "terminal_states": ["Done", "Merging"]
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("missing merging section");
+
+        assert_eq!(error.to_string(), "todoist_missing_required_section Merging");
+    }
+
+    #[tokio::test]
+    async fn create_task_adds_origin_back_reference() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let created = tracker
+            .create_task(json!({
+                "content": "Follow-up",
+                "description": "Investigate",
+                "origin_task_id": "123"
+            }))
+            .await
+            .expect("create task");
+
+        assert_eq!(created["section_id"], "sec-todo");
+        assert_eq!(created["description"], "Investigate\n\nOrigin: TD-123");
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_foreign_project_tasks() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [
+    {"id":"task-1","content":"Foreign","project_id":"other","section_id":"sec-foreign","labels":[]}
+  ],
+  "sections": [
+    {"id":"sec-foreign","project_id":"other","name":"Todo"},
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .update_task("task-1", json!({"content": "Nope"}))
+            .await
+            .expect_err("foreign project");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported Todoist task `task-1` belongs to project `other`, outside configured project `proj`."
+        );
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_runtime_label_scope_violations() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [
+    {"id":"task-1","content":"Scoped","project_id":"proj","section_id":"sec-todo","labels":["backend"]}
+  ],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "label": "symphony-runtime"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .update_task("task-1", json!({"content": "Nope"}))
+            .await
+            .expect_err("label scope");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported Todoist task `task-1` is outside runtime label scope `symphony-runtime`."
+        );
+    }
+
+    #[tokio::test]
+    async fn create_comment_rejects_foreign_project_targets() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .create_comment(json!({"project_id": "other", "content": "Project note"}))
+            .await
+            .expect_err("foreign project");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported create_comment cannot target Todoist project `other` outside configured project `proj`."
         );
     }
 }

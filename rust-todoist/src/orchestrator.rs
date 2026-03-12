@@ -23,7 +23,10 @@ use crate::{
     prompt,
     tracker::{TrackerClient, build_tracker_client},
     workflow::WorkflowStore,
-    workspace::{Workspace, sanitize_identifier, workspace_path_for_identifier},
+    workspace::{
+        Workspace, sanitize_identifier, ssh_args, ssh_executable,
+        workspace_path_for_identifier_on_host,
+    },
 };
 
 const RUNNING_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -54,6 +57,7 @@ struct State {
     poll_interval_ms: u64,
     max_concurrent_agents: usize,
     max_retry_backoff_ms: u64,
+    worker_runtime: WorkerRuntimeConfig,
     next_poll_due_at: Option<Instant>,
     poll_check_in_progress: bool,
     running: BTreeMap<String, RunningEntry>,
@@ -68,6 +72,8 @@ struct RunningEntry {
     issue: Issue,
     identifier: String,
     workspace_path: PathBuf,
+    workspace_location: String,
+    worker_host: Option<String>,
     cancel: CancellationToken,
     join: JoinHandle<()>,
     session_id: Option<String>,
@@ -93,8 +99,23 @@ struct RetryEntry {
     due_at: Instant,
     identifier: String,
     tracked_issue: Option<Issue>,
+    worker_host: Option<String>,
+    workspace_location: Option<String>,
     error: Option<String>,
     cancel: CancellationToken,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkerRuntimeConfig {
+    ssh_hosts: Vec<String>,
+    max_concurrent_agents_per_host: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerSelection {
+    Local,
+    Remote(String),
+    NoCapacity,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -138,6 +159,7 @@ pub struct RunningSnapshot {
     pub labels: Vec<String>,
     pub due: Option<Value>,
     pub deadline: Option<Value>,
+    pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -155,6 +177,8 @@ pub struct RetrySnapshot {
     pub issue_identifier: String,
     pub attempt: u32,
     pub due_at: DateTime<Utc>,
+    pub worker_host: Option<String>,
+    pub workspace_location: Option<String>,
     pub error: Option<String>,
 }
 
@@ -197,6 +221,7 @@ pub struct IssueDetail {
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkspaceDetail {
     pub path: String,
+    pub worker_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,6 +232,7 @@ pub struct AttemptDetail {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningDetail {
+    pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -222,6 +248,8 @@ pub struct RunningDetail {
 pub struct RetryDetail {
     pub attempt: u32,
     pub due_at: DateTime<Utc>,
+    pub worker_host: Option<String>,
+    pub workspace_location: Option<String>,
     pub error: Option<String>,
 }
 
@@ -524,7 +552,8 @@ async fn run_tick(
                                     &active_states,
                                     &terminal_states,
                                 ) {
-                                    dispatch_issue(workflow_store, tx, state, issue, None).await;
+                                    dispatch_issue(workflow_store, tx, state, issue, None, None)
+                                        .await;
                                 }
                             }
                         }
@@ -569,67 +598,62 @@ fn refresh_runtime_config(workflow_store: &WorkflowStore, state: &mut State) {
     state.poll_interval_ms = effective.config.polling.interval_ms;
     state.max_concurrent_agents = effective.config.agent.max_concurrent_agents;
     state.max_retry_backoff_ms = effective.config.agent.max_retry_backoff_ms;
+    state.worker_runtime = worker_runtime_from_config(&effective.config);
+}
+
+fn worker_runtime_from_config(config: &ServiceConfig) -> WorkerRuntimeConfig {
+    WorkerRuntimeConfig {
+        ssh_hosts: config.worker.ssh_hosts.clone(),
+        max_concurrent_agents_per_host: config.worker.max_concurrent_agents_per_host,
+    }
 }
 
 async fn startup_terminal_cleanup(workflow_store: &WorkflowStore, tracker: &dyn TrackerClient) {
     let effective = workflow_store.effective();
+    let worker_runtime = worker_runtime_from_config(&effective.config);
+
     match tracker.fetch_open_issues().await {
         Ok(issues) => {
             let live_workspaces: BTreeSet<String> = issues
                 .iter()
                 .map(|issue| sanitize_identifier(&issue.identifier))
                 .collect();
-            let mut entries = match tokio::fs::read_dir(&effective.config.workspace.root).await {
-                Ok(entries) => entries,
-                Err(error) => {
-                    warn!("workspace_cleanup=startup status=skipped reason={error}");
-                    return;
-                }
-            };
-
-            loop {
-                match entries.next_entry().await {
-                    Ok(Some(entry)) => {
-                        let path = entry.path();
-                        let file_type = match entry.file_type().await {
-                            Ok(file_type) => file_type,
-                            Err(error) => {
-                                warn!(
-                                    "workspace_cleanup=startup status=skipped path={} reason={error}",
-                                    path.display()
-                                );
-                                continue;
-                            }
-                        };
-                        if !file_type.is_dir() {
-                            continue;
-                        }
-
-                        let identifier = entry.file_name().to_string_lossy().to_string();
-                        if live_workspaces.contains(&identifier) {
-                            continue;
-                        }
-
-                        if let Err(error) =
-                            Workspace::remove_path(&effective.config, &path, &identifier).await
-                        {
-                            warn!(
-                                "workspace_cleanup=startup status=failed issue_identifier={} path={} error={error}",
-                                identifier,
-                                path.display()
-                            );
-                        } else {
+            if worker_runtime.ssh_hosts.is_empty() {
+                match Workspace::sweep_stale_workspaces(&effective.config, &live_workspaces, None)
+                    .await
+                {
+                    Ok(removed) => {
+                        for path in removed {
                             info!(
-                                "workspace_cleanup=startup status=removed issue_identifier={} path={}",
-                                identifier,
+                                "workspace_cleanup=startup status=removed path={}",
                                 path.display()
                             );
                         }
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        warn!("workspace_cleanup=startup status=skipped reason={error}");
-                        break;
+                    Err(error) => warn!("workspace_cleanup=startup status=skipped reason={error}"),
+                }
+            } else {
+                for worker_host in &worker_runtime.ssh_hosts {
+                    match Workspace::sweep_stale_workspaces(
+                        &effective.config,
+                        &live_workspaces,
+                        Some(worker_host.as_str()),
+                    )
+                    .await
+                    {
+                        Ok(removed) => {
+                            for path in removed {
+                                info!(
+                                    "workspace_cleanup=startup status=removed worker_host={} path={}",
+                                    worker_host,
+                                    path.display()
+                                );
+                            }
+                        }
+                        Err(error) => warn!(
+                            "workspace_cleanup=startup status=skipped worker_host={} reason={error}",
+                            worker_host
+                        ),
                     }
                 }
             }
@@ -844,26 +868,27 @@ async fn reconcile_stalled_runs(
 
     for issue_id in stalled {
         if let Some(running) = state.running.get(&issue_id) {
+            let last_activity_at = running.last_codex_timestamp.unwrap_or(running.started_at);
             let elapsed_ms = now
-                .signed_duration_since(running.last_codex_timestamp.unwrap_or(running.started_at))
+                .signed_duration_since(last_activity_at)
                 .num_milliseconds();
+            let session_id = running
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "n/a".to_string());
+            let identifier = running.identifier.clone();
+            let tracked_issue = running.issue.clone();
+            let worker_host = running.worker_host.clone();
+            let workspace_location = running.workspace_location.clone();
             warn!(
                 "reconcile=status=stalled issue_id={} issue_identifier={} elapsed_ms={} session_id={}",
-                issue_id,
-                running.identifier,
-                elapsed_ms,
-                running
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| "n/a".to_string())
+                issue_id, identifier, elapsed_ms, session_id
             );
             let next_attempt = if running.retry_attempt > 0 {
                 running.retry_attempt + 1
             } else {
                 1
             };
-            let identifier = running.identifier.clone();
-            let tracked_issue = running.issue.clone();
             terminate_running_issue(state, issue_id.clone(), false, workflow_store).await;
             schedule_retry(
                 tx,
@@ -872,6 +897,8 @@ async fn reconcile_stalled_runs(
                 next_attempt,
                 identifier,
                 Some(tracked_issue),
+                worker_host,
+                Some(workspace_location),
                 Some(format!("stalled for {elapsed_ms}ms without codex activity")),
                 false,
             );
@@ -892,10 +919,17 @@ async fn terminate_running_issue(
         let config = workflow_store.effective().config.clone();
         let workspace_path = running.workspace_path.clone();
         let identifier = running.identifier.clone();
+        let worker_host = running.worker_host.clone();
         tokio::spawn(async move {
             stop_running_entry(running).await;
             if cleanup_workspace {
-                let _ = Workspace::remove_path(&config, &workspace_path, &identifier).await;
+                let _ = Workspace::remove_path_on_host(
+                    &config,
+                    &workspace_path,
+                    &identifier,
+                    worker_host.as_deref(),
+                )
+                .await;
             }
         });
     } else {
@@ -916,6 +950,7 @@ fn should_dispatch_issue(
         && !state.running.contains_key(&issue.id)
         && available_slots(state) > 0
         && state_slots_available(state, config, issue)
+        && worker_slots_available(state, None)
 }
 
 fn retry_candidate_issue(
@@ -951,6 +986,63 @@ fn state_slots_available(state: &State, config: &ServiceConfig, issue: &Issue) -
     used < limit
 }
 
+fn worker_slots_available(state: &State, preferred_worker_host: Option<&str>) -> bool {
+    !matches!(
+        select_worker_host(state, preferred_worker_host),
+        WorkerSelection::NoCapacity
+    )
+}
+
+fn select_worker_host(state: &State, preferred_worker_host: Option<&str>) -> WorkerSelection {
+    if state.worker_runtime.ssh_hosts.is_empty() {
+        return WorkerSelection::Local;
+    }
+
+    let available_hosts = state
+        .worker_runtime
+        .ssh_hosts
+        .iter()
+        .filter(|host| worker_host_slots_available(state, host))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if available_hosts.is_empty() {
+        return WorkerSelection::NoCapacity;
+    }
+
+    if let Some(preferred_worker_host) = preferred_worker_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && available_hosts
+            .iter()
+            .any(|host| host == preferred_worker_host)
+    {
+        return WorkerSelection::Remote(preferred_worker_host.to_string());
+    }
+
+    available_hosts
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, host)| (running_worker_host_count(state, host), *index))
+        .map(|(_, host)| WorkerSelection::Remote(host.clone()))
+        .unwrap_or(WorkerSelection::NoCapacity)
+}
+
+fn worker_host_slots_available(state: &State, worker_host: &str) -> bool {
+    match state.worker_runtime.max_concurrent_agents_per_host {
+        Some(limit) => running_worker_host_count(state, worker_host) < limit,
+        None => true,
+    }
+}
+
+fn running_worker_host_count(state: &State, worker_host: &str) -> usize {
+    state
+        .running
+        .values()
+        .filter(|running| running.worker_host.as_deref() == Some(worker_host))
+        .count()
+}
+
 fn sort_issues_for_dispatch(left: &Issue, right: &Issue) -> std::cmp::Ordering {
     let left_created = left
         .created_at
@@ -979,6 +1071,7 @@ async fn dispatch_issue(
     state: &mut State,
     issue: Issue,
     attempt: Option<u32>,
+    preferred_worker_host: Option<String>,
 ) {
     let clear_claim = |state: &mut State| {
         state.claimed.remove(&issue.id);
@@ -1020,8 +1113,26 @@ async fn dispatch_issue(
                 return;
             }
 
-            let workspace_path =
-                workspace_path_for_identifier(&effective.config, &issue.identifier);
+            let worker_host = match select_worker_host(state, preferred_worker_host.as_deref()) {
+                WorkerSelection::Local => None,
+                WorkerSelection::Remote(host) => Some(host),
+                WorkerSelection::NoCapacity => {
+                    info!(
+                        "dispatch=status=skipped issue_id={} issue_identifier={} reason=no_worker_capacity preferred_worker_host={}",
+                        issue.id,
+                        issue.identifier,
+                        preferred_worker_host.as_deref().unwrap_or("local")
+                    );
+                    clear_claim(state);
+                    return;
+                }
+            };
+            let workspace_path = workspace_path_for_identifier_on_host(
+                &effective.config,
+                &issue.identifier,
+                worker_host.as_deref(),
+            );
+            let workspace_location = workspace_path.display().to_string();
             let cancel = CancellationToken::new();
             let issue_id = issue.id.clone();
             let issue_identifier = issue.identifier.clone();
@@ -1031,11 +1142,13 @@ async fn dispatch_issue(
             let retry_attempt = attempt.unwrap_or(0);
             let worker_issue = issue.clone();
             let worker_issue_id = issue_id.clone();
+            let worker_host_for_task = worker_host.clone();
             let join = tokio::spawn(async move {
                 let result = run_worker(
                     workflow_store,
                     worker_issue,
                     attempt,
+                    worker_host_for_task,
                     cancel_clone,
                     join_tx.clone(),
                 )
@@ -1054,6 +1167,8 @@ async fn dispatch_issue(
                     issue,
                     identifier: issue_identifier.clone(),
                     workspace_path,
+                    workspace_location,
+                    worker_host: worker_host.clone(),
                     cancel,
                     join,
                     session_id: None,
@@ -1077,8 +1192,11 @@ async fn dispatch_issue(
             state.claimed.insert(issue_id.clone());
             state.retry_attempts.remove(&issue_id);
             info!(
-                "dispatch=status=started issue_id={} issue_identifier={} attempt={}",
-                issue_id, issue_identifier, retry_attempt
+                "dispatch=status=started issue_id={} issue_identifier={} attempt={} worker_host={}",
+                issue_id,
+                issue_identifier,
+                retry_attempt,
+                worker_host.as_deref().unwrap_or("local")
             );
         }
         Err(error) => {
@@ -1115,6 +1233,8 @@ fn handle_worker_exit(
                 1,
                 running.identifier.clone(),
                 Some(issue.clone()),
+                running.worker_host.clone(),
+                Some(running.workspace_location.clone()),
                 None,
                 true,
             );
@@ -1150,6 +1270,8 @@ fn handle_worker_exit(
                 attempt,
                 running.identifier.clone(),
                 Some(running.issue.clone()),
+                running.worker_host.clone(),
+                Some(running.workspace_location.clone()),
                 Some(error.clone()),
                 false,
             );
@@ -1207,14 +1329,28 @@ async fn handle_retry_issue_with_tracker(
         Ok(issues) => {
             if let Some(issue) = issues.into_iter().find(|issue| issue.id == issue_id) {
                 if terminal_states.contains(&issue.state_key()) {
-                    cleanup_issue_workspace(&effective.config, &issue).await;
+                    cleanup_issue_workspace(
+                        &effective.config,
+                        &issue,
+                        retry_entry.worker_host.as_deref(),
+                        !state.worker_runtime.ssh_hosts.is_empty(),
+                    )
+                    .await;
                     state.claimed.remove(issue_id);
                 } else if retry_candidate_issue(&issue, &active_states, &terminal_states) {
                     if available_slots(state) > 0
                         && state_slots_available(state, &effective.config, &issue)
+                        && worker_slots_available(state, retry_entry.worker_host.as_deref())
                     {
-                        dispatch_issue(workflow_store, tx, state, issue, Some(retry_entry.attempt))
-                            .await;
+                        dispatch_issue(
+                            workflow_store,
+                            tx,
+                            state,
+                            issue,
+                            Some(retry_entry.attempt),
+                            retry_entry.worker_host.clone(),
+                        )
+                        .await;
                     } else {
                         schedule_retry(
                             tx,
@@ -1223,6 +1359,8 @@ async fn handle_retry_issue_with_tracker(
                             retry_entry.attempt + 1,
                             issue.identifier.clone(),
                             Some(issue.clone()),
+                            retry_entry.worker_host.clone(),
+                            retry_entry.workspace_location.clone(),
                             Some("no available orchestrator slots".to_string()),
                             false,
                         );
@@ -1242,6 +1380,8 @@ async fn handle_retry_issue_with_tracker(
                 retry_entry.attempt + 1,
                 retry_entry.identifier,
                 retry_entry.tracked_issue.clone(),
+                retry_entry.worker_host.clone(),
+                retry_entry.workspace_location.clone(),
                 Some(format!("retry poll failed: {error}")),
                 false,
             );
@@ -1249,8 +1389,41 @@ async fn handle_retry_issue_with_tracker(
     }
 }
 
-async fn cleanup_issue_workspace(config: &ServiceConfig, issue: &Issue) {
-    if let Err(error) = Workspace::remove_for_identifier(config, &issue.identifier).await {
+async fn cleanup_issue_workspace(
+    config: &ServiceConfig,
+    issue: &Issue,
+    worker_host: Option<&str>,
+    remote_workers_configured: bool,
+) {
+    if let Some(worker_host) = worker_host {
+        if let Err(error) =
+            Workspace::remove_for_identifier_on_host(config, &issue.identifier, Some(worker_host))
+                .await
+        {
+            warn!(
+                "workspace_cleanup=retry status=failed issue_id={} issue_identifier={} worker_host={} error={error}",
+                issue.id, issue.identifier, worker_host
+            );
+        }
+        return;
+    }
+
+    if remote_workers_configured {
+        for worker_host in &config.worker.ssh_hosts {
+            if let Err(error) = Workspace::remove_for_identifier_on_host(
+                config,
+                &issue.identifier,
+                Some(worker_host.as_str()),
+            )
+            .await
+            {
+                warn!(
+                    "workspace_cleanup=retry status=failed issue_id={} issue_identifier={} worker_host={} error={error}",
+                    issue.id, issue.identifier, worker_host
+                );
+            }
+        }
+    } else if let Err(error) = Workspace::remove_for_identifier(config, &issue.identifier).await {
         warn!(
             "workspace_cleanup=retry status=failed issue_id={} issue_identifier={} error={error}",
             issue.id, issue.identifier
@@ -1277,6 +1450,8 @@ fn schedule_retry(
     attempt: u32,
     identifier: String,
     tracked_issue: Option<Issue>,
+    worker_host: Option<String>,
+    workspace_location: Option<String>,
     error: Option<String>,
     continuation: bool,
 ) {
@@ -1315,16 +1490,19 @@ fn schedule_retry(
             due_at: Instant::now() + Duration::from_millis(delay_ms),
             identifier: identifier.clone(),
             tracked_issue,
+            worker_host: worker_host.clone(),
+            workspace_location,
             error: error.clone(),
             cancel,
         },
     );
     warn!(
-        "retry=status=queued issue_id={} issue_identifier={} attempt={} delay_ms={} error={}",
+        "retry=status=queued issue_id={} issue_identifier={} attempt={} delay_ms={} worker_host={} error={}",
         issue_id,
         identifier,
         attempt,
         delay_ms,
+        worker_host.as_deref().unwrap_or("local"),
         error.unwrap_or_else(|| "none".to_string())
     );
 }
@@ -1344,6 +1522,9 @@ fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent)
 
     if let Some(pid) = event.codex_app_server_pid {
         running.codex_app_server_pid = Some(pid);
+    }
+    if let Some(worker_host) = event.worker_host.clone() {
+        running.worker_host = Some(worker_host);
     }
     if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
         running.terminal_transition_permitted = true;
@@ -1482,6 +1663,7 @@ fn build_snapshot(state: &State) -> Snapshot {
                 labels: running.issue.labels.clone(),
                 due: running.issue.due.clone(),
                 deadline: running.issue.deadline.clone(),
+                worker_host: running.worker_host.clone(),
                 session_id: running.session_id.clone(),
                 codex_app_server_pid: running.codex_app_server_pid,
                 turn_count: running.turn_count,
@@ -1489,7 +1671,7 @@ fn build_snapshot(state: &State) -> Snapshot {
                 last_message: running.last_codex_message.clone(),
                 started_at: running.started_at,
                 last_event_at: running.last_codex_timestamp,
-                workspace: running.workspace_path.display().to_string(),
+                workspace: running.workspace_location.clone(),
                 tokens: TokenSnapshot {
                     input_tokens: running.codex_input_tokens,
                     output_tokens: running.codex_output_tokens,
@@ -1511,6 +1693,8 @@ fn build_snapshot(state: &State) -> Snapshot {
                             .saturating_duration_since(now_instant)
                             .as_millis() as i64,
                     ),
+                worker_host: retry.worker_host.clone(),
+                workspace_location: retry.workspace_location.clone(),
                 error: retry.error.clone(),
             })
             .collect(),
@@ -1553,10 +1737,16 @@ fn build_issue_detail(
     }
 
     let workspace = running
-        .map(|running| running.workspace_path.clone())
+        .map(|running| running.workspace_location.clone())
+        .or_else(|| retry.and_then(|retry| retry.workspace_location.clone()))
         .unwrap_or_else(|| {
             let effective = workflow_store.effective();
-            workspace_path_for_identifier(&effective.config, identifier)
+            let worker_host = running
+                .and_then(|running| running.worker_host.as_deref())
+                .or_else(|| retry.and_then(|retry| retry.worker_host.as_deref()));
+            workspace_path_for_identifier_on_host(&effective.config, identifier, worker_host)
+                .display()
+                .to_string()
         });
 
     let issue_id = running
@@ -1578,7 +1768,10 @@ fn build_issue_detail(
         status,
         tracked_issue,
         workspace: WorkspaceDetail {
-            path: workspace.display().to_string(),
+            path: workspace,
+            worker_host: running
+                .and_then(|running| running.worker_host.clone())
+                .or_else(|| retry.and_then(|retry| retry.worker_host.clone())),
         },
         attempts: AttemptDetail {
             restart_count: running
@@ -1587,6 +1780,7 @@ fn build_issue_detail(
             current_retry_attempt: retry.map(|retry| retry.attempt),
         },
         running: running.map(|running| RunningDetail {
+            worker_host: running.worker_host.clone(),
             session_id: running.session_id.clone(),
             codex_app_server_pid: running.codex_app_server_pid,
             turn_count: running.turn_count,
@@ -1610,6 +1804,8 @@ fn build_issue_detail(
                         .saturating_duration_since(Instant::now())
                         .as_millis() as i64,
                 ),
+            worker_host: retry.worker_host.clone(),
+            workspace_location: retry.workspace_location.clone(),
             error: retry.error.clone(),
         }),
         recent_events: running
@@ -1643,7 +1839,7 @@ async fn stop_running_entry(mut running: RunningEntry) {
                 "worker_shutdown=status=timeout issue_id={} issue_identifier={} pid={:?}",
                 issue_id, identifier, pid
             );
-            force_kill_process(pid);
+            force_kill_process(pid, running.worker_host.as_deref());
             running.join.abort();
             let _ = running.join.await;
         }
@@ -1651,16 +1847,24 @@ async fn stop_running_entry(mut running: RunningEntry) {
 }
 
 #[cfg(unix)]
-fn force_kill_process(pid: Option<u32>) {
+fn force_kill_process(pid: Option<u32>, worker_host: Option<&str>) {
     if let Some(pid) = pid {
-        let _ = StdCommand::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        if let Some(worker_host) = worker_host {
+            if let Ok(executable) = ssh_executable() {
+                let _ = StdCommand::new(executable)
+                    .args(ssh_args(worker_host, &format!("kill -9 {pid}")))
+                    .status();
+            }
+        } else {
+            let _ = StdCommand::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn force_kill_process(_pid: Option<u32>) {}
+fn force_kill_process(_pid: Option<u32>, _worker_host: Option<&str>) {}
 
 fn shutdown_retries(entries: Vec<RetryEntry>) {
     for retry in entries {
@@ -1672,13 +1876,21 @@ async fn run_worker(
     workflow_store: WorkflowStore,
     issue: Issue,
     attempt: Option<u32>,
+    worker_host: Option<String>,
     cancellation: CancellationToken,
     tx: mpsc::Sender<Command>,
 ) -> Result<WorkerDisposition, String> {
     let effective = workflow_store.effective();
-    let workspace = Workspace::create_for_issue(&effective.config, &issue)
-        .await
-        .map_err(|error| error.to_string())?;
+    info!(
+        "worker=status=starting issue_id={} issue_identifier={} worker_host={}",
+        issue.id,
+        issue.identifier,
+        worker_host.as_deref().unwrap_or("local")
+    );
+    let workspace =
+        Workspace::create_for_issue_on_host(&effective.config, &issue, worker_host.as_deref())
+            .await
+            .map_err(|error| error.to_string())?;
     if let Err(error) = workspace.run_before_run(&effective.config, &issue).await {
         workspace.run_after_run(&effective.config, &issue).await;
         return Err(error.to_string());
@@ -1687,7 +1899,10 @@ async fn run_worker(
     let tracker =
         build_tracker_client(effective.config.clone()).map_err(|error| error.to_string())?;
     let app = AppServerClient::new(effective.config.clone(), tracker.clone());
-    let mut session = match app.start_session(&workspace.path).await {
+    let mut session = match app
+        .start_session_on_host(&workspace.path, worker_host.as_deref())
+        .await
+    {
         Ok(session) => session,
         Err(error) => {
             workspace.run_after_run(&effective.config, &issue).await;
@@ -1791,10 +2006,11 @@ async fn run_worker(
         .run_after_run(&workflow_store.effective().config, &issue)
         .await;
     if cleanup_terminal_workspace {
-        Workspace::remove_path(
+        Workspace::remove_path_on_host(
             &workflow_store.effective().config,
             &workspace.path,
             &issue.identifier,
+            worker_host.as_deref(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -1823,9 +2039,9 @@ mod tests {
 
     use super::{
         Orchestrator, OrchestratorHandle, OrchestratorHandleError, RetryEntry, RunningEntry, State,
-        WorkerDisposition, build_snapshot, candidate_issue, dispatch_issue,
-        guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
-        handle_worker_exit, run_startup_terminal_cleanup,
+        WorkerDisposition, WorkerRuntimeConfig, WorkerSelection, build_snapshot, candidate_issue,
+        dispatch_issue, guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
+        handle_worker_exit, run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
     };
@@ -1880,6 +2096,161 @@ mod tests {
         let snapshot = build_snapshot(&State::default());
         assert_eq!(snapshot.counts.running, 0);
         assert_eq!(snapshot.counts.retrying, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_host_selection_prefers_least_loaded_host_and_honors_affinity() {
+        let mut state = State {
+            worker_runtime: WorkerRuntimeConfig {
+                ssh_hosts: vec!["ssh-a".to_string(), "ssh-b".to_string()],
+                max_concurrent_agents_per_host: Some(2),
+            },
+            ..State::default()
+        };
+        state.running.insert(
+            "issue-1".to_string(),
+            RunningEntry {
+                issue: Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "one".to_string(),
+                    state: "In Progress".to_string(),
+                    ..Issue::default()
+                },
+                identifier: "ABC-1".to_string(),
+                workspace_path: PathBuf::from("/tmp/workspace-a"),
+                workspace_location: "/tmp/workspace-a".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: None,
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            select_worker_host(&state, None),
+            WorkerSelection::Remote("ssh-b".to_string())
+        );
+        assert_eq!(
+            select_worker_host(&state, Some("ssh-a")),
+            WorkerSelection::Remote("ssh-a".to_string())
+        );
+
+        state.running.insert(
+            "issue-2".to_string(),
+            RunningEntry {
+                issue: Issue {
+                    id: "issue-2".to_string(),
+                    identifier: "ABC-2".to_string(),
+                    title: "two".to_string(),
+                    state: "In Progress".to_string(),
+                    ..Issue::default()
+                },
+                identifier: "ABC-2".to_string(),
+                workspace_path: PathBuf::from("/tmp/workspace-a-2"),
+                workspace_location: "/tmp/workspace-a-2".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: None,
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            select_worker_host(&state, Some("ssh-a")),
+            WorkerSelection::Remote("ssh-b".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_worker_host_and_workspace_affinity() {
+        let mut state = State::default();
+        state.running.insert(
+            "issue-1".to_string(),
+            RunningEntry {
+                issue: Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "one".to_string(),
+                    state: "In Progress".to_string(),
+                    ..Issue::default()
+                },
+                identifier: "ABC-1".to_string(),
+                workspace_path: PathBuf::from("/tmp/workspace-a"),
+                workspace_location: "/srv/symphony/ABC-1".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: None,
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+        state.retry_attempts.insert(
+            "issue-2".to_string(),
+            RetryEntry {
+                attempt: 2,
+                due_at: Instant::now() + Duration::from_secs(30),
+                identifier: "ABC-2".to_string(),
+                tracked_issue: None,
+                worker_host: Some("ssh-b".to_string()),
+                workspace_location: Some("/srv/symphony/ABC-2".to_string()),
+                error: Some("boom".to_string()),
+                cancel: CancellationToken::new(),
+            },
+        );
+
+        let snapshot = build_snapshot(&state);
+        assert_eq!(snapshot.running[0].worker_host.as_deref(), Some("ssh-a"));
+        assert_eq!(snapshot.running[0].workspace, "/srv/symphony/ABC-1");
+        assert_eq!(snapshot.retrying[0].worker_host.as_deref(), Some("ssh-b"));
+        assert_eq!(
+            snapshot.retrying[0].workspace_location.as_deref(),
+            Some("/srv/symphony/ABC-2")
+        );
     }
 
     #[test]
@@ -1971,6 +2342,8 @@ mod tests {
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
+                workspace_location: "/tmp/workspace".to_string(),
+                worker_host: None,
                 cancel: CancellationToken::new(),
                 join,
                 session_id: None,
@@ -2037,6 +2410,8 @@ mod tests {
                 due_at: Instant::now(),
                 identifier: issue.identifier.clone(),
                 tracked_issue: Some(issue.clone()),
+                worker_host: None,
+                workspace_location: Some(workspace_path.display().to_string()),
                 error: None,
                 cancel: CancellationToken::new(),
             },
@@ -2083,6 +2458,8 @@ mod tests {
                     project_id: Some("proj-1".to_string()),
                     ..Issue::default()
                 }),
+                worker_host: Some("ssh-a".to_string()),
+                workspace_location: Some("/srv/symphony/ABC-1".to_string()),
                 error: Some("boom".to_string()),
                 cancel: CancellationToken::new(),
             },
@@ -2097,6 +2474,8 @@ mod tests {
                 .and_then(|issue| issue.project_id.as_deref()),
             Some("proj-1")
         );
+        assert_eq!(detail.workspace.worker_host.as_deref(), Some("ssh-a"));
+        assert_eq!(detail.workspace.path, "/srv/symphony/ABC-1");
     }
 
     #[tokio::test]
@@ -2131,6 +2510,8 @@ mod tests {
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
+                workspace_location: "/tmp/workspace".to_string(),
+                worker_host: None,
                 cancel: CancellationToken::new(),
                 join: tokio::spawn(async {}),
                 session_id: Some("session-1".to_string()),
@@ -2191,6 +2572,8 @@ mod tests {
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
+                workspace_location: "/tmp/workspace".to_string(),
+                worker_host: Some("ssh-a".to_string()),
                 cancel: CancellationToken::new(),
                 join: tokio::spawn(async {}),
                 session_id: Some("session-1".to_string()),
@@ -2239,6 +2622,7 @@ mod tests {
                 .map(|issue| issue.state.as_str()),
             Some("Merging")
         );
+        assert_eq!(retry.worker_host.as_deref(), Some("ssh-a"));
     }
 
     #[tokio::test]
@@ -2275,7 +2659,15 @@ test
         state.claimed.insert(issue.id.clone());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        dispatch_issue(&workflow_store, &tx, &mut state, issue.clone(), Some(1)).await;
+        dispatch_issue(
+            &workflow_store,
+            &tx,
+            &mut state,
+            issue.clone(),
+            Some(1),
+            None,
+        )
+        .await;
 
         assert!(
             !state.claimed.contains(&issue.id),
@@ -2346,6 +2738,32 @@ test
             .await
             .expect("cleanup task should finish after timeout")
             .expect("cleanup task should not panic");
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_skips_local_workspace_sweep_when_remote_workers_are_configured() {
+        let dir = tempdir().expect("tempdir");
+        let workflow_store =
+            sample_workflow_store_with_worker_hosts(dir.path(), &["ssh-a", "ssh-b"]);
+        let workspace_path = workflow_store
+            .effective()
+            .config
+            .workspace
+            .root
+            .join("ABC-1");
+        fs::create_dir_all(&workspace_path).expect("workspace");
+
+        run_startup_terminal_cleanup(
+            workflow_store,
+            Arc::new(StaticTracker {
+                candidates: Vec::new(),
+                by_id: Vec::new(),
+            }),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(workspace_path.exists());
     }
 
     struct StaticTracker {
@@ -2445,8 +2863,27 @@ test
     }
 
     fn sample_workflow_store_with_root(root: &std::path::Path) -> WorkflowStore {
+        sample_workflow_store_with_worker_hosts(root, &[])
+    }
+
+    fn sample_workflow_store_with_worker_hosts(
+        root: &std::path::Path,
+        worker_hosts: &[&str],
+    ) -> WorkflowStore {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("WORKFLOW.md");
+        let worker_yaml = if worker_hosts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "worker:\n  ssh_hosts:\n{}\n  max_concurrent_agents_per_host: 2\n",
+                worker_hosts
+                    .iter()
+                    .map(|host| format!("    - {host}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
         fs::write(
             &path,
             format!(
@@ -2463,11 +2900,13 @@ tracker:
     - Cancelled
 workspace:
   root: {}
+{}
 ---
 
 test
 "#,
-                root.display()
+                root.display(),
+                worker_yaml
             ),
         )
         .expect("write workflow");

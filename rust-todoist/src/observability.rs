@@ -69,6 +69,7 @@ pub struct RunningEntryPayload {
     pub labels: Vec<String>,
     pub due: Option<Value>,
     pub deadline: Option<Value>,
+    pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -127,6 +128,7 @@ pub struct IssuePayload {
 #[derive(Clone, Debug, Serialize)]
 pub struct IssueWorkspacePayload {
     pub path: String,
+    pub worker_host: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -137,6 +139,7 @@ pub struct IssueAttemptsPayload {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct IssueRunningPayload {
+    pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -153,6 +156,8 @@ pub struct IssueRunningPayload {
 pub struct IssueRetryPayload {
     pub attempt: u32,
     pub due_at: DateTime<Utc>,
+    pub worker_host: Option<String>,
+    pub workspace_location: Option<String>,
     pub error: Option<String>,
 }
 
@@ -234,6 +239,7 @@ impl Presenter {
                         labels: entry.labels,
                         due: entry.due,
                         deadline: entry.deadline,
+                        worker_host: entry.worker_host,
                         session_id: entry.session_id,
                         app_server_pid: entry.codex_app_server_pid,
                         turn_count: entry.turn_count,
@@ -284,6 +290,7 @@ impl Presenter {
             status: detail.status,
             workspace: IssueWorkspacePayload {
                 path: detail.workspace.path,
+                worker_host: detail.workspace.worker_host,
             },
             attempts: IssueAttemptsPayload {
                 restart_count: detail.attempts.restart_count,
@@ -292,6 +299,7 @@ impl Presenter {
             running: detail.running.map(|running| {
                 let last_event = running.last_event.clone();
                 IssueRunningPayload {
+                    worker_host: running.worker_host,
                     session_id: running.session_id,
                     app_server_pid: running.codex_app_server_pid,
                     turn_count: running.turn_count,
@@ -310,6 +318,8 @@ impl Presenter {
             retry: detail.retry.map(|retry| IssueRetryPayload {
                 attempt: retry.attempt,
                 due_at: retry.due_at,
+                worker_host: retry.worker_host,
+                workspace_location: retry.workspace_location,
                 error: retry.error,
             }),
             logs: IssueLogsPayload {
@@ -542,7 +552,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
                 <div class=\"section-head\">\
                   <div>\
                     <h2>Running Sessions</h2>\
-                    <p class=\"muted\">Active issues, last known Codex activity, token usage, and workspace path.</p>\
+                    <p class=\"muted\">Active issues, worker host, last known Codex activity, token usage, and workspace location.</p>\
                   </div>\
                 </div>\
                 <table>\
@@ -556,7 +566,7 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
                 <div class=\"section-head\">\
                   <div>\
                     <h2>Retry Queue</h2>\
-                    <p class=\"muted\">Pending retries with due time and last known error.</p>\
+                    <p class=\"muted\">Pending retries with preferred worker host, workspace affinity, due time, and last known error.</p>\
                   </div>\
                 </div>\
                 <table>\
@@ -910,15 +920,27 @@ fn format_running_row(entry: &RunningEntryPayload, running_event_width: usize) -
         ),
         RUNNING_RUNTIME_WIDTH,
     );
-    let event = format_cell(
-        &sanitize_display_text(
+    let event_text = entry
+        .worker_host
+        .as_deref()
+        .map(|worker_host| {
+            format!(
+                "{}: {}",
+                worker_host,
+                entry
+                    .last_message
+                    .as_deref()
+                    .unwrap_or("No Codex message yet.")
+            )
+        })
+        .unwrap_or_else(|| {
             entry
                 .last_message
                 .as_deref()
-                .unwrap_or("No Codex message yet."),
-        ),
-        running_event_width,
-    );
+                .unwrap_or("No Codex message yet.")
+                .to_string()
+        });
+    let event = format_cell(&sanitize_display_text(&event_text), running_event_width);
     let tokens = format_cell(&format_int(entry.tokens.total_tokens), RUNNING_TOKENS_WIDTH);
     format!("│ {issue} {state} {session} {pid} {runtime_turns} {event} {tokens}")
 }
@@ -931,9 +953,10 @@ fn format_retry_row(entry: &RetrySnapshot) -> String {
         .max(0);
     let due_in_seconds = ((due_in + 999) / 1_000).max(0);
     format!(
-        "│  {} attempt={} due_in={}s error={}",
+        "│  {} attempt={} worker={} due_in={}s error={}",
         colorize(&entry.issue_identifier, ANSI_CYAN),
         entry.attempt,
+        inline_text(entry.worker_host.as_deref().unwrap_or("local")),
         due_in_seconds,
         inline_text(entry.error.as_deref().unwrap_or("none"))
     )
@@ -2216,6 +2239,7 @@ const DASHBOARD_JS: &str = r#"
           <div class="issue-stack">
             <span><strong>${escapeHtml(entry.issue_identifier)}</strong></span>
             <span class="issue-title">${escapeHtml(entry.title || 'Untitled task')}</span>
+            <span class="muted">Worker: ${escapeHtml(entry.worker_host || 'local')}</span>
             <div class="issue-links">${links.join('')}</div>
             ${renderTaskMeta(entry)}
           </div>
@@ -2239,7 +2263,7 @@ const DASHBOARD_JS: &str = r#"
             <span class="muted">In ${formatInt(entry.tokens?.input_tokens)} / Out ${formatInt(entry.tokens?.output_tokens)}</span>
           </div>
         </td>
-        <td class="mono">${escapeHtml(entry.workspace)}</td>
+        <td class="mono"><div>${escapeHtml(entry.workspace)}</div><div class="muted">${escapeHtml(entry.worker_host || 'local')}</div></td>
       </tr>`;
     }).join('');
   }
@@ -2249,7 +2273,7 @@ const DASHBOARD_JS: &str = r#"
       return '<tr><td colspan="4" class="empty">Retry queue is empty.</td></tr>';
     }
     return payload.retrying.map((entry) => `<tr>
-      <td><strong>${escapeHtml(entry.issue_identifier)}</strong></td>
+      <td><strong>${escapeHtml(entry.issue_identifier)}</strong><div class="muted">Worker: ${escapeHtml(entry.worker_host || 'local')}</div>${entry.workspace_location ? `<div class="mono muted">${escapeHtml(entry.workspace_location)}</div>` : ''}</td>
       <td>${entry.attempt}</td>
       <td class="mono">${escapeHtml(entry.due_at)}</td>
       <td>${escapeHtml(entry.error || 'none')}</td>
@@ -2513,6 +2537,8 @@ mod tests {
         let html = render_dashboard_html(&sample_payload());
         assert!(html.contains("Open task"));
         assert!(html.contains("Project board"));
+        assert!(html.contains("\"worker_host\":\"ssh-a\""));
+        assert!(html.contains("\"workspace_location\":\"/srv/symphony/ABC-456\""));
         assert!(html.contains("Due "));
         assert!(html.contains("Deadline "));
     }
@@ -2537,6 +2563,7 @@ mod tests {
             }),
             workspace: crate::orchestrator::WorkspaceDetail {
                 path: "/tmp/symphony/TD-123".to_string(),
+                worker_host: Some("ssh-a".to_string()),
             },
             attempts: crate::orchestrator::AttemptDetail {
                 restart_count: 0,
@@ -2555,6 +2582,7 @@ mod tests {
         );
         assert_eq!(payload.tracked["labels"][0], "frontend");
         assert_eq!(payload.tracked["due"]["date"], "2026-03-12");
+        assert_eq!(payload.workspace.worker_host.as_deref(), Some("ssh-a"));
     }
 
     #[test]
@@ -3039,6 +3067,7 @@ mod tests {
                 labels: vec!["frontend".to_string(), "todoist".to_string()],
                 due: Some(json!({"date": "2026-03-12", "string": "tomorrow"})),
                 deadline: Some(json!({"date": "2026-03-14"})),
+                worker_host: Some("ssh-a".to_string()),
                 session_id: Some("sess-123".to_string()),
                 app_server_pid: Some(4242),
                 turn_count: 2,
@@ -3059,6 +3088,8 @@ mod tests {
                 issue_identifier: "ABC-456".to_string(),
                 attempt: 2,
                 due_at: Utc.with_ymd_and_hms(2026, 3, 11, 0, 1, 0).unwrap(),
+                worker_host: Some("ssh-b".to_string()),
+                workspace_location: Some("/srv/symphony/ABC-456".to_string()),
                 error: Some("boom".to_string()),
             }],
             codex_totals: CodexTotalsPayload {
@@ -3101,7 +3132,11 @@ mod tests {
             &fixture_path,
             r#"{
   "tasks": [],
-  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"},
+    {"id":"sec-in-progress","project_id":"proj","name":"In Progress"},
+    {"id":"sec-done","project_id":"proj","name":"Done"}
+  ],
   "user_plan_limits": {"comments": true}
 }"#,
         )

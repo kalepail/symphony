@@ -14,14 +14,13 @@ use tracing::warn;
 use crate::{
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
-    tracker::{TrackerClient, TrackerError},
+    tracker::{TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError},
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_PAGE_SIZE: usize = 200;
 const MAX_ACTIVITY_PAGE_SIZE: usize = 100;
 const DEFAULT_TOOL_PAGE_SIZE: usize = 50;
-const COMMENT_SIZE_LIMIT: usize = 15_000;
 const REFRESH_CONCURRENCY: usize = 10;
 const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
 const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
@@ -734,12 +733,96 @@ impl TodoistTracker {
         let project_id = self.project_id()?;
         let project = self.get_project_resource(&project_id).await?;
         let sections_by_id = self.section_map_for_project(&project_id).await?;
-        self.validate_required_sections(&sections_by_id, &self.config.tracker.active_states)
+        self.validate_required_sections(&sections_by_id, &required_open_sections(&self.config))
             .await?;
         self.resolve_assignee_filter_for_project(&project_id, &project)
             .await?;
         self.ensure_comments_available().await?;
         Ok(())
+    }
+
+    async fn scoped_task_for_mutation(&self, task_id: &str) -> Result<Value, TrackerError> {
+        let task = self.get_task(task_id).await?;
+        self.ensure_task_is_mutable_in_scope(&task)?;
+        Ok(task)
+    }
+
+    fn ensure_task_is_mutable_in_scope(&self, task: &Value) -> Result<(), TrackerError> {
+        let task_id = json_id(task.get("id")).unwrap_or_else(|| "unknown".to_string());
+        let configured_project_id = self.project_id()?;
+        let task_project_id = task
+            .get("project_id")
+            .and_then(json_id_from_value)
+            .ok_or_else(|| {
+                TrackerError::TrackerOperationUnsupported(format!(
+                    "Todoist task `{task_id}` is missing a project_id and cannot be mutated safely."
+                ))
+            })?;
+        if task_project_id != configured_project_id {
+            return Err(TrackerError::TrackerOperationUnsupported(format!(
+                "Todoist task `{task_id}` belongs to project `{task_project_id}`, outside configured project `{configured_project_id}`."
+            )));
+        }
+
+        if let Some(runtime_label) = self.runtime_label_filter() {
+            let labels = task
+                .get("labels")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let in_scope = labels
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|label| label.eq_ignore_ascii_case(runtime_label.as_str()));
+            if !in_scope {
+                return Err(TrackerError::TrackerOperationUnsupported(format!(
+                    "Todoist task `{task_id}` is outside runtime label scope `{runtime_label}`."
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_project_in_scope(&self, project_id: &str, action: &str) -> Result<(), TrackerError> {
+        let configured_project_id = self.project_id()?;
+        if project_id != configured_project_id {
+            return Err(TrackerError::TrackerOperationUnsupported(format!(
+                "{action} cannot target Todoist project `{project_id}` outside configured project `{configured_project_id}`."
+            )));
+        }
+        Ok(())
+    }
+
+    async fn ensure_section_in_scope(
+        &self,
+        section_id: &str,
+        action: &str,
+    ) -> Result<(), TrackerError> {
+        let section = self.get_section(section_id).await?;
+        let project_id = section
+            .get("project_id")
+            .and_then(json_id_from_value)
+            .ok_or(TrackerError::TodoistUnknownPayload)?;
+        self.ensure_project_in_scope(&project_id, action)
+    }
+
+    async fn ensure_parent_task_in_scope(
+        &self,
+        parent_id: &str,
+        action: &str,
+    ) -> Result<(), TrackerError> {
+        self.scoped_task_for_mutation(parent_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                TrackerError::TrackerOperationUnsupported(message) => {
+                    TrackerError::TrackerOperationUnsupported(format!(
+                        "{action} parent task rejected: {message}"
+                    ))
+                }
+                other => other,
+            })
     }
 
     async fn comments_query(
@@ -777,6 +860,35 @@ impl TodoistTracker {
 
 #[async_trait]
 impl TrackerClient for TodoistTracker {
+    async fn capabilities(&self) -> Result<TrackerCapabilities, TrackerError> {
+        let limits = match self.user_plan_limits().await {
+            Ok(limits) => limits,
+            Err(error) if comments_plan_probe_is_soft_failure(&error) => {
+                return Ok(TrackerCapabilities {
+                    comments: true,
+                    reminders: false,
+                    activity_log: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(TrackerCapabilities {
+            comments: limits
+                .get("comments")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            reminders: limits
+                .get("reminders")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            activity_log: limits
+                .get("activity_log")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
     async fn validate_startup(&self) -> Result<(), TrackerError> {
         self.validate_startup_config().await
     }
@@ -1033,11 +1145,17 @@ impl TrackerClient for TodoistTracker {
                     "`content` is required for create_comment".to_string(),
                 )
             })?;
-        if content.len() > COMMENT_SIZE_LIMIT {
+        if content.len() > TODOIST_COMMENT_SIZE_LIMIT {
             return Err(TrackerError::TodoistCommentTooLarge {
-                limit: COMMENT_SIZE_LIMIT,
+                limit: TODOIST_COMMENT_SIZE_LIMIT,
                 actual: content.len(),
             });
+        }
+        if let Some(project_id) = arguments.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "create_comment")?;
+        }
+        if let Some(task_id) = arguments.get("task_id").and_then(json_id_from_value) {
+            self.scoped_task_for_mutation(&task_id).await?;
         }
         let mut body = comment_target_body(arguments)?
             .as_object()
@@ -1064,9 +1182,9 @@ impl TrackerClient for TodoistTracker {
                     "`content` is required for update_comment".to_string(),
                 )
             })?;
-        if content.len() > COMMENT_SIZE_LIMIT {
+        if content.len() > TODOIST_COMMENT_SIZE_LIMIT {
             return Err(TrackerError::TodoistCommentTooLarge {
-                limit: COMMENT_SIZE_LIMIT,
+                limit: TODOIST_COMMENT_SIZE_LIMIT,
                 actual: content.len(),
             });
         }
@@ -1080,10 +1198,18 @@ impl TrackerClient for TodoistTracker {
     }
 
     async fn update_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
+        self.scoped_task_for_mutation(task_id).await?;
         let mut body = sanitize_write_arguments(arguments)
             .as_object()
             .cloned()
             .unwrap_or_default();
+        if let Some(project_id) = body.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "update_task")?;
+        }
+        if let Some(section_id) = body.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&section_id, "update_task")
+                .await?;
+        }
         if body.contains_key("labels")
             && let Some(label) = self.runtime_label_filter().as_deref()
         {
@@ -1099,7 +1225,19 @@ impl TrackerClient for TodoistTracker {
     }
 
     async fn move_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
+        self.scoped_task_for_mutation(task_id).await?;
         let body = move_task_body(arguments)?;
+        if let Some(project_id) = body.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "move_task")?;
+        }
+        if let Some(section_id) = body.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&section_id, "move_task")
+                .await?;
+        }
+        if let Some(parent_id) = body.get("parent_id").and_then(json_id_from_value) {
+            self.ensure_parent_task_in_scope(&parent_id, "move_task")
+                .await?;
+        }
         self.request_json(
             Method::POST,
             &format!("/tasks/{task_id}/move"),
@@ -1110,11 +1248,13 @@ impl TrackerClient for TodoistTracker {
     }
 
     async fn close_task(&self, task_id: &str) -> Result<Value, TrackerError> {
+        self.scoped_task_for_mutation(task_id).await?;
         self.request_json(Method::POST, &format!("/tasks/{task_id}/close"), None, None)
             .await
     }
 
     async fn reopen_task(&self, task_id: &str) -> Result<Value, TrackerError> {
+        self.scoped_task_for_mutation(task_id).await?;
         self.request_json(
             Method::POST,
             &format!("/tasks/{task_id}/reopen"),
@@ -1148,6 +1288,23 @@ impl TrackerClient for TodoistTracker {
         {
             body.insert("project_id".to_string(), Value::String(project_id));
         }
+        if let Some(project_id) = body.get("project_id").and_then(json_id_from_value) {
+            self.ensure_project_in_scope(&project_id, "create_task")?;
+        }
+        if let Some(section_id) = body.get("section_id").and_then(json_id_from_value) {
+            self.ensure_section_in_scope(&section_id, "create_task")
+                .await?;
+        }
+        if let Some(parent_id) = body.get("parent_id").and_then(json_id_from_value) {
+            self.ensure_parent_task_in_scope(&parent_id, "create_task")
+                .await?;
+        }
+        let origin_task_id = body.remove("origin_task_id").and_then(|value| match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        });
+        maybe_add_origin_back_reference(&mut body, origin_task_id.as_deref());
         if let Some(label) = self.runtime_label_filter().as_deref() {
             enforce_runtime_label_scope(&mut body, label);
         }
@@ -1491,6 +1648,47 @@ fn task_list_request(
     }
 
     Ok(("/tasks", query))
+}
+
+fn required_open_sections(config: &ServiceConfig) -> Vec<String> {
+    let mut sections = config.tracker.active_states.clone();
+    if config.tracker.terminal_states_explicit {
+        sections.extend(
+            config
+                .tracker
+                .terminal_states
+                .iter()
+                .filter(|state| normalize_state_name(state) != "done")
+                .cloned(),
+        );
+    }
+    sections
+}
+
+fn maybe_add_origin_back_reference(body: &mut Map<String, Value>, origin_task_id: Option<&str>) {
+    let Some(origin_task_id) = origin_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let origin_reference = format!("TD-{origin_task_id}");
+    let origin_lower = origin_reference.to_ascii_lowercase();
+    let existing = body
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if existing.to_ascii_lowercase().contains(origin_lower.as_str()) {
+        return;
+    }
+
+    let description = if existing.is_empty() {
+        format!("Origin: {origin_reference}")
+    } else {
+        format!("{existing}\n\nOrigin: {origin_reference}")
+    };
+    body.insert("description".to_string(), Value::String(description));
 }
 
 fn merge_action_defaults(arguments: Value, defaults: Value) -> Value {
@@ -1880,7 +2078,7 @@ mod tests {
     };
     use crate::{
         config::ServiceConfig,
-        tracker::{TrackerClient, TrackerError},
+        tracker::{TrackerCapabilities, TrackerClient, TrackerError},
     };
 
     #[derive(Clone)]
@@ -1972,7 +2170,8 @@ mod tests {
             "base_url": base_url,
             "api_key": "token",
             "project_id": "proj",
-            "active_states": ["Todo", "In Progress"]
+            "active_states": ["Todo", "In Progress"],
+            "terminal_states": ["Done"]
         });
         if let Some(assignee) = assignee {
             tracker["assignee"] = json!(assignee);
@@ -2373,6 +2572,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_reflect_plan_limits() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }),
+            sections: vec![json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"})],
+            collaborators: Vec::new(),
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({
+                "comments": true,
+                "reminders": false,
+                "activity_log": false
+            }),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, None));
+        let capabilities = tracker.capabilities().await.expect("capabilities");
+
+        assert_eq!(
+            capabilities,
+            TrackerCapabilities {
+                comments: true,
+                reminders: false,
+                activity_log: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_requires_non_done_terminal_sections() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }),
+            sections: vec![json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"})],
+            collaborators: Vec::new(),
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({"comments": true}),
+        })
+        .await;
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "base_url": server.base_url,
+                    "api_key": "token",
+                    "project_id": "proj",
+                    "active_states": ["Todo"],
+                    "terminal_states": ["Done", "Merging"]
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = TodoistTracker::new(config);
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("missing merging section");
+
+        assert_eq!(error.to_string(), "todoist_missing_required_section Merging");
+    }
+
+    #[tokio::test]
+    async fn create_task_adds_origin_back_reference_and_defaults_to_todo_section() {
+        async fn get_project() -> impl IntoResponse {
+            Json(json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }))
+        }
+
+        async fn list_sections() -> impl IntoResponse {
+            Json(json!({
+                "results": [
+                    {"id": "sec-todo", "project_id": "proj", "name": "Todo"}
+                ],
+                "next_cursor": null
+            }))
+        }
+
+        async fn create_task(Json(mut body): Json<Value>) -> impl IntoResponse {
+            if let Some(map) = body.as_object_mut() {
+                map.insert("id".to_string(), Value::String("task-1".to_string()));
+            }
+            (HttpStatusCode::OK, Json(body)).into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/projects/{project_id}", get(get_project))
+                .route("/sections", get(list_sections))
+                .route("/tasks", post(create_task));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        let task = tracker
+            .create_task(json!({
+                "content": "Follow-up",
+                "description": "Investigate",
+                "origin_task_id": "123"
+            }))
+            .await
+            .expect("task");
+        join.abort();
+
+        assert_eq!(task["project_id"], "proj");
+        assert_eq!(task["section_id"], "sec-todo");
+        assert_eq!(task["description"], "Investigate\n\nOrigin: TD-123");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_foreign_project_targets() {
+        let tracker = TodoistTracker::new(tracker_config("http://127.0.0.1:1", None));
+        let error = tracker
+            .create_task(json!({
+                "content": "Follow-up",
+                "project_id": "other"
+            }))
+            .await
+            .expect_err("foreign project");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported create_task cannot target Todoist project `other` outside configured project `proj`."
+        );
+    }
+
+    #[tokio::test]
+    async fn update_task_rejects_runtime_label_scope_violations() {
+        async fn get_task() -> impl IntoResponse {
+            Json(json!({
+                "id": "task-1",
+                "content": "Scoped",
+                "project_id": "proj",
+                "section_id": "sec-todo",
+                "labels": ["backend"]
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new().route("/tasks/{task_id}", get(get_task));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "base_url": format!("http://{address}"),
+                    "api_key": "token",
+                    "project_id": "proj",
+                    "active_states": ["Todo", "In Progress"],
+                    "label": "symphony-runtime"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = TodoistTracker::new(config);
+        let error = tracker
+            .update_task("task-1", json!({"content": "Nope"}))
+            .await
+            .expect_err("label scope");
+        join.abort();
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported Todoist task `task-1` is outside runtime label scope `symphony-runtime`."
+        );
+    }
+
+    #[tokio::test]
     async fn list_projects_retries_rate_limited_reads() {
         async fn list_projects(State(attempts): State<Arc<AtomicUsize>>) -> impl IntoResponse {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
@@ -2501,6 +2889,22 @@ mod tests {
 
     #[tokio::test]
     async fn create_task_retries_rate_limited_writes_with_stable_request_id() {
+        async fn get_section(Path(section_id): Path<String>) -> impl IntoResponse {
+            if section_id == "sec-todo" {
+                (
+                    HttpStatusCode::OK,
+                    Json(json!({
+                        "id": "sec-todo",
+                        "project_id": "proj",
+                        "name": "Todo"
+                    })),
+                )
+                    .into_response()
+            } else {
+                (HttpStatusCode::NOT_FOUND, "").into_response()
+            }
+        }
+
         async fn create_task(
             State(state): State<(Arc<AtomicUsize>, Arc<Mutex<Vec<Option<String>>>>)>,
             headers: HeaderMap,
@@ -2531,6 +2935,7 @@ mod tests {
         let state = (attempts.clone(), request_ids.clone());
         let join = tokio::spawn(async move {
             let app = Router::new()
+                .route("/sections/{section_id}", get(get_section))
                 .route("/tasks", post(create_task))
                 .with_state(state);
             let _ = axum::serve(listener, app).await;

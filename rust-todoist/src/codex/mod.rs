@@ -18,8 +18,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    config::ServiceConfig, dynamic_tool, issue::Issue, tracker::TrackerClient,
-    workspace::validate_workspace_path,
+    config::ServiceConfig,
+    dynamic_tool,
+    issue::Issue,
+    tracker::TrackerClient,
+    workspace::{
+        remote_shell_assign, ssh_args, ssh_executable, validate_workspace_path_for_worker,
+    },
 };
 
 const NON_INTERACTIVE_ANSWER: &str =
@@ -30,6 +35,7 @@ const APP_SERVER_STOP_TIMEOUT_SECS: u64 = 5;
 pub struct CodexEvent {
     pub event: String,
     pub timestamp: DateTime<Utc>,
+    pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -76,6 +82,7 @@ pub struct AppServerSession {
     config: ServiceConfig,
     tracker: Arc<dyn TrackerClient>,
     workspace: PathBuf,
+    worker_host: Option<String>,
     child: Child,
     stdin: ChildStdin,
     stdout_rx: mpsc::UnboundedReceiver<RawLine>,
@@ -92,6 +99,7 @@ pub struct TurnSession {
 
 struct TurnContext<'a> {
     pid: Option<u32>,
+    worker_host: Option<String>,
     session_id: &'a str,
     thread_id: String,
     turn_id: &'a str,
@@ -118,29 +126,20 @@ impl AppServerClient {
     }
 
     pub async fn start_session(&self, workspace: &Path) -> Result<AppServerSession, CodexError> {
-        validate_workspace_path(&self.config.workspace.root, workspace)
+        self.start_session_on_host(workspace, None).await
+    }
+
+    pub async fn start_session_on_host(
+        &self,
+        workspace: &Path,
+        worker_host: Option<&str>,
+    ) -> Result<AppServerSession, CodexError> {
+        validate_workspace_path_for_worker(&self.config, workspace, worker_host)
             .map_err(|error| CodexError::InvalidWorkspaceCwd(error.to_string()))?;
 
         let workspace = workspace.to_path_buf();
-        let shell =
-            app_server_shell().ok_or_else(|| CodexError::CodexNotFound("no_shell_found".into()))?;
-
-        let mut child = Command::new(shell)
-            .arg("-lc")
-            .arg(&self.config.codex.command)
-            .current_dir(&workspace)
-            .env_remove("TODOIST_API_TOKEN")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    CodexError::CodexNotFound(error.to_string())
-                } else {
-                    CodexError::Io(error.to_string())
-                }
-            })?;
+        let worker_host = worker_host.map(ToOwned::to_owned);
+        let mut child = spawn_app_server_process(&self.config, &workspace, worker_host.as_deref())?;
 
         let codex_app_server_pid = child.id();
         let stdin = child
@@ -163,6 +162,7 @@ impl AppServerClient {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
             workspace,
+            worker_host,
             child,
             stdin,
             stdout_rx,
@@ -203,7 +203,7 @@ impl AppServerSession {
                 "cwd": self.workspace,
                 "title": format!("{}: {}", issue.identifier, issue.title),
                 "approvalPolicy": self.config.codex.approval_policy,
-                "sandboxPolicy": self.config.codex.turn_sandbox_policy
+                "sandboxPolicy": turn_sandbox_policy_for_workspace(&self.config, &self.workspace)
             }
         });
         self.send_json(&payload).await?;
@@ -214,6 +214,7 @@ impl AppServerSession {
                 on_event(event_with(
                     "startup_failed",
                     self.codex_app_server_pid,
+                    self.worker_host.clone(),
                     None,
                     None,
                     None,
@@ -231,6 +232,7 @@ impl AppServerSession {
         on_event(event_with(
             "session_started",
             self.codex_app_server_pid,
+            self.worker_host.clone(),
             Some(session_id.clone()),
             Some(self.thread_id.clone()),
             Some(turn_id.clone()),
@@ -265,6 +267,7 @@ impl AppServerSession {
                         if let Some(method) = message.get("method").and_then(Value::as_str) {
                             let turn = TurnContext {
                                 pid: self.codex_app_server_pid,
+                                worker_host: self.worker_host.clone(),
                                 session_id: &session_id,
                                 thread_id: self.thread_id.clone(),
                                 turn_id: &turn_id,
@@ -291,6 +294,7 @@ impl AppServerSession {
                         on_event(event_with(
                             "malformed",
                             self.codex_app_server_pid,
+                            self.worker_host.clone(),
                             Some(session_id.clone()),
                             Some(self.thread_id.clone()),
                             Some(turn_id.clone()),
@@ -303,6 +307,7 @@ impl AppServerSession {
                     on_event(event_with(
                         "malformed",
                         self.codex_app_server_pid,
+                        self.worker_host.clone(),
                         Some(session_id.clone()),
                         Some(self.thread_id.clone()),
                         Some(turn_id.clone()),
@@ -358,6 +363,8 @@ impl AppServerSession {
 
     async fn start_thread(&mut self) -> Result<(), CodexError> {
         let request_id = 2;
+        let dynamic_tools =
+            dynamic_tool::tool_specs_with_tracker(&self.config, self.tracker.as_ref()).await;
         let payload = json!({
             "id": request_id,
             "method": "thread/start",
@@ -365,7 +372,7 @@ impl AppServerSession {
                 "approvalPolicy": self.config.codex.approval_policy,
                 "sandbox": self.config.codex.thread_sandbox,
                 "cwd": self.workspace,
-                "dynamicTools": dynamic_tool::tool_specs(&self.config)
+                "dynamicTools": dynamic_tools
             }
         });
         self.send_json(&payload).await?;
@@ -736,6 +743,63 @@ impl Drop for AppServerSession {
     }
 }
 
+fn spawn_app_server_process(
+    config: &ServiceConfig,
+    workspace: &Path,
+    worker_host: Option<&str>,
+) -> Result<Child, CodexError> {
+    if let Some(worker_host) = worker_host {
+        let executable = ssh_executable().map_err(|error| CodexError::Io(error.to_string()))?;
+        let remote_command = format!(
+            "{}\ncd \"$workspace\" && exec {}",
+            remote_shell_assign("workspace", &workspace.to_string_lossy()),
+            config.codex.command
+        );
+        let mut child = Command::new(executable);
+        child
+            .args(ssh_args(worker_host, &remote_command))
+            .env_remove("TODOIST_API_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        child.spawn().map_err(spawn_error)
+    } else {
+        let shell =
+            app_server_shell().ok_or_else(|| CodexError::CodexNotFound("no_shell_found".into()))?;
+        Command::new(shell)
+            .arg("-lc")
+            .arg(&config.codex.command)
+            .current_dir(workspace)
+            .env_remove("TODOIST_API_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(spawn_error)
+    }
+}
+
+fn spawn_error(error: std::io::Error) -> CodexError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        CodexError::CodexNotFound(error.to_string())
+    } else {
+        CodexError::Io(error.to_string())
+    }
+}
+
+fn turn_sandbox_policy_for_workspace(config: &ServiceConfig, workspace: &Path) -> Value {
+    let mut policy = config.codex.turn_sandbox_policy.clone();
+    if let Some(policy_map) = policy.as_object_mut()
+        && policy_map.contains_key("writableRoots")
+    {
+        policy_map.insert(
+            "writableRoots".to_string(),
+            json!([workspace.to_string_lossy().to_string()]),
+        );
+    }
+    policy
+}
+
 fn spawn_stdout_task(stdout: ChildStdout) -> mpsc::UnboundedReceiver<RawLine> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -933,6 +997,7 @@ fn event(
     CodexEvent {
         event: event.to_string(),
         timestamp: Utc::now(),
+        worker_host: turn.worker_host.clone(),
         session_id: Some(turn.session_id.to_string()),
         thread_id: Some(turn.thread_id.clone()),
         turn_id: Some(turn.turn_id.to_string()),
@@ -948,6 +1013,7 @@ fn event(
 fn event_with(
     event: &str,
     pid: Option<u32>,
+    worker_host: Option<String>,
     session_id: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -957,6 +1023,7 @@ fn event_with(
     CodexEvent {
         event: event.to_string(),
         timestamp: Utc::now(),
+        worker_host,
         session_id,
         thread_id,
         turn_id,
@@ -1224,6 +1291,137 @@ done
 
         unsafe {
             std::env::remove_var("TODOIST_API_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_session_on_host_uses_ssh_launch_and_emits_worker_host_metadata() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let remote_workspace = home.join("remote-workspaces").join("MT-REMOTE");
+        fs::create_dir_all(&remote_workspace).expect("workspace");
+        let trace = dir.path().join("remote-trace.log");
+        let ssh = dir.path().join("ssh");
+        write_executable(
+            &ssh,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -F|-p)
+      shift 2
+      ;;
+    -T)
+      shift
+      ;;
+    *)
+      shift
+      break
+      ;;
+  esac
+done
+exec /bin/sh -lc "$1"
+"#,
+        );
+        let script = dir.path().join("fake-codex.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$(pwd)" > "{}"
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{{"id":1,"result":{{}}}}'
+      ;;
+    2)
+      ;;
+    3)
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-remote"}}}}}}'
+      ;;
+    4)
+      printf '%s\n' '{{"id":10,"result":{{"turn":{{"id":"turn-remote"}}}}}}'
+      printf '%s\n' '{{"method":"turn/completed"}}'
+      exit 0
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+done
+"#,
+                trace.display()
+            ),
+        );
+
+        unsafe {
+            std::env::set_var("SYMPHONY_SSH_BIN", &ssh);
+            std::env::set_var("HOME", &home);
+        }
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": {
+                    "root": "~/remote-workspaces"
+                },
+                "codex": {
+                    "command": script.display().to_string()
+                }
+            })
+            .as_object()
+            .expect("config object"),
+        )
+        .expect("config");
+        let app = AppServerClient::new(
+            config,
+            Arc::new(StubTracker {
+                tool_result: Ok(json!({ "data": {} })),
+            }),
+        );
+
+        let mut session = app
+            .start_session_on_host(
+                Path::new("~/remote-workspaces/MT-REMOTE"),
+                Some("builder-1"),
+            )
+            .await
+            .expect("session");
+        let events = Arc::new(Mutex::new(Vec::<CodexEvent>::new()));
+        let captured = Arc::clone(&events);
+        session
+            .run_turn(
+                "Remote turn",
+                &sample_issue(),
+                &CancellationToken::new(),
+                move |event| captured.lock().expect("events").push(event),
+            )
+            .await
+            .expect("turn");
+        session.stop().await;
+
+        assert_eq!(
+            fs::read_to_string(&trace).expect("trace").trim(),
+            remote_workspace.display().to_string()
+        );
+        let events = events.lock().expect("events");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.worker_host.as_deref() == Some("builder-1"))
+        );
+
+        unsafe {
+            std::env::remove_var("SYMPHONY_SSH_BIN");
+            std::env::remove_var("HOME");
         }
     }
 

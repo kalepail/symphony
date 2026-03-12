@@ -173,6 +173,11 @@ tracker:
   terminal_states:
     - Cancelled
     - Duplicate
+worker:
+  ssh_hosts:
+    - builder-a
+    - builder-b:2222
+  max_concurrent_agents_per_host: 2
 ```
 
 ### State Model
@@ -181,6 +186,18 @@ tracker:
 - `Done` -> close task
 - `Cancelled` / `Duplicate` -> explicit open-task sections
 - orchestrator dispatch targets top-level tasks by default, not subtasks
+- non-`Done` terminal sections are only required at startup when the workflow explicitly configures
+  them in `terminal_states`
+
+### Distributed Execution
+
+- `worker.ssh_hosts` enables SSH-backed worker placement
+- when multiple worker hosts are configured, Symphony dispatches to the least-loaded host and
+  preserves host affinity across retries where possible
+- `worker.max_concurrent_agents_per_host` applies an optional per-host cap on top of the global
+  agent limit
+- remote workspace paths preserve the configured `workspace.root` string, including `~`, so hooks,
+  Codex sessions, cleanup, and operator surfaces all refer to the same logical remote path
 
 ### Identifier Model
 

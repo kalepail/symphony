@@ -16,6 +16,7 @@ pub struct ServiceConfig {
     pub polling: PollingConfig,
     pub observability: ObservabilityConfig,
     pub workspace: WorkspaceConfig,
+    pub worker: WorkerConfig,
     pub hooks: HookConfig,
     pub agent: AgentConfig,
     pub codex: CodexConfig,
@@ -33,6 +34,8 @@ pub struct TrackerConfig {
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    #[serde(skip)]
+    pub terminal_states_explicit: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +53,13 @@ pub struct ObservabilityConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
+    pub root_raw: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    pub ssh_hosts: Vec<String>,
+    pub max_concurrent_agents_per_host: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +120,7 @@ impl ServiceConfig {
         let polling = parse_polling_config(config.get("polling"))?;
         let observability = parse_observability_config(config.get("observability"))?;
         let workspace = parse_workspace_config(config.get("workspace"))?;
+        let worker = parse_worker_config(config.get("worker"))?;
         let hooks = parse_hook_config(config.get("hooks"))?;
         let agent = parse_agent_config(config.get("agent"))?;
         let codex = parse_codex_config(config.get("codex"), &workspace.root)?;
@@ -120,6 +131,7 @@ impl ServiceConfig {
             polling,
             observability,
             workspace,
+            worker,
             hooks,
             agent,
             codex,
@@ -210,6 +222,7 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
             "tracker.terminal_states",
             &["Cancelled", "Canceled", "Duplicate", "Done"],
         )?,
+        terminal_states_explicit: map.contains_key("terminal_states"),
     })
 }
 
@@ -242,8 +255,22 @@ fn parse_observability_config(value: Option<&Value>) -> Result<ObservabilityConf
 fn parse_workspace_config(value: Option<&Value>) -> Result<WorkspaceConfig, ConfigError> {
     let map = as_object(value, "workspace")?;
     let root = optional_string(map.get("root"), "workspace.root")?;
+    let root_raw = resolve_path_string(root.as_deref(), &default_workspace_root_string());
     Ok(WorkspaceConfig {
-        root: resolve_path_value(root.as_deref(), default_workspace_root()),
+        root: resolve_path_value(Some(root_raw.as_str()), default_workspace_root()),
+        root_raw,
+    })
+}
+
+fn parse_worker_config(value: Option<&Value>) -> Result<WorkerConfig, ConfigError> {
+    let map = as_object(value, "worker")?;
+    Ok(WorkerConfig {
+        ssh_hosts: parse_string_list(map.get("ssh_hosts"), "worker.ssh_hosts", &[])?,
+        max_concurrent_agents_per_host: parse_positive_u64(
+            map.get("max_concurrent_agents_per_host"),
+            "worker.max_concurrent_agents_per_host",
+        )?
+        .map(|value| value as usize),
     })
 }
 
@@ -517,14 +544,7 @@ fn env_reference(value: &str) -> Option<&str> {
 }
 
 fn resolve_path_value(value: Option<&str>, default: PathBuf) -> PathBuf {
-    let raw = value
-        .and_then(|value| {
-            env_reference(value)
-                .map(runtime_env::get)
-                .unwrap_or_else(|| Some(value.to_string()))
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.display().to_string());
+    let raw = resolve_path_string(value, &default.display().to_string());
 
     let expanded = shellexpand::tilde(&raw).to_string();
     let path = PathBuf::from(&expanded);
@@ -544,8 +564,24 @@ fn resolve_path_value(value: Option<&str>, default: PathBuf) -> PathBuf {
     PathBuf::from(raw)
 }
 
+fn resolve_path_string(value: Option<&str>, default: &str) -> String {
+    value
+        .and_then(|value| {
+            env_reference(value)
+                .map(runtime_env::get)
+                .unwrap_or_else(|| Some(value.to_string()))
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn default_workspace_root() -> PathBuf {
     env::temp_dir().join("symphony_workspaces")
+}
+
+fn default_workspace_root_string() -> String {
+    default_workspace_root().display().to_string()
 }
 
 fn default_approval_policy() -> Value {
@@ -618,6 +654,10 @@ mod tests {
                         "In Progress": 2,
                         "Review": 3
                     }
+                },
+                "worker": {
+                    "ssh_hosts": ["builder-1", "builder-2"],
+                    "max_concurrent_agents_per_host": 4
                 }
             })
             .as_object()
@@ -629,6 +669,8 @@ mod tests {
         assert_eq!(config.tracker.label.as_deref(), Some("symphony-full-smoke"));
         assert_eq!(config.max_concurrent_agents_for_state("in progress"), 2);
         assert_eq!(config.max_concurrent_agents_for_state("review"), 3);
+        assert_eq!(config.worker.ssh_hosts, vec!["builder-1", "builder-2"]);
+        assert_eq!(config.worker.max_concurrent_agents_per_host, Some(4));
     }
 
     #[test]
@@ -819,6 +861,7 @@ mod tests {
 
         assert_eq!(config.tracker.api_key.as_deref(), Some("dotenv-token"));
         assert_eq!(config.workspace.root.to_string_lossy(), "/tmp/overlay-root");
+        assert_eq!(config.workspace.root_raw, "/tmp/overlay-root");
         assert!(std::env::var("TODOIST_API_TOKEN").is_err());
         assert!(std::env::var("SYMPHONY_WORKSPACE_ROOT").is_err());
         runtime_env::clear_for_tests();
@@ -967,9 +1010,32 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.workspace.root, dir.path());
+        assert_eq!(config.workspace.root_raw, dir.path().display().to_string());
 
         unsafe {
             std::env::remove_var(env_name);
         }
+    }
+
+    #[test]
+    fn preserves_remote_safe_workspace_root_string() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": {
+                    "root": "~/remote-workspaces"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.workspace.root_raw, "~/remote-workspaces");
+        assert!(config.workspace.root.is_absolute());
     }
 }
