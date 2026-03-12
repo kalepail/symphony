@@ -111,8 +111,10 @@ Notes:
 - The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the stronger unattended workflow contract used by Symphony: explicit task-scoped workpad discipline, PR feedback sweeps, Todoist-native rework handling, and a completion bar before the canonical review handoff state `Human Review`.
 - `tracker.kind` supports `todoist` for live runs and `memory` for deterministic local/system tests backed by a fixture file.
 - `tracker.label` is an optional Todoist-native routing filter when one runtime should own only a subset of a shared project.
+- If `tracker.assignee` is configured, the project must support assignment and any explicit assignee id must be a valid Todoist collaborator for that shared project.
 - When `tracker.label` is configured, `todoist.create_task` automatically inherits that label so follow-up tasks stay inside the same runtime ownership boundary.
 - Top-level `todoist.create_task` calls default into the project's `Todo` section when no `section_id` is supplied. Use `parent_id` only for true subtasks.
+- Todoist comments must be available on the connected account or plan. Symphony validates that at startup because task-scoped workpad comments are part of the core runtime contract.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
 - `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
@@ -126,7 +128,7 @@ Notes:
 - Optional web observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now uses live SSE updates, keeps runtime clocks moving client-side, and falls back to `/api/v1/state` polling if the stream is unavailable. The terminal dashboard is enabled independently through `observability.terminal_enabled`.
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.
 - The sample `before_remove` hook first checks for `./scripts/workspace_before_remove.sh` in the target repo, then falls back to the bundled [`rust-todoist/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) path when the workspace itself is this repository. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
-- [`rust/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
+- [`rust-todoist/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
 - When Symphony exposes the host-side `github_api` tool, prefer it for both PR creation and post-publish metadata writes such as applying the `symphony` label. This avoids the in-session `gh auth token` drift that can appear even when host GitHub auth is healthy.
 - The smoke workflows are label-scoped on purpose: `symphony-smoke-minimal` and `symphony-smoke-full` let multiple Todoist runtimes share one smoke project without stealing each other's tasks.
 
@@ -176,7 +178,7 @@ For parity with the original Elixir implementation and the root [SPEC.md](../SPE
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
 
-`Human Review`, `Rework`, and `Merging` are first-class workflow states in the Todoist runtime. Smoke and production workflows should use those canonical names directly, and rework should preserve the surviving PR diff instead of restarting blindly from `origin/main`.
+`Human Review`, `Rework`, and `Merging` are first-class workflow states in the Todoist runtime. Smoke and production workflows should use those canonical names directly, and rework should preserve the surviving PR diff instead of restarting blindly from `origin/main`. `Human Review` is intentionally a handoff column rather than an active dispatch state, so Symphony resumes only after a human moves the task to `Rework` or `Merging`.
 
 ## Testing
 
@@ -184,6 +186,7 @@ For parity with the original Elixir implementation and the root [SPEC.md](../SPE
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test --test live_e2e -- --ignored --nocapture
 sh -n scripts/workspace_before_remove.sh
 sh -n scripts/github_publish_preflight.sh
 ```
@@ -195,3 +198,4 @@ Tracked live-smoke workflow files now live alongside the main workflow:
 - [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
 - [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
 - [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`.
+- [tests/live_e2e.rs](./tests/live_e2e.rs) is the env-gated real Todoist/Codex integration test modeled after Elixir’s live E2E harness.

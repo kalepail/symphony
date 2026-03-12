@@ -4,6 +4,7 @@ tracker:
   api_key: $TODOIST_API_TOKEN
   project_id: $SYMPHONY_SMOKE_PROJECT_ID
   label: symphony-smoke-full
+  # `Human Review` is a handoff state, not an active dispatch state.
   active_states:
     - Todo
     - In Progress
@@ -154,7 +155,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
+   - `Human Review` -> human handoff state. Do not make changes, and expect Symphony to stay idle until a human moves the task to `Rework` or `Merging`.
    - `Merging` -> on entry, run the `land` skill flow; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
@@ -300,8 +301,8 @@ Use this only when completion is blocked by missing required tools or missing au
 
 ## Step 3: Human Review and merge handling
 
-1. When the task is in `Human Review`, do not code or change task content.
-2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
+1. When the task is in `Human Review`, do not code or change task content. This is an operator handoff state, so no new Symphony turn should run until a human moves the task to `Rework` or `Merging`.
+2. Humans should poll GitHub review updates while the task stays in `Human Review`.
 3. If review feedback requires changes, move the task to `Rework` and follow the rework flow.
 4. If approved, human moves the task to `Merging`.
 5. When the task is in `Merging`, run the `land` skill in a loop until the PR is merged. If the checkout does not contain the skill file, use the runtime-provided `land` skill guidance instead of a repo-local path. Do not call `gh pr merge` directly.
@@ -355,7 +356,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Include a clear title, description, acceptance criteria, and a short back-reference to the current `TD-...` task in the follow-up description.
 - Todoist has no native `related` or `blockedBy` graph in v1, so record dependency notes in the task description instead of inventing structured relation fields.
 - Do not move to `Human Review` unless the `Completion bar before review handoff` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
+- In `Human Review`, do not make changes. A human must move the task to `Rework` or `Merging` before Symphony runs again.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep task text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

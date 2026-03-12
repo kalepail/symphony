@@ -18,12 +18,14 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - `TODOIST_API_TOKEN`
 - `SYMPHONY_WORKSPACE_ROOT`
 - `SYMPHONY_SMOKE_PROJECT_ID`
+- If `tracker.assignee` will be set, a Todoist project that supports assignment and exposes the intended assignee as a collaborator
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
 - For the direct GitHub REST fallback, either `GH_TOKEN` / `GITHUB_TOKEN` is exported or `gh auth token` succeeds on the host
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
 Seed minimal smoke tasks with the label `symphony-smoke-minimal` and full/rework/merge smoke tasks with the label `symphony-smoke-full`.
+Todoist comments must be available on the connected account or plan because the persistent Symphony workpad is a task-scoped comment and startup now validates that capability.
 
 ## Canonical Todoist Sections
 
@@ -33,6 +35,7 @@ For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), th
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
 
 Smoke parity runs and production workflows should use the canonical names above directly.
+`Human Review` is a human handoff column, not an active dispatch state. Symphony resumes only after a human moves the task to `Rework` or `Merging`.
 For workpad validation, treat task-scoped comments and their `item_id` field as the canonical Todoist comment surface for a task. Full workflow runs should leave exactly one surviving task-scoped workpad comment marked by both `## Codex Workpad` and `<!-- symphony:workpad -->`.
 
 ## Operator Preflight
@@ -49,6 +52,7 @@ This verifies both the `gh` path and the direct GitHub REST fallback against the
 
 - Minimal live smoke: [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md)
 - Full live smoke: [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md)
+- Repo-owned live E2E harness: [tests/live_e2e.rs](./tests/live_e2e.rs)
 
 ## Observability Evidence
 

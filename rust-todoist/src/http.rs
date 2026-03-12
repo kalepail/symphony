@@ -406,14 +406,24 @@ mod tests {
 
     async fn test_runtime(invalidate_workflow: bool) -> (Orchestrator, WorkflowStore) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let fixture_path = dir.path().join("memory.json");
+        std::fs::write(
+            &fixture_path,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
         let workflow_path = dir.path().join("WORKFLOW.md");
         std::fs::write(
             &workflow_path,
-            r#"---
+            format!(
+                r#"---
 tracker:
-  kind: todoist
-  base_url: "http://127.0.0.1:9/api/v1"
-  api_key: token
+  kind: memory
+  fixture_path: {}
   project_id: proj
   active_states:
     - Todo
@@ -426,6 +436,8 @@ workspace:
 
 test
 "#,
+                fixture_path.display()
+            ),
         )
         .expect("workflow");
         let workflow_store = WorkflowStore::new(workflow_path.clone()).expect("store");

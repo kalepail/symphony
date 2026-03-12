@@ -259,6 +259,10 @@ impl Orchestrator {
 
         let tracker =
             build_tracker_client(effective.config.clone()).map_err(|error| error.to_string())?;
+        tracker
+            .validate_startup()
+            .await
+            .map_err(|error| error.to_string())?;
         let (tx, mut rx) = mpsc::channel(256);
         let (updates_tx, updates_rx) = watch::channel(0u64);
         let join_tx = tx.clone();
@@ -419,6 +423,13 @@ async fn run_tick(
                             return;
                         }
                     };
+                    if let Err(error) = tracker.validate_startup().await {
+                        error!("dispatch=status=blocked reason={error}");
+                        schedule_next_tick(tx, state);
+                        state.poll_check_in_progress = false;
+                        notify_observers(updates, update_version);
+                        return;
+                    }
                     match tracker.fetch_candidate_issues().await {
                         Ok(issues) => {
                             let active_states = effective.config.active_state_set();
@@ -1582,7 +1593,7 @@ mod tests {
     use crate::issue::Issue;
 
     use super::{
-        RetryEntry, RunningEntry, State, build_snapshot, candidate_issue,
+        Orchestrator, RetryEntry, RunningEntry, State, build_snapshot, candidate_issue,
         handle_retry_issue_with_tracker, sort_issues_for_dispatch, todoist_close_task_succeeded,
     };
     use crate::{orchestrator::build_issue_detail, workflow::WorkflowStore};
@@ -1803,6 +1814,49 @@ mod tests {
                 .and_then(|issue| issue.project_id.as_deref()),
             Some("proj-1")
         );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_start_fails_when_todoist_comments_are_unavailable() {
+        let dir = tempdir().expect("tempdir");
+        let fixture_path = dir.path().join("memory.json");
+        fs::write(
+            &fixture_path,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": false}
+}"#,
+        )
+        .expect("fixture");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &workflow_path,
+            format!(
+                r#"---
+tracker:
+  kind: memory
+  fixture_path: {}
+  project_id: proj
+workspace:
+  root: {}
+---
+
+test
+"#,
+                fixture_path.display(),
+                dir.path().join("workspaces").display()
+            ),
+        )
+        .expect("workflow");
+
+        let workflow_store = WorkflowStore::new(workflow_path).expect("workflow store");
+        let error = match Orchestrator::start(workflow_store).await {
+            Ok(_) => panic!("startup should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("todoist_comments_unavailable"));
     }
 
     struct StaticTracker {

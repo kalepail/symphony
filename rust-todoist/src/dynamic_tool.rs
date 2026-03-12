@@ -883,6 +883,16 @@ fn tool_error_payload(error: TrackerError) -> Value {
                 "message": format!("Todoist section `{section}` is required by WORKFLOW.md but was not found.")
             }
         }),
+        TrackerError::TodoistAssigneeNotResolvable {
+            assignee,
+            project_id,
+        } => json!({
+            "error": {
+                "message": format!(
+                    "Todoist assignee `{assignee}` is not valid for project `{project_id}`."
+                )
+            }
+        }),
         TrackerError::MissingTodoistCurrentUser => json!({
             "error": {
                 "message": "Todoist current user could not be resolved."

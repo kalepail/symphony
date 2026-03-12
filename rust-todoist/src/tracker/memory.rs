@@ -127,20 +127,66 @@ impl MemoryTracker {
             .unwrap_or_else(|| "Done".to_string())
     }
 
-    fn assignee_filter_value(&self, state: &MemoryState) -> Option<String> {
-        match self.config.tracker.assignee.as_deref() {
-            Some("me") => json_id(state.current_user.get("id")),
-            Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
-            _ => None,
+    fn assignee_filter_value_validated(
+        &self,
+        state: &MemoryState,
+    ) -> Result<Option<String>, TrackerError> {
+        let assignee = match self.config.tracker.assignee.as_deref() {
+            Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => return Ok(None),
+        };
+
+        if assignee == "me" {
+            return json_id(state.current_user.get("id"))
+                .map(Some)
+                .ok_or(TrackerError::MissingTodoistCurrentUser);
         }
+
+        let project_id = self.current_project_id();
+        let project = state.projects.iter().find(|project| {
+            project.get("id").and_then(json_id_from_value).as_deref() == Some(project_id.as_str())
+        });
+        let is_shared = project
+            .and_then(|project| project.get("is_shared"))
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| !state.collaborators.is_empty());
+        let can_assign_tasks = project
+            .and_then(|project| project.get("can_assign_tasks"))
+            .and_then(Value::as_bool)
+            .unwrap_or(is_shared);
+
+        if !can_assign_tasks {
+            return Err(TrackerError::TodoistAssigneeNotResolvable {
+                assignee,
+                project_id,
+            });
+        }
+
+        if is_shared {
+            let collaborator_matches = state.collaborators.iter().any(|collaborator| {
+                collaborator
+                    .get("id")
+                    .and_then(json_id_from_value)
+                    .as_deref()
+                    == Some(assignee.as_str())
+            });
+            if !collaborator_matches {
+                return Err(TrackerError::TodoistAssigneeNotResolvable {
+                    assignee,
+                    project_id,
+                });
+            }
+        }
+
+        Ok(Some(assignee))
     }
 
-    fn issues_from_state(&self, state: &MemoryState) -> Vec<Issue> {
+    fn issues_from_state(&self, state: &MemoryState) -> Result<Vec<Issue>, TrackerError> {
         let sections = Self::sections_by_id(state);
         let completed_state = self.completed_state_label();
-        let assignee_filter = self.assignee_filter_value(state);
+        let assignee_filter = self.assignee_filter_value_validated(state)?;
         let label_filter = self.runtime_label_filter();
-        state
+        Ok(state
             .tasks
             .iter()
             .filter(|task| {
@@ -162,7 +208,7 @@ impl MemoryTracker {
                     .is_none_or(|filter| issue.assignee_id.as_deref() == Some(filter.as_str()));
                 issue
             })
-            .collect()
+            .collect())
     }
 
     fn runtime_label_filter(&self) -> Option<String> {
@@ -234,6 +280,13 @@ impl MemoryTracker {
 
 #[async_trait]
 impl TrackerClient for MemoryTracker {
+    async fn validate_startup(&self) -> Result<(), TrackerError> {
+        let state = self.state();
+        self.assignee_filter_value_validated(&state)?;
+        self.ensure_comments_available(&state)?;
+        Ok(())
+    }
+
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         let active_states: BTreeSet<String> = self
             .config
@@ -242,7 +295,7 @@ impl TrackerClient for MemoryTracker {
             .iter()
             .map(|state| normalize_state_name(state))
             .collect();
-        let issues = self.issues_from_state(&self.state());
+        let issues = self.issues_from_state(&self.state())?;
 
         Ok(issues
             .into_iter()
@@ -260,7 +313,7 @@ impl TrackerClient for MemoryTracker {
             .collect();
 
         Ok(self
-            .issues_from_state(&self.state())
+            .issues_from_state(&self.state())?
             .into_iter()
             .filter(|issue| !issue.is_subtask && wanted.contains(&issue.state_key()))
             .collect())
@@ -276,7 +329,7 @@ impl TrackerClient for MemoryTracker {
         let wanted: BTreeSet<&str> = issue_ids.iter().map(String::as_str).collect();
 
         Ok(self
-            .issues_from_state(&self.state())
+            .issues_from_state(&self.state())?
             .into_iter()
             .filter(|issue| wanted.contains(issue.id.as_str()))
             .collect())
@@ -284,7 +337,7 @@ impl TrackerClient for MemoryTracker {
 
     async fn fetch_open_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         Ok(self
-            .issues_from_state(&self.state())
+            .issues_from_state(&self.state())?
             .into_iter()
             .filter(|issue| !issue.is_subtask)
             .collect())
@@ -2065,6 +2118,84 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "tracker_operation_unsupported exactly one of `task_id` or `project_id` is required"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_requires_comments_plan() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": false}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("comments required");
+
+        assert_eq!(error.to_string(), "todoist_comments_unavailable");
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_non_collaborator_assignee_in_shared_project() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "projects": [{"id":"proj","name":"Shared Project","is_shared":true,"can_assign_tasks":true}],
+  "collaborators": [{"id":"user-1","project_id":"proj","name":"Memory User"}],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "assignee": "user-2"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("collaborator validation");
+
+        assert_eq!(
+            error.to_string(),
+            "todoist_assignee_not_resolvable assignee=user-2 project_id=proj"
         );
     }
 }

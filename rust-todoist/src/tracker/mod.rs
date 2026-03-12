@@ -31,6 +31,11 @@ pub enum TrackerError {
     TodoistProjectNotFound(String),
     #[error("todoist_missing_required_section {0}")]
     TodoistMissingRequiredSection(String),
+    #[error("todoist_assignee_not_resolvable assignee={assignee} project_id={project_id}")]
+    TodoistAssigneeNotResolvable {
+        assignee: String,
+        project_id: String,
+    },
     #[error("todoist_comments_unavailable")]
     TodoistCommentsUnavailable,
     #[error("todoist_reminders_unavailable")]
@@ -51,6 +56,9 @@ pub enum TrackerError {
 
 #[async_trait]
 pub trait TrackerClient: Send + Sync {
+    async fn validate_startup(&self) -> Result<(), TrackerError> {
+        Ok(())
+    }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError>;
     async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError>;
     async fn fetch_issue_states_by_ids(

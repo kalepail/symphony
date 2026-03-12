@@ -30,6 +30,12 @@ pub(crate) struct AssigneeFilter {
     match_value: String,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectAssignmentCapabilities {
+    is_shared: bool,
+    can_assign_tasks: bool,
+}
+
 impl TodoistTracker {
     pub fn new(config: ServiceConfig) -> Self {
         let client = Client::builder()
@@ -308,6 +314,50 @@ impl TodoistTracker {
         self.section_map_for_project(&project_id).await
     }
 
+    fn project_assignment_capabilities(project: &Value) -> ProjectAssignmentCapabilities {
+        ProjectAssignmentCapabilities {
+            is_shared: project
+                .get("is_shared")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            can_assign_tasks: project
+                .get("can_assign_tasks")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    async fn collaborator_ids(&self, project_id: &str) -> Result<BTreeSet<String>, TrackerError> {
+        let mut collaborator_ids = BTreeSet::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let page = self
+                .get_collaborators_page(project_id, cursor.as_deref(), MAX_PAGE_SIZE)
+                .await?;
+            let results = page
+                .get("results")
+                .and_then(Value::as_array)
+                .ok_or(TrackerError::TodoistUnknownPayload)?;
+
+            for collaborator in results {
+                if let Some(id) = json_id(collaborator.get("id")) {
+                    collaborator_ids.insert(id);
+                }
+            }
+
+            cursor = page
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(collaborator_ids)
+    }
+
     async fn validate_required_sections(
         &self,
         sections_by_id: &HashMap<String, String>,
@@ -326,21 +376,51 @@ impl TodoistTracker {
         Ok(())
     }
 
-    async fn resolve_assignee_filter(&self) -> Result<Option<AssigneeFilter>, TrackerError> {
+    async fn resolve_assignee_filter_for_project(
+        &self,
+        project_id: &str,
+        project: &Value,
+    ) -> Result<Option<AssigneeFilter>, TrackerError> {
         let assignee = match self.config.tracker.assignee.clone() {
             Some(value) if !value.trim().is_empty() => value,
             _ => return Ok(None),
         };
+        let assignee = assignee.trim().to_string();
+        let capabilities = Self::project_assignment_capabilities(project);
 
-        if assignee.trim() == "me" {
+        if !capabilities.can_assign_tasks {
+            return Err(TrackerError::TodoistAssigneeNotResolvable {
+                assignee,
+                project_id: project_id.to_string(),
+            });
+        }
+
+        if assignee == "me" {
             let user = self.get_current_user().await?;
             let id = json_id(user.get("id")).ok_or(TrackerError::MissingTodoistCurrentUser)?;
             return Ok(Some(AssigneeFilter { match_value: id }));
         }
 
+        if capabilities.is_shared {
+            let collaborator_ids = self.collaborator_ids(project_id).await?;
+            if !collaborator_ids.contains(assignee.as_str()) {
+                return Err(TrackerError::TodoistAssigneeNotResolvable {
+                    assignee,
+                    project_id: project_id.to_string(),
+                });
+            }
+        }
+
         Ok(Some(AssigneeFilter {
-            match_value: assignee.trim().to_string(),
+            match_value: assignee,
         }))
+    }
+
+    async fn resolve_assignee_filter(&self) -> Result<Option<AssigneeFilter>, TrackerError> {
+        let project_id = self.project_id()?;
+        let project = self.get_project_resource(&project_id).await?;
+        self.resolve_assignee_filter_for_project(&project_id, &project)
+            .await
     }
 
     async fn fetch_all_project_tasks(&self) -> Result<Vec<Value>, TrackerError> {
@@ -490,6 +570,18 @@ impl TodoistTracker {
             .unwrap_or(Value::Null))
     }
 
+    async fn validate_startup_config(&self) -> Result<(), TrackerError> {
+        let project_id = self.project_id()?;
+        let project = self.get_project_resource(&project_id).await?;
+        let sections_by_id = self.section_map_for_project(&project_id).await?;
+        self.validate_required_sections(&sections_by_id, &self.config.tracker.active_states)
+            .await?;
+        self.resolve_assignee_filter_for_project(&project_id, &project)
+            .await?;
+        self.ensure_comments_available().await?;
+        Ok(())
+    }
+
     async fn comments_query(
         &self,
         arguments: &Value,
@@ -525,6 +617,10 @@ impl TodoistTracker {
 
 #[async_trait]
 impl TrackerClient for TodoistTracker {
+    async fn validate_startup(&self) -> Result<(), TrackerError> {
+        self.validate_startup_config().await
+    }
+
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         let sections_by_id = self.section_map().await?;
         self.validate_required_sections(&sections_by_id, &self.config.tracker.active_states)
@@ -1481,15 +1577,128 @@ fn map_todoist_status(status: StatusCode, text: &str) -> TrackerError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
-    use serde_json::json;
+    use axum::{
+        Json, Router,
+        extract::{Path, Query, State},
+        routing::{get, post},
+    };
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::{
-        comment_target_body, create_reminder_body, csv_query_value, enforce_runtime_label_scope,
-        extend_repeated_query_values, move_task_body, normalize_task, sanitize_comment_arguments,
-        sanitize_write_arguments, task_list_request, update_reminder_body,
+        TodoistTracker, comment_target_body, create_reminder_body, csv_query_value,
+        enforce_runtime_label_scope, extend_repeated_query_values, move_task_body, normalize_task,
+        sanitize_comment_arguments, sanitize_write_arguments, task_list_request,
+        update_reminder_body,
     };
+    use crate::{config::ServiceConfig, tracker::TrackerClient};
+
+    #[derive(Clone)]
+    struct MockTodoistState {
+        project: Value,
+        sections: Vec<Value>,
+        collaborators: Vec<Value>,
+        current_user: Value,
+        plan_limits: Value,
+    }
+
+    struct MockTodoistServer {
+        base_url: String,
+        join: JoinHandle<()>,
+    }
+
+    impl Drop for MockTodoistServer {
+        fn drop(&mut self) {
+            self.join.abort();
+        }
+    }
+
+    async fn spawn_mock_todoist(state: MockTodoistState) -> MockTodoistServer {
+        async fn get_project(
+            State(state): State<Arc<MockTodoistState>>,
+            Path(_project_id): Path<String>,
+        ) -> Json<Value> {
+            Json(state.project.clone())
+        }
+
+        async fn list_sections(
+            State(state): State<Arc<MockTodoistState>>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            Json(json!({
+                "results": state.sections,
+                "next_cursor": null
+            }))
+        }
+
+        async fn list_collaborators(
+            State(state): State<Arc<MockTodoistState>>,
+            Path(_project_id): Path<String>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            Json(json!({
+                "results": state.collaborators,
+                "next_cursor": null
+            }))
+        }
+
+        async fn get_user(State(state): State<Arc<MockTodoistState>>) -> Json<Value> {
+            Json(state.current_user.clone())
+        }
+
+        async fn sync(State(state): State<Arc<MockTodoistState>>) -> Json<Value> {
+            Json(json!({
+                "user_plan_limits": {
+                    "current": state.plan_limits
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/projects/{project_id}", get(get_project))
+            .route("/sections", get(list_sections))
+            .route(
+                "/projects/{project_id}/collaborators",
+                get(list_collaborators),
+            )
+            .route("/user", get(get_user))
+            .route("/sync", post(sync))
+            .with_state(Arc::new(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        MockTodoistServer {
+            base_url: format!("http://{address}"),
+            join,
+        }
+    }
+
+    fn tracker_config(base_url: &str, assignee: Option<&str>) -> ServiceConfig {
+        let mut tracker = json!({
+            "kind": "todoist",
+            "base_url": base_url,
+            "api_key": "token",
+            "project_id": "proj",
+            "active_states": ["Todo", "In Progress"]
+        });
+        if let Some(assignee) = assignee {
+            tracker["assignee"] = json!(assignee);
+        }
+
+        ServiceConfig::from_map(
+            json!({
+                "tracker": tracker
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config")
+    }
 
     #[test]
     fn normalize_task_uses_done_for_completed_tasks() {
@@ -1793,5 +2002,85 @@ mod tests {
             .expect_err("missing project");
 
         assert_eq!(error.to_string(), "missing_tracker_project_id");
+    }
+
+    #[tokio::test]
+    async fn startup_validation_requires_comment_capability() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }),
+            sections: vec![
+                json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+            ],
+            collaborators: Vec::new(),
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({"comments": false}),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, None));
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("comments required");
+
+        assert_eq!(error.to_string(), "todoist_comments_unavailable");
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_assignee_outside_shared_project_collaborators() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": true,
+                "can_assign_tasks": true
+            }),
+            sections: vec![
+                json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+            ],
+            collaborators: vec![json!({"id": "user-1", "project_id": "proj"})],
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({"comments": true}),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("user-2")));
+        let error = tracker
+            .validate_startup()
+            .await
+            .expect_err("shared project collaborator validation");
+
+        assert_eq!(
+            error.to_string(),
+            "todoist_assignee_not_resolvable assignee=user-2 project_id=proj"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_accepts_me_for_assignable_project() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": true,
+                "can_assign_tasks": true
+            }),
+            sections: vec![
+                json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+            ],
+            collaborators: vec![json!({"id": "user-1", "project_id": "proj"})],
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({"comments": true}),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
+
+        tracker.validate_startup().await.expect("startup valid");
     }
 }
