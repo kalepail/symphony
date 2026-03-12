@@ -387,17 +387,42 @@ impl Presenter {
         samples.push((now_ms, current_tokens));
         samples.sort_by_key(|(timestamp, _)| *timestamp);
 
+        let rates = samples
+            .windows(2)
+            .map(|window| {
+                let (start_ms, start_tokens) = window[0];
+                let (end_ms, end_tokens) = window[1];
+                let elapsed_ms = end_ms - start_ms;
+                let delta_tokens = end_tokens.saturating_sub(start_tokens);
+                let tps = if elapsed_ms <= 0 {
+                    0.0
+                } else {
+                    delta_tokens as f64 / (elapsed_ms as f64 / 1_000.0)
+                };
+                (end_ms, tps)
+            })
+            .collect::<Vec<_>>();
+
         let mut bucket_tps = Vec::with_capacity(THROUGHPUT_GRAPH_COLUMNS);
         for bucket_index in 0..THROUGHPUT_GRAPH_COLUMNS {
             let bucket_start = graph_window_start + bucket_index as i64 * bucket_ms;
             let bucket_end = bucket_start + bucket_ms;
-            let start_tokens = tokens_at_or_before(&samples, bucket_start);
-            let end_tokens = tokens_at_or_before(&samples, bucket_end);
-            let delta = end_tokens.saturating_sub(start_tokens);
-            let tps = if bucket_ms <= 0 {
+            let last_bucket = bucket_index == THROUGHPUT_GRAPH_COLUMNS - 1;
+            let values = rates
+                .iter()
+                .filter_map(|(timestamp, tps)| {
+                    let in_bucket = if last_bucket {
+                        *timestamp >= bucket_start && *timestamp <= bucket_end
+                    } else {
+                        *timestamp >= bucket_start && *timestamp < bucket_end
+                    };
+                    in_bucket.then_some(*tps)
+                })
+                .collect::<Vec<_>>();
+            let tps = if values.is_empty() {
                 0.0
             } else {
-                delta as f64 / (bucket_ms as f64 / 1_000.0)
+                values.iter().sum::<f64>() / values.len() as f64
             };
             bucket_tps.push(tps);
         }
@@ -416,18 +441,6 @@ impl Presenter {
             })
             .collect()
     }
-}
-
-fn tokens_at_or_before(samples: &[(i64, u64)], timestamp: i64) -> u64 {
-    let mut last = 0u64;
-    for (sample_timestamp, total) in samples {
-        if *sample_timestamp <= timestamp {
-            last = *total;
-        } else {
-            break;
-        }
-    }
-    last
 }
 
 pub fn render_dashboard_html(payload: &StatePayload) -> String {
@@ -1321,6 +1334,7 @@ fn humanize_codex_wrapper_event(event: &str, payload: Option<&Value>) -> String 
         "agent_message_content_delta" => {
             humanize_streaming_event("agent message content streaming", payload)
         }
+        "agent_reasoning" => humanize_streaming_event("reasoning update", payload),
         "agent_reasoning_delta" => humanize_streaming_event("reasoning streaming", payload),
         "reasoning_content_delta" => {
             humanize_streaming_event("reasoning content streaming", payload)
@@ -2231,7 +2245,7 @@ mod tests {
     };
 
     use chrono::{TimeZone, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::time::{Duration, sleep};
 
     use crate::{
@@ -2427,6 +2441,192 @@ mod tests {
         }
     }
 
+    #[test]
+    fn humanizes_dynamic_tool_wrapper_events() {
+        let completed = json!({
+            "event": "tool_call_completed",
+            "message": {
+                "payload": {"method": "item/tool/call", "params": {"name": "linear_graphql"}}
+            }
+        });
+        let failed = json!({
+            "event": "tool_call_failed",
+            "message": {
+                "payload": {"method": "item/tool/call", "params": {"tool": "linear_graphql"}}
+            }
+        });
+        let unsupported = json!({
+            "event": "unsupported_tool_call",
+            "message": {
+                "payload": {"method": "item/tool/call", "params": {"tool": "unknown_tool"}}
+            }
+        });
+
+        assert_eq!(
+            summarize_message_payload(&completed).as_deref(),
+            Some("dynamic tool call completed (linear_graphql)")
+        );
+        assert_eq!(
+            summarize_message_payload(&failed).as_deref(),
+            Some("dynamic tool call failed (linear_graphql)")
+        );
+        assert_eq!(
+            summarize_message_payload(&unsupported).as_deref(),
+            Some("unsupported dynamic tool call rejected (unknown_tool)")
+        );
+    }
+
+    #[test]
+    fn humanizes_nested_codex_payload_envelopes() {
+        let wrapped = json!({
+            "event": "notification",
+            "message": {
+                "payload": {
+                    "method": "turn/completed",
+                    "params": {
+                        "turn": {"status": "completed"},
+                        "usage": {"input_tokens": "10", "output_tokens": 2, "total_tokens": 12}
+                    }
+                },
+                "raw": "{\"method\":\"turn/completed\"}"
+            }
+        });
+
+        let text = summarize_message_payload(&wrapped).expect("summary");
+        assert!(text.contains("turn completed"));
+        assert!(text.contains("in 10"));
+    }
+
+    #[test]
+    fn uses_shell_command_line_as_exec_command_status_text() {
+        let payload = json!({
+            "event": "notification",
+            "message": {
+                "method": "codex/event/exec_command_begin",
+                "params": {"msg": {"command": "git status --short"}}
+            }
+        });
+
+        assert_eq!(
+            summarize_message_payload(&payload).as_deref(),
+            Some("git status --short")
+        );
+    }
+
+    #[test]
+    fn formats_auto_approval_updates_from_codex() {
+        let payload = json!({
+            "event": "approval_auto_approved",
+            "message": {
+                "payload": {
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"parsedCmd": "mix test"}
+                },
+                "decision": "acceptForSession"
+            }
+        });
+
+        let text = summarize_message_payload(&payload).expect("summary");
+        assert!(text.contains("command approval requested"));
+        assert!(text.contains("auto-approved"));
+    }
+
+    #[test]
+    fn formats_auto_answered_tool_input_updates_from_codex() {
+        let payload = json!({
+            "event": "tool_input_auto_answered",
+            "message": {
+                "payload": {
+                    "method": "item/tool/requestUserInput",
+                    "params": {"question": "Continue?"}
+                },
+                "answer": "This is a non-interactive session. Operator input is unavailable."
+            }
+        });
+
+        let text = summarize_message_payload(&payload).expect("summary");
+        assert!(text.contains("tool requires user input"));
+        assert!(text.contains("auto-answered"));
+    }
+
+    #[test]
+    fn enriches_wrapper_reasoning_and_message_streaming_events_with_payload_context() {
+        let reasoning = json!({
+            "event": "notification",
+            "message": {
+                "method": "codex/event/agent_reasoning",
+                "params": {
+                    "msg": {
+                        "payload": {"summaryText": "compare retry paths for Linear polling"}
+                    }
+                }
+            }
+        });
+        let message_delta = json!({
+            "event": "notification",
+            "message": {
+                "method": "codex/event/agent_message_delta",
+                "params": {
+                    "msg": {
+                        "payload": {"delta": "writing workpad reconciliation update"}
+                    }
+                }
+            }
+        });
+        let fallback_reasoning = json!({
+            "event": "notification",
+            "message": {
+                "method": "codex/event/agent_reasoning",
+                "params": { "msg": {"payload": {}} }
+            }
+        });
+
+        let reasoning_text = summarize_message_payload(&reasoning).expect("summary");
+        let message_text = summarize_message_payload(&message_delta).expect("summary");
+        let fallback_text = summarize_message_payload(&fallback_reasoning).expect("summary");
+
+        assert!(
+            reasoning_text.contains("reasoning update: compare retry paths for Linear polling")
+        );
+        assert!(
+            message_text.contains("agent message streaming: writing workpad reconciliation update")
+        );
+        assert_eq!(fallback_text, "reasoning update");
+    }
+
+    #[test]
+    fn running_row_expands_to_requested_terminal_width() {
+        let entry = sample_payload().running.into_iter().next().expect("entry");
+        let running_event_width = 52;
+        let row = super::format_running_row(&entry, running_event_width);
+        let plain = super::strip_ansi_sequences(&row);
+        let expected_width = 8
+            + super::RUNNING_ID_WIDTH
+            + super::RUNNING_STATE_WIDTH
+            + super::RUNNING_SESSION_WIDTH
+            + super::RUNNING_PID_WIDTH
+            + super::RUNNING_RUNTIME_WIDTH
+            + running_event_width
+            + super::RUNNING_TOKENS_WIDTH;
+
+        assert_eq!(plain.chars().count(), expected_width);
+        assert!(plain.contains("tool requires user input"));
+    }
+
+    #[test]
+    fn tps_graph_matches_steady_throughput_snapshot() {
+        let mut presenter = super::Presenter::default();
+        let now_ms = 600_000;
+        let current_tokens = 6_000;
+        for timestamp in (0..=575_000).rev().step_by(25_000) {
+            presenter.capture_token_sample(timestamp, (timestamp / 100) as u64);
+        }
+
+        assert_eq!(
+            presenter.tps_graph(now_ms, current_tokens),
+            "████████████████████████"
+        );
+    }
     #[test]
     fn computes_rolling_tps_and_stable_graph() {
         let mut presenter = super::Presenter::default();
@@ -2630,5 +2830,11 @@ test
             .await
             .expect("orchestrator");
         (orchestrator, workflow_store)
+    }
+
+    fn summarize_message_payload(payload: &Value) -> Option<String> {
+        let event = payload.get("event").and_then(Value::as_str);
+        let message = payload.get("message").map(Value::to_string);
+        summarize_codex_message(event, message.as_deref())
     }
 }

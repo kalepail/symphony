@@ -5,12 +5,20 @@ on:
     paths:
       - "rust/**"
       - ".github/workflows/rust-ci.yml"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/pr-description-lint.yml"
+      - "scripts/**"
+      - "SPEC.md"
   push:
     branches:
       - main
     paths:
       - "rust/**"
       - ".github/workflows/rust-ci.yml"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/pr-description-lint.yml"
+      - "scripts/**"
+      - "SPEC.md"
 
 jobs:
   rust-ci:

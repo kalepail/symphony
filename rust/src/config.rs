@@ -219,12 +219,21 @@ fn parse_polling_config(value: Option<&Value>) -> Result<PollingConfig, ConfigEr
 
 fn parse_observability_config(value: Option<&Value>) -> Result<ObservabilityConfig, ConfigError> {
     let map = as_object(value, "observability")?;
+    let terminal_enabled = parse_bool(
+        map.get("terminal_enabled"),
+        "observability.terminal_enabled",
+    )?;
+    let legacy_dashboard_enabled = parse_bool(
+        map.get("dashboard_enabled"),
+        "observability.dashboard_enabled",
+    )?;
+
     Ok(ObservabilityConfig {
-        terminal_enabled: parse_bool(
-            map.get("terminal_enabled"),
-            "observability.terminal_enabled",
-        )?
-        .unwrap_or(true),
+        // Accept Elixir's legacy `dashboard_enabled` key so migrated workflows keep
+        // their operator-surface intent without renaming the field immediately.
+        terminal_enabled: terminal_enabled
+            .or(legacy_dashboard_enabled)
+            .unwrap_or(true),
         refresh_ms: parse_positive_u64(map.get("refresh_ms"), "observability.refresh_ms")?
             .unwrap_or(1_000),
         render_interval_ms: parse_positive_u64(
@@ -708,6 +717,49 @@ mod tests {
         assert!(!config.observability.terminal_enabled);
         assert_eq!(config.observability.refresh_ms, 2_500);
         assert_eq!(config.observability.render_interval_ms, 500);
+    }
+
+    #[test]
+    fn supports_legacy_dashboard_enabled_alias() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "observability": {
+                    "dashboard_enabled": false
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert!(!config.observability.terminal_enabled);
+    }
+
+    #[test]
+    fn terminal_enabled_takes_precedence_over_legacy_dashboard_enabled() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "linear",
+                    "api_key": "token",
+                    "project_slug": "proj"
+                },
+                "observability": {
+                    "terminal_enabled": true,
+                    "dashboard_enabled": false
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert!(config.observability.terminal_enabled);
     }
 
     #[test]

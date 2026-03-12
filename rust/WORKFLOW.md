@@ -287,18 +287,24 @@ Use this only when completion is blocked by missing required tools or missing au
 
 ## Step 4: Rework handling
 
-1. Treat `Rework` as a full approach reset, not incremental patching.
-2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
+1. Treat `Rework` as a planning reset, not a license to discard already-accepted implementation.
+2. Re-read the full issue body, the latest surviving PR diff, and all human comments; explicitly identify what will be done differently this attempt.
 3. Close only PRs that are truly superseded by the new rerun attempt.
    - At most one PR may survive a rerun handoff.
    - Preserve the newest valid open PR once it has the intended diff, passing checks, and no actionable feedback.
    - Do not close the final good PR just because earlier rerun PRs were retired.
-4. Remove the existing `## Codex Workpad` comment from the issue.
-5. Create a fresh branch from `origin/main`.
-6. Start over from the normal kickoff flow:
-   - If current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state.
-   - Create a new bootstrap `## Codex Workpad` comment.
-   - Build a fresh plan/checklist and execute end-to-end.
+4. Before any branch reset or force-push, record the surviving PR head SHA and summarize the already-accepted diff in the workpad.
+5. Default rework base is the surviving PR branch/HEAD, not `origin/main`.
+   - Layer the requested follow-up changes on top of the current surviving diff.
+   - Keep the original ticket scope plus the rework request in the same PR unless the PR is invalid or explicitly superseded.
+6. Only restart from `origin/main` when the current PR/branch is unusable (for example: closed, merged, corrupted, or intentionally replaced).
+   - If you must restart from `origin/main`, you must reapply both the original intended ticket diff and the newly requested rework before handing back to review.
+   - Never hand off a rerun PR that fixes the review comment but drops the original accepted change.
+7. Remove the existing `## Codex Workpad` comment from the issue.
+8. Create a new bootstrap `## Codex Workpad` comment for the rerun and explicitly carry forward the union of:
+   - original acceptance criteria, and
+   - review/rework acceptance criteria.
+9. Before moving back to `Human Review`, verify the surviving PR diff still contains the original intended change set plus the new rework change set.
 
 ## Completion bar before review handoff
 
@@ -308,6 +314,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - PR feedback sweep is complete and no actionable comments remain.
 - PR checks are green, branch is pushed, and exactly one open PR for the current rerun is linked on the issue.
 - Required PR metadata is present (`symphony` label).
+- For `Rework`, the surviving PR still contains the original intended ticket diff in addition to the follow-up fix.
 - If app-touching, runtime validation/media requirements from Step 2 are complete.
 
 ## Guardrails

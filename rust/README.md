@@ -103,7 +103,7 @@ Notes:
 - `tracker.kind` supports `linear` for live runs and `memory` for deterministic local/system tests backed by a fixture file.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
-- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
+- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs. Rust also accepts Elixir's legacy `observability.dashboard_enabled` key as a compatibility alias during migration. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
