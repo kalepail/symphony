@@ -30,6 +30,7 @@ struct MemoryState {
     tasks: Vec<Value>,
     sections: Vec<Value>,
     comments: Vec<Value>,
+    activities: Vec<Value>,
     current_user: Value,
     collaborators: Vec<Value>,
     projects: Vec<Value>,
@@ -38,6 +39,7 @@ struct MemoryState {
     user_plan_limits: Value,
     next_task_id: u64,
     next_comment_id: u64,
+    next_activity_id: u64,
     next_reminder_id: u64,
 }
 
@@ -51,6 +53,8 @@ struct MemoryFixtureEnvelope {
     sections: Vec<Value>,
     #[serde(default)]
     comments: Vec<Value>,
+    #[serde(default)]
+    activities: Vec<Value>,
     #[serde(default)]
     current_user: Value,
     #[serde(default)]
@@ -135,9 +139,22 @@ impl MemoryTracker {
         let sections = Self::sections_by_id(state);
         let completed_state = self.completed_state_label();
         let assignee_filter = self.assignee_filter_value(state);
+        let label_filter = self.runtime_label_filter();
         state
             .tasks
             .iter()
+            .filter(|task| {
+                label_filter.as_ref().is_none_or(|label| {
+                    task.get("labels")
+                        .and_then(Value::as_array)
+                        .is_some_and(|labels| {
+                            labels
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .any(|task_label| task_label.eq_ignore_ascii_case(label))
+                        })
+                })
+            })
             .filter_map(|task| normalize_task(task, &sections, None, completed_state.as_str()))
             .map(|mut issue| {
                 issue.assigned_to_worker = assignee_filter
@@ -146,6 +163,33 @@ impl MemoryTracker {
                 issue
             })
             .collect()
+    }
+
+    fn runtime_label_filter(&self) -> Option<String> {
+        self.config
+            .tracker
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn default_todo_section_id(&self, state: &MemoryState, project_id: &str) -> Option<String> {
+        state.sections.iter().find_map(|section| {
+            let matches_project = section
+                .get("project_id")
+                .and_then(json_id_from_value)
+                .as_deref()
+                == Some(project_id);
+            let matches_todo = section
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| normalize_state_name(name) == "todo");
+            (matches_project && matches_todo)
+                .then(|| json_id(section.get("id")))
+                .flatten()
+        })
     }
 
     fn ensure_comments_available(&self, state: &MemoryState) -> Result<(), TrackerError> {
@@ -171,6 +215,19 @@ impl MemoryTracker {
             Ok(())
         } else {
             Err(TrackerError::TodoistRemindersUnavailable)
+        }
+    }
+
+    fn ensure_activity_log_available(&self, state: &MemoryState) -> Result<(), TrackerError> {
+        if state
+            .user_plan_limits
+            .get("activity_log")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            Ok(())
+        } else {
+            Err(TrackerError::TodoistActivityLogUnavailable)
         }
     }
 }
@@ -205,7 +262,7 @@ impl TrackerClient for MemoryTracker {
         Ok(self
             .issues_from_state(&self.state())
             .into_iter()
-            .filter(|issue| wanted.contains(&issue.state_key()))
+            .filter(|issue| !issue.is_subtask && wanted.contains(&issue.state_key()))
             .collect())
     }
 
@@ -226,7 +283,26 @@ impl TrackerClient for MemoryTracker {
     }
 
     async fn fetch_open_issues(&self) -> Result<Vec<Issue>, TrackerError> {
-        Ok(self.issues_from_state(&self.state()))
+        Ok(self
+            .issues_from_state(&self.state())
+            .into_iter()
+            .filter(|issue| !issue.is_subtask)
+            .collect())
+    }
+
+    async fn restore_active_issue(&self, issue: &Issue) -> Result<(), TrackerError> {
+        let mut state = self.state();
+        let task = value_object_mut(find_by_id_mut(&mut state.tasks, &issue.id, "task")?)?;
+        task.insert("checked".to_string(), Value::Bool(false));
+        task.insert("is_completed".to_string(), Value::Bool(false));
+        task.remove("completed_at");
+        if let Some(section_id) = issue.section_id.as_deref() {
+            task.insert(
+                "section_id".to_string(),
+                Value::String(section_id.to_string()),
+            );
+        }
+        Ok(())
     }
 
     async fn get_current_user(&self) -> Result<Value, TrackerError> {
@@ -280,16 +356,37 @@ impl TrackerClient for MemoryTracker {
         let project_id = arguments
             .get("project_id")
             .and_then(json_id_from_value)
-            .unwrap_or_else(|| self.current_project_id());
+            .or_else(|| default_task_scope_project_id(self, &arguments));
         let section_id = arguments.get("section_id").and_then(json_id_from_value);
+        let parent_id = arguments.get("parent_id").and_then(json_id_from_value);
+        let label = arguments
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let ids = arguments
+            .get("ids")
+            .map(parse_requested_ids)
+            .unwrap_or_default();
         let state = self.state();
         let tasks = state
             .tasks
             .iter()
             .filter(|task| {
-                task.get("project_id")
-                    .and_then(json_id_from_value)
-                    .is_none_or(|value| value == project_id)
+                ids.is_empty()
+                    || task
+                        .get("id")
+                        .and_then(json_id_from_value)
+                        .is_some_and(|value| ids.contains(&value))
+            })
+            .filter(|task| {
+                project_id.as_ref().is_none_or(|project_id| {
+                    task.get("project_id")
+                        .and_then(json_id_from_value)
+                        .as_deref()
+                        == Some(project_id.as_str())
+                })
             })
             .filter(|task| {
                 section_id.as_ref().is_none_or(|section_id| {
@@ -297,6 +394,25 @@ impl TrackerClient for MemoryTracker {
                         .and_then(json_id_from_value)
                         .as_deref()
                         == Some(section_id.as_str())
+                })
+            })
+            .filter(|task| {
+                parent_id.as_ref().is_none_or(|parent_id| {
+                    task.get("parent_id")
+                        .and_then(json_id_from_value)
+                        .as_deref()
+                        == Some(parent_id.as_str())
+                })
+            })
+            .filter(|task| {
+                label.as_ref().is_none_or(|label| {
+                    task.get("labels")
+                        .and_then(Value::as_array)
+                        .is_some_and(|labels| {
+                            labels
+                                .iter()
+                                .any(|value| value.as_str() == Some(label.as_str()))
+                        })
                 })
             })
             .cloned()
@@ -361,6 +477,55 @@ impl TrackerClient for MemoryTracker {
         ))
     }
 
+    async fn get_comment(&self, comment_id: &str) -> Result<Value, TrackerError> {
+        let state = self.state();
+        state
+            .comments
+            .iter()
+            .find(|comment| json_id(comment.get("id")).as_deref() == Some(comment_id))
+            .cloned()
+            .ok_or_else(|| not_found("comment", comment_id))
+    }
+
+    async fn delete_comment(&self, comment_id: &str) -> Result<Value, TrackerError> {
+        let mut state = self.state();
+        self.ensure_comments_available(&state)?;
+        let Some(position) = state
+            .comments
+            .iter()
+            .position(|comment| json_id(comment.get("id")).as_deref() == Some(comment_id))
+        else {
+            return Err(not_found("comment", comment_id));
+        };
+
+        let deleted = state.comments.remove(position);
+        let parent_project_id = deleted
+            .get("project_id")
+            .and_then(json_id_from_value)
+            .or_else(|| {
+                deleted
+                    .get("item_id")
+                    .and_then(json_id_from_value)
+                    .and_then(|task_id| {
+                        state.tasks.iter().find_map(|task| {
+                            (json_id(task.get("id")).as_deref() == Some(task_id.as_str()))
+                                .then(|| task.get("project_id").and_then(json_id_from_value))
+                                .flatten()
+                        })
+                    })
+            });
+        let parent_item_id = deleted.get("item_id").and_then(json_id_from_value);
+        record_activity(
+            &mut state,
+            "note",
+            comment_id.to_string(),
+            "deleted",
+            parent_project_id,
+            parent_item_id,
+        );
+        Ok(Value::Null)
+    }
+
     async fn list_comments(&self, arguments: Value) -> Result<Value, TrackerError> {
         let target = comment_target(&arguments)?;
         let state = self.state();
@@ -369,7 +534,7 @@ impl TrackerClient for MemoryTracker {
             .iter()
             .filter(|comment| match target {
                 "task_id" => {
-                    comment.get("task_id").and_then(json_id_from_value)
+                    comment.get("item_id").and_then(json_id_from_value)
                         == arguments.get("task_id").and_then(json_id_from_value)
                 }
                 "project_id" => {
@@ -390,6 +555,7 @@ impl TrackerClient for MemoryTracker {
     async fn create_comment(&self, arguments: Value) -> Result<Value, TrackerError> {
         let mut state = self.state();
         self.ensure_comments_available(&state)?;
+        let target = comment_target(&arguments)?;
         let content = required_string(&arguments, "content", "create_comment")?;
         if content.len() > 15_000 {
             return Err(TrackerError::TodoistCommentTooLarge {
@@ -407,10 +573,43 @@ impl TrackerClient for MemoryTracker {
             "posted_at".to_string(),
             Value::String(Utc::now().to_rfc3339()),
         );
-        copy_if_present(&arguments, &mut comment, "task_id");
-        copy_if_present(&arguments, &mut comment, "project_id");
+        if let Some(posted_uid) = state.current_user.get("id").and_then(json_id_from_value) {
+            comment.insert("posted_uid".to_string(), Value::String(posted_uid));
+        }
+        comment.insert("file_attachment".to_string(), Value::Null);
+        comment.insert("uids_to_notify".to_string(), Value::Null);
+        comment.insert("is_deleted".to_string(), Value::Bool(false));
+        comment.insert("reactions".to_string(), Value::Null);
+        match target {
+            "task_id" => copy_field(
+                arguments.get("task_id"),
+                &mut comment,
+                "item_id",
+                Value::Null,
+            ),
+            "project_id" => copy_field(
+                arguments.get("project_id"),
+                &mut comment,
+                "project_id",
+                Value::Null,
+            ),
+            _ => {}
+        }
         let comment = Value::Object(comment);
         state.comments.push(comment.clone());
+        let parent_project_id = parent_project_id_from_comment_target(&state, &arguments, target);
+        let parent_item_id = arguments.get("task_id").and_then(json_id_from_value);
+        record_activity(
+            &mut state,
+            "note",
+            comment
+                .get("id")
+                .and_then(json_id_from_value)
+                .unwrap_or_default(),
+            "added",
+            parent_project_id,
+            parent_item_id,
+        );
         Ok(comment)
     }
 
@@ -428,18 +627,33 @@ impl TrackerClient for MemoryTracker {
                 actual: content.len(),
             });
         }
-        let comment =
-            value_object_mut(find_by_id_mut(&mut state.comments, comment_id, "comment")?)?;
-        comment.insert("content".to_string(), Value::String(content));
-        comment.insert(
-            "updated_at".to_string(),
-            Value::String(Utc::now().to_rfc3339()),
+        let comment_value = {
+            let comment =
+                value_object_mut(find_by_id_mut(&mut state.comments, comment_id, "comment")?)?;
+            comment.insert("content".to_string(), Value::String(content));
+            comment.insert(
+                "updated_at".to_string(),
+                Value::String(Utc::now().to_rfc3339()),
+            );
+            Value::Object(comment.clone())
+        };
+        let comment = comment_value.as_object().expect("comment object");
+        let parent_project_id = parent_project_id_from_comment_value(&state, comment);
+        let parent_item_id = comment.get("item_id").and_then(json_id_from_value);
+        record_activity(
+            &mut state,
+            "note",
+            comment_id.to_string(),
+            "updated",
+            parent_project_id,
+            parent_item_id,
         );
-        Ok(Value::Object(comment.clone()))
+        Ok(comment_value)
     }
 
     async fn update_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
         let mut state = self.state();
+        let labels_updated = arguments.get("labels").is_some();
         let task_value = {
             let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
             let updates = sanitize_action_arguments(
@@ -460,15 +674,28 @@ impl TrackerClient for MemoryTracker {
                     task.insert(key.clone(), value.clone());
                 }
             }
+            if task.contains_key("labels")
+                && labels_updated
+                && let Some(label) = self.runtime_label_filter().as_deref()
+            {
+                enforce_runtime_label_scope(task, label);
+            }
             Value::Object(task.clone())
         };
+        record_activity(
+            &mut state,
+            "item",
+            task_id.to_string(),
+            "updated",
+            task_value.get("project_id").and_then(json_id_from_value),
+            task_value.get("parent_id").and_then(json_id_from_value),
+        );
         sync_labels_from_names(&mut state, &label_names(&task_value));
         Ok(task_value)
     }
 
     async fn move_task(&self, task_id: &str, arguments: Value) -> Result<Value, TrackerError> {
         let mut state = self.state();
-        let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
         let updates =
             sanitize_action_arguments(arguments, &["project_id", "section_id", "parent_id"]);
         let Some(updates) = updates.as_object() else {
@@ -481,30 +708,64 @@ impl TrackerClient for MemoryTracker {
                 "`section_id`, `project_id`, or `parent_id` is required for move_task".to_string(),
             ));
         }
-        for (key, value) in updates {
-            task.insert(key.clone(), value.clone());
-        }
-        Ok(Value::Object(task.clone()))
+        let task_value = {
+            let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
+            for (key, value) in updates {
+                task.insert(key.clone(), value.clone());
+            }
+            Value::Object(task.clone())
+        };
+        record_activity(
+            &mut state,
+            "item",
+            task_id.to_string(),
+            "moved",
+            task_value.get("project_id").and_then(json_id_from_value),
+            task_value.get("parent_id").and_then(json_id_from_value),
+        );
+        Ok(task_value)
     }
 
     async fn close_task(&self, task_id: &str) -> Result<Value, TrackerError> {
         let mut state = self.state();
-        let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
-        task.insert("checked".to_string(), Value::Bool(true));
-        task.insert("is_completed".to_string(), Value::Bool(true));
-        task.insert(
-            "completed_at".to_string(),
-            Value::String(Utc::now().to_rfc3339()),
+        let task_value = {
+            let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
+            task.insert("checked".to_string(), Value::Bool(true));
+            task.insert("is_completed".to_string(), Value::Bool(true));
+            task.insert(
+                "completed_at".to_string(),
+                Value::String(Utc::now().to_rfc3339()),
+            );
+            Value::Object(task.clone())
+        };
+        record_activity(
+            &mut state,
+            "item",
+            task_id.to_string(),
+            "completed",
+            task_value.get("project_id").and_then(json_id_from_value),
+            task_value.get("parent_id").and_then(json_id_from_value),
         );
         Ok(Value::Null)
     }
 
     async fn reopen_task(&self, task_id: &str) -> Result<Value, TrackerError> {
         let mut state = self.state();
-        let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
-        task.insert("checked".to_string(), Value::Bool(false));
-        task.insert("is_completed".to_string(), Value::Bool(false));
-        task.remove("completed_at");
+        let task_value = {
+            let task = value_object_mut(find_by_id_mut(&mut state.tasks, task_id, "task")?)?;
+            task.insert("checked".to_string(), Value::Bool(false));
+            task.insert("is_completed".to_string(), Value::Bool(false));
+            task.remove("completed_at");
+            Value::Object(task.clone())
+        };
+        record_activity(
+            &mut state,
+            "item",
+            task_id.to_string(),
+            "uncompleted",
+            task_value.get("project_id").and_then(json_id_from_value),
+            task_value.get("parent_id").and_then(json_id_from_value),
+        );
         Ok(Value::Null)
     }
 
@@ -519,7 +780,7 @@ impl TrackerClient for MemoryTracker {
         let mut task = Map::new();
         task.insert("id".to_string(), Value::String(id.clone()));
         task.insert("content".to_string(), Value::String(content));
-        task.insert("project_id".to_string(), Value::String(project_id));
+        task.insert("project_id".to_string(), Value::String(project_id.clone()));
         task.insert("url".to_string(), Value::String(todoist_task_url(&id)));
         task.insert(
             "created_at".to_string(),
@@ -546,7 +807,23 @@ impl TrackerClient for MemoryTracker {
                 task.insert(key.clone(), value.clone());
             }
         }
+        if task.get("parent_id").is_none() && task.get("section_id").is_none() {
+            if let Some(section_id) = self.default_todo_section_id(&state, &project_id) {
+                task.insert("section_id".to_string(), Value::String(section_id));
+            }
+        }
+        if let Some(label) = self.runtime_label_filter().as_deref() {
+            enforce_runtime_label_scope(&mut task, label);
+        }
         let task = Value::Object(task);
+        record_activity(
+            &mut state,
+            "item",
+            id,
+            "added",
+            task.get("project_id").and_then(json_id_from_value),
+            task.get("parent_id").and_then(json_id_from_value),
+        );
         sync_labels_from_names(&mut state, &label_names(&task));
         state.tasks.push(task.clone());
         Ok(task)
@@ -574,6 +851,132 @@ impl TrackerClient for MemoryTracker {
             reminders,
             arguments.get("cursor").and_then(Value::as_str),
             read_limit(&arguments),
+        ))
+    }
+
+    async fn list_activities(&self, arguments: Value) -> Result<Value, TrackerError> {
+        let state = self.state();
+        self.ensure_activity_log_available(&state)?;
+        let object_type = arguments
+            .get("object_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let object_id = arguments.get("object_id").and_then(json_id_from_value);
+        let parent_project_id = arguments
+            .get("parent_project_id")
+            .and_then(json_id_from_value);
+        let parent_item_id = arguments.get("parent_item_id").and_then(json_id_from_value);
+        let event_type = arguments
+            .get("event_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let object_event_types = arguments
+            .get("object_event_types")
+            .map(parse_object_event_types)
+            .unwrap_or_default();
+        let date_from = arguments
+            .get("date_from")
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let date_to = arguments
+            .get("date_to")
+            .and_then(Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let activities = state
+            .activities
+            .iter()
+            .filter(|activity| {
+                object_type.as_ref().is_none_or(|object_type| {
+                    activity.get("object_type").and_then(Value::as_str)
+                        == Some(object_type.as_str())
+                })
+            })
+            .filter(|activity| {
+                object_id.as_ref().is_none_or(|object_id| {
+                    activity
+                        .get("object_id")
+                        .and_then(json_id_from_value)
+                        .as_deref()
+                        == Some(object_id.as_str())
+                })
+            })
+            .filter(|activity| {
+                parent_project_id.as_ref().is_none_or(|project_id| {
+                    activity
+                        .get("parent_project_id")
+                        .and_then(json_id_from_value)
+                        .as_deref()
+                        == Some(project_id.as_str())
+                })
+            })
+            .filter(|activity| {
+                parent_item_id.as_ref().is_none_or(|item_id| {
+                    activity
+                        .get("parent_item_id")
+                        .and_then(json_id_from_value)
+                        .as_deref()
+                        == Some(item_id.as_str())
+                })
+            })
+            .filter(|activity| {
+                event_type.as_ref().is_none_or(|event_type| {
+                    activity.get("event_type").and_then(Value::as_str) == Some(event_type.as_str())
+                })
+            })
+            .filter(|activity| {
+                object_event_types.is_empty() || {
+                    let activity_object_type = activity
+                        .get("object_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let activity_event_type = activity
+                        .get("event_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    object_event_types
+                        .iter()
+                        .any(|(expected_object, expected_event)| {
+                            expected_object
+                                .as_ref()
+                                .is_none_or(|expected| expected == activity_object_type)
+                                && expected_event
+                                    .as_ref()
+                                    .is_none_or(|expected| expected == activity_event_type)
+                        })
+                }
+            })
+            .filter(|activity| {
+                date_from.as_ref().is_none_or(|date_from| {
+                    activity
+                        .get("event_date")
+                        .and_then(Value::as_str)
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc) >= *date_from)
+                        .unwrap_or(false)
+                })
+            })
+            .filter(|activity| {
+                date_to.as_ref().is_none_or(|date_to| {
+                    activity
+                        .get("event_date")
+                        .and_then(Value::as_str)
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc) < *date_to)
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(paginate_events(
+            activities,
+            arguments.get("cursor").and_then(Value::as_str),
+            read_limit_with_cap(&arguments, 100),
         ))
     }
 
@@ -734,7 +1137,7 @@ fn state_from_envelope(config: &ServiceConfig, envelope: MemoryFixtureEnvelope) 
         .clone()
         .unwrap_or_else(|| "memory-project".to_string());
     let mut tasks = if envelope.tasks.is_empty() {
-        legacy_issues_to_tasks(&envelope.issues, &project_id)
+        issues_to_memory_tasks(&envelope.issues, &project_id)
     } else {
         envelope.tasks
     };
@@ -772,10 +1175,12 @@ fn state_from_envelope(config: &ServiceConfig, envelope: MemoryFixtureEnvelope) 
     MemoryState {
         next_task_id: next_counter(&tasks, 10_000),
         next_comment_id: next_counter(&envelope.comments, 20_000),
+        next_activity_id: next_counter(&envelope.activities, 25_000),
         next_reminder_id: next_counter(&envelope.reminders, 30_000),
         tasks,
         sections,
         comments: envelope.comments,
+        activities: envelope.activities,
         current_user,
         collaborators: envelope.collaborators,
         projects,
@@ -800,7 +1205,7 @@ fn normalize_plan_limits(value: Value) -> Value {
     }
 }
 
-fn legacy_issues_to_tasks(issues: &[Issue], project_id: &str) -> Vec<Value> {
+fn issues_to_memory_tasks(issues: &[Issue], project_id: &str) -> Vec<Value> {
     let now = Utc::now().to_rfc3339();
     issues
         .iter()
@@ -988,6 +1393,37 @@ fn label_names(task: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn enforce_runtime_label_scope(task: &mut Map<String, Value>, runtime_label: &str) {
+    let runtime_label = runtime_label.trim();
+    if runtime_label.is_empty() {
+        return;
+    }
+
+    let mut labels = task
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(runtime_label))
+    {
+        labels.push(runtime_label.to_string());
+    }
+
+    task.insert(
+        "labels".to_string(),
+        Value::Array(labels.into_iter().map(Value::String).collect()),
+    );
+}
+
 fn next_counter(values: &[Value], fallback: u64) -> u64 {
     values
         .iter()
@@ -1022,17 +1458,39 @@ fn paginate_collection(values: Vec<Value>, cursor: Option<&str>, limit: usize) -
 }
 
 fn read_limit(arguments: &Value) -> usize {
+    read_limit_with_cap(arguments, 200)
+}
+
+fn read_limit_with_cap(arguments: &Value, max: u64) -> usize {
     arguments
         .get("limit")
         .and_then(Value::as_u64)
-        .map(|value| value.min(200) as usize)
+        .map(|value| value.min(max) as usize)
         .unwrap_or(50)
+}
+
+fn paginate_events(values: Vec<Value>, cursor: Option<&str>, limit: usize) -> Value {
+    let start = cursor
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    let end = start.saturating_add(limit).min(values.len());
+    json!({
+        "events": values[start..end].to_vec(),
+        "next_cursor": (end < values.len()).then(|| end.to_string())
+    })
 }
 
 fn sanitize_action_arguments(arguments: Value, allowed_keys: &[&str]) -> Value {
     let mut map = arguments.as_object().cloned().unwrap_or_default();
     map.retain(|key, _| allowed_keys.contains(&key.as_str()));
     Value::Object(map)
+}
+
+fn default_task_scope_project_id(tracker: &MemoryTracker, arguments: &Value) -> Option<String> {
+    let has_explicit_scope = ["project_id", "section_id", "parent_id", "label", "ids"]
+        .iter()
+        .any(|key| arguments.get(*key).is_some());
+    (!has_explicit_scope).then(|| tracker.current_project_id())
 }
 
 fn comment_target(arguments: &Value) -> Result<&'static str, TrackerError> {
@@ -1065,10 +1523,115 @@ fn required_string(arguments: &Value, key: &str, action: &str) -> Result<String,
         })
 }
 
-fn copy_if_present(arguments: &Value, map: &mut Map<String, Value>, key: &str) {
-    if let Some(value) = arguments.get(key) {
-        map.insert(key.to_string(), value.clone());
+fn copy_field(source: Option<&Value>, map: &mut Map<String, Value>, key: &str, default: Value) {
+    map.insert(key.to_string(), source.cloned().unwrap_or(default));
+}
+
+fn parse_requested_ids(value: &Value) -> BTreeSet<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(json_id_from_value)
+            .collect::<BTreeSet<_>>(),
+        Value::String(values) => values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>(),
+        Value::Number(value) => [value.to_string()].into_iter().collect(),
+        _ => BTreeSet::new(),
     }
+}
+
+fn parse_object_event_types(value: &Value) -> Vec<(Option<String>, Option<String>)> {
+    let mut filters = Vec::new();
+    let values = match value {
+        Value::Array(values) => values.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+        Value::String(value) => vec![value.as_str()],
+        _ => Vec::new(),
+    };
+
+    for raw in values {
+        let mut parts = raw.splitn(2, ':');
+        let object_type = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let event_type = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        filters.push((object_type, event_type));
+    }
+
+    filters
+}
+
+fn parent_project_id_from_comment_target(
+    state: &MemoryState,
+    arguments: &Value,
+    target: &str,
+) -> Option<String> {
+    match target {
+        "project_id" => arguments.get("project_id").and_then(json_id_from_value),
+        "task_id" => arguments
+            .get("task_id")
+            .and_then(json_id_from_value)
+            .and_then(|task_id| {
+                state.tasks.iter().find_map(|task| {
+                    (task.get("id").and_then(json_id_from_value).as_deref()
+                        == Some(task_id.as_str()))
+                    .then(|| task.get("project_id").and_then(json_id_from_value))
+                    .flatten()
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn parent_project_id_from_comment_value(
+    state: &MemoryState,
+    comment: &Map<String, Value>,
+) -> Option<String> {
+    comment
+        .get("project_id")
+        .and_then(json_id_from_value)
+        .or_else(|| {
+            comment
+                .get("item_id")
+                .and_then(json_id_from_value)
+                .and_then(|task_id| {
+                    state.tasks.iter().find_map(|task| {
+                        (task.get("id").and_then(json_id_from_value).as_deref()
+                            == Some(task_id.as_str()))
+                        .then(|| task.get("project_id").and_then(json_id_from_value))
+                        .flatten()
+                    })
+                })
+        })
+}
+
+fn record_activity(
+    state: &mut MemoryState,
+    object_type: &str,
+    object_id: String,
+    event_type: &str,
+    parent_project_id: Option<String>,
+    parent_item_id: Option<String>,
+) {
+    state.activities.push(json!({
+        "id": state.next_activity_id,
+        "object_type": object_type,
+        "object_id": object_id,
+        "event_type": event_type,
+        "event_date": Utc::now().to_rfc3339(),
+        "parent_project_id": parent_project_id,
+        "parent_item_id": parent_item_id
+    }));
+    state.next_activity_id += 1;
 }
 
 fn find_by_id_mut<'a>(
@@ -1170,6 +1733,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_candidate_issues_honors_runtime_label_scope() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [
+    {"id":"1","content":"Scoped","project_id":"proj","section_id":"sec-todo","labels":["symphony-smoke-full"]},
+    {"id":"2","content":"Other","project_id":"proj","section_id":"sec-todo","labels":["symphony-smoke-minimal"]}
+  ],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "label": "symphony-smoke-full"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let issues = tracker.fetch_candidate_issues().await.expect("issues");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "1");
+    }
+
+    #[tokio::test]
+    async fn create_task_applies_runtime_label_scope_and_defaults_to_todo_section() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [
+    {"id":"sec-backlog","project_id":"proj","name":"Backlog"},
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "label": "symphony-runtime"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let created = tracker
+            .create_task(json!({"content": "Follow-up"}))
+            .await
+            .expect("create task");
+
+        assert_eq!(created["project_id"], "proj");
+        assert_eq!(created["section_id"], "sec-todo");
+        assert_eq!(created["labels"], json!(["symphony-runtime"]));
+    }
+
+    #[tokio::test]
+    async fn update_task_preserves_runtime_label_scope_when_labels_change() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("tasks.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [
+    {"id":"task-1","content":"Scoped","project_id":"proj","section_id":"sec-todo","labels":["symphony-runtime"]}
+  ],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ]
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "label": "symphony-runtime"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let updated = tracker
+            .update_task("task-1", json!({"labels": ["backend"]}))
+            .await
+            .expect("update task");
+
+        assert_eq!(updated["labels"], json!(["backend", "symphony-runtime"]));
+    }
+
+    #[tokio::test]
     async fn fetch_issue_states_by_ids_supports_yaml_envelope() {
         let dir = tempdir().expect("tempdir");
         let fixture = dir.path().join("issues.yaml");
@@ -1261,12 +1944,19 @@ mod tests {
             .create_comment(json!({"task_id": "task-1", "content": "## Codex Workpad"}))
             .await
             .expect("comment");
+        assert_eq!(comment["item_id"], "task-1");
         let comment_id = comment["id"].as_str().expect("id");
+        let fetched = tracker.get_comment(comment_id).await.expect("comment");
+        assert_eq!(fetched["item_id"], "task-1");
         let updated = tracker
             .update_comment(comment_id, json!({"content": "updated"}))
             .await
             .expect("updated");
         assert_eq!(updated["content"], "updated");
+        tracker
+            .delete_comment(comment_id)
+            .await
+            .expect("delete comment");
 
         let moved = tracker
             .move_task("task-1", json!({"section_id": "sec-progress"}))
@@ -1274,11 +1964,32 @@ mod tests {
             .expect("moved");
         assert_eq!(moved["section_id"], "sec-progress");
 
+        let children = tracker
+            .list_tasks(json!({"parent_id": "task-1"}))
+            .await
+            .expect("children");
+        assert_eq!(children["results"].as_array().expect("results").len(), 0);
+
         let subtask = tracker
             .create_task(json!({"content": "Child", "parent_id": "task-1", "labels": ["backend", "frontend"]}))
             .await
             .expect("subtask");
         assert_eq!(subtask["parent_id"], "task-1");
+
+        let children = tracker
+            .list_tasks(json!({"parent_id": "task-1", "label": "frontend"}))
+            .await
+            .expect("children");
+        assert_eq!(children["results"].as_array().expect("results").len(), 1);
+
+        let activities = tracker
+            .list_activities(json!({
+                "parent_item_id": "task-1",
+                "object_event_types": ["item:moved", "note:added", "note:deleted"]
+            }))
+            .await
+            .expect("activities");
+        assert!(!activities["events"].as_array().expect("events").is_empty());
 
         let reminder = tracker
             .create_reminder(json!({"task_id": "task-1", "type": "relative", "minute_offset": 30}))
@@ -1301,9 +2012,59 @@ mod tests {
 
         tracker.close_task("task-1").await.expect("close");
         tracker.reopen_task("task-1").await.expect("reopen");
+        tracker
+            .restore_active_issue(&crate::issue::Issue {
+                id: "task-1".to_string(),
+                identifier: "TD-task-1".to_string(),
+                title: "Parent".to_string(),
+                state: "Todo".to_string(),
+                section_id: Some("sec-todo".to_string()),
+                ..crate::issue::Issue::default()
+            })
+            .await
+            .expect("restore active issue");
 
         let issues = tracker.fetch_candidate_issues().await.expect("issues");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].assignee_id.as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn memory_tracker_requires_a_comment_target() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [{"id":"task-1","content":"Parent","project_id":"proj","section_id":"sec-todo","labels":[]}],
+  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let error = tracker
+            .create_comment(json!({"content": "## Codex Workpad"}))
+            .await
+            .expect_err("missing target");
+
+        assert_eq!(
+            error.to_string(),
+            "tracker_operation_unsupported exactly one of `task_id` or `project_id` is required"
+        );
     }
 }

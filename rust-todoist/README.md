@@ -108,8 +108,11 @@ No description provided.
 
 Notes:
 
-- The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the same stronger unattended workflow contract as the Elixir sample: explicit workpad discipline, PR feedback sweeps, rework/reset behavior, and a completion bar before the canonical review handoff state `Human Review`. Alternate review states such as `In Review` are treated as migration-compatibility shims when the exact original state layout is unavailable.
+- The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the stronger unattended workflow contract used by Symphony: explicit task-scoped workpad discipline, PR feedback sweeps, Todoist-native rework handling, and a completion bar before the canonical review handoff state `Human Review`.
 - `tracker.kind` supports `todoist` for live runs and `memory` for deterministic local/system tests backed by a fixture file.
+- `tracker.label` is an optional Todoist-native routing filter when one runtime should own only a subset of a shared project.
+- When `tracker.label` is configured, `todoist.create_task` automatically inherits that label so follow-up tasks stay inside the same runtime ownership boundary.
+- Top-level `todoist.create_task` calls default into the project's `Todo` section when no `section_id` is supplied. Use `parent_id` only for true subtasks.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
 - `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
@@ -117,13 +120,15 @@ Notes:
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
 - The Rust implementation watches `WORKFLOW.md` and reloads the last good config without restart. Invalid reloads are logged and block new dispatches until fixed.
-- `todoist` exposes structured actions such as `get_task`, `list_sections`, `list_comments`, `create_comment`, `update_task`, `move_task`, and `close_task`, and preserves Todoist HTTP error payloads in tool output so Codex can recover from validation failures.
+- `todoist` exposes structured actions such as `get_task`, `list_sections`, `list_comments`, `create_project_comment`, `delete_comment`, `get_workpad`, `upsert_workpad`, `delete_workpad`, `list_tasks`, `list_activities`, `update_task`, `move_task`, and `close_task`, and preserves Todoist HTTP error payloads in tool output so Codex can recover from validation failures.
+  Task comment requests use `task_id`, while Todoist comment responses identify those same comments with `item_id`. The default workflow uses the dedicated workpad actions so the persistent `## Codex Workpad` stays on one task comment instead of drifting across multiple comments. `close_task` is guarded by Symphony and only succeeds from `Merging` after the linked GitHub PR is verified as merged.
 - Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
 - Optional web observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now uses live SSE updates, keeps runtime clocks moving client-side, and falls back to `/api/v1/state` polling if the stream is unavailable. The terminal dashboard is enabled independently through `observability.terminal_enabled`.
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.
 - The sample `before_remove` hook first checks for `./scripts/workspace_before_remove.sh` in the target repo, then falls back to the bundled [`rust-todoist/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) path when the workspace itself is this repository. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
 - [`rust/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
 - When Symphony exposes the host-side `github_api` tool, prefer it for both PR creation and post-publish metadata writes such as applying the `symphony` label. This avoids the in-session `gh auth token` drift that can appear even when host GitHub auth is healthy.
+- The smoke workflows are label-scoped on purpose: `symphony-smoke-minimal` and `symphony-smoke-full` let multiple Todoist runtimes share one smoke project without stealing each other's tasks.
 
 ## Operator Surface
 
@@ -171,7 +176,7 @@ For parity with the original Elixir implementation and the root [SPEC.md](../SPE
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
 
-`Human Review`, `Rework`, and `Merging` are part of the original workflow contract, not optional naming flourishes. Compatibility mappings such as `In Review` remain supported for migration, but parity smokes should use the canonical state names above.
+`Human Review`, `Rework`, and `Merging` are first-class workflow states in the Todoist runtime. Smoke and production workflows should use those canonical names directly, and rework should preserve the surviving PR diff instead of restarting blindly from `origin/main`.
 
 ## Testing
 

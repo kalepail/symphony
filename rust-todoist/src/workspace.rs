@@ -593,6 +593,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn surfaces_before_run_hook_failures() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": { "before_run": "echo nope && exit 23" }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-BEFORE-RUN-FAIL".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        let error = workspace.run_before_run(&config, &issue).await.unwrap_err();
+
+        match error {
+            WorkspaceError::HookFailed {
+                hook,
+                status,
+                output,
+            } => {
+                assert_eq!(hook, "before_run");
+                assert_eq!(status, 23);
+                assert!(output.contains("nope"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn surfaces_before_run_hook_timeouts() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": {
+                    "timeout_ms": 10,
+                    "before_run": "sleep 1"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-BEFORE-RUN-TIMEOUT".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        let error = workspace.run_before_run(&config, &issue).await.unwrap_err();
+
+        match error {
+            WorkspaceError::HookTimeout { hook, timeout_ms } => {
+                assert_eq!(hook, "before_run");
+                assert_eq!(timeout_ms, 10);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn after_run_hook_failures_are_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let marker = dir.path().join("after-run.marker");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": {
+                    "after_run": format!("printf 'ran' > '{}' && exit 19", marker.display())
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-AFTER-RUN-FAIL".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        workspace.run_after_run(&config, &issue).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&marker).await.expect("marker"),
+            "ran"
+        );
+        assert!(workspace.path.exists());
+    }
+
+    #[tokio::test]
+    async fn after_run_hook_timeouts_are_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "workspace": { "root": dir.path() },
+                "hooks": {
+                    "timeout_ms": 10,
+                    "after_run": "sleep 1"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "MT-AFTER-RUN-TIMEOUT".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let workspace = Workspace::create_for_issue(&config, &issue)
+            .await
+            .expect("workspace");
+        workspace.run_after_run(&config, &issue).await;
+
+        assert!(workspace.path.exists());
+    }
+
+    #[tokio::test]
     async fn before_remove_hook_failures_do_not_block_workspace_removal() {
         let dir = tempdir().expect("tempdir");
         let marker = dir.path().join("before-remove.marker");

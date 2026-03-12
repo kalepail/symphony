@@ -72,6 +72,7 @@ struct RunningEntry {
     turn_count: u32,
     retry_attempt: u32,
     started_at: DateTime<Utc>,
+    terminal_transition_permitted: bool,
     recent_events: Vec<RecentEvent>,
 }
 
@@ -582,11 +583,44 @@ async fn reconcile_running_issues(
                 .cloned()
                 .collect::<Vec<_>>()
             {
-                let identifier = state
-                    .running
-                    .get(&missing_id)
-                    .map(|running| running.identifier.clone())
+                let maybe_running = state.running.get(&missing_id).map(|running| {
+                    (
+                        running.identifier.clone(),
+                        running.issue.clone(),
+                        running.terminal_transition_permitted,
+                    )
+                });
+                let identifier = maybe_running
+                    .as_ref()
+                    .map(|(identifier, _, _)| identifier.clone())
                     .unwrap_or_else(|| missing_id.clone());
+                if let Some((_, previous_issue, permitted)) = maybe_running
+                    && !permitted
+                {
+                    warn!(
+                        "reconcile=status=missing_unexpected issue_id={} issue_identifier={} reason=not_returned_by_tracker previous_state={}",
+                        missing_id, identifier, previous_issue.state
+                    );
+                    match tracker.restore_active_issue(&previous_issue).await {
+                        Ok(()) => {
+                            info!(
+                                "reconcile=status=restored issue_id={} issue_identifier={} state={}",
+                                missing_id, identifier, previous_issue.state
+                            );
+                            if let Some(running) = state.running.get_mut(&missing_id) {
+                                running.issue = previous_issue;
+                                running.terminal_transition_permitted = false;
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(
+                                "reconcile=status=restore_failed issue_id={} issue_identifier={} reason=not_returned_by_tracker error={}",
+                                missing_id, identifier, error
+                            );
+                        }
+                    }
+                }
                 info!(
                     "reconcile=status=missing issue_id={} issue_identifier={} reason=not_returned_by_tracker",
                     missing_id, identifier
@@ -596,6 +630,41 @@ async fn reconcile_running_issues(
 
             for issue in issues {
                 if terminal_states.contains(&issue.state_key()) {
+                    let unexpected_terminal = state
+                        .running
+                        .get(&issue.id)
+                        .is_some_and(|running| !running.terminal_transition_permitted);
+                    if unexpected_terminal {
+                        let previous_issue = state
+                            .running
+                            .get(&issue.id)
+                            .map(|running| running.issue.clone());
+                        if let Some(previous_issue) = previous_issue {
+                            warn!(
+                                "reconcile=status=unexpected_terminal issue_id={} issue_identifier={} state={} previous_state={}",
+                                issue.id, issue.identifier, issue.state, previous_issue.state
+                            );
+                            match tracker.restore_active_issue(&previous_issue).await {
+                                Ok(()) => {
+                                    info!(
+                                        "reconcile=status=restored issue_id={} issue_identifier={} state={}",
+                                        issue.id, issue.identifier, previous_issue.state
+                                    );
+                                    if let Some(running) = state.running.get_mut(&issue.id) {
+                                        running.issue = previous_issue;
+                                        running.terminal_transition_permitted = false;
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        "reconcile=status=restore_failed issue_id={} issue_identifier={} state={} error={}",
+                                        issue.id, issue.identifier, issue.state, error
+                                    );
+                                }
+                            }
+                        }
+                    }
                     info!(
                         "reconcile=status=terminal issue_id={} issue_identifier={} state={}",
                         issue.id, issue.identifier, issue.state
@@ -875,6 +944,7 @@ async fn dispatch_issue(
                     turn_count: 0,
                     retry_attempt,
                     started_at: Utc::now(),
+                    terminal_transition_permitted: false,
                     recent_events: Vec::new(),
                 },
             );
@@ -1122,6 +1192,9 @@ fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent)
     if let Some(pid) = event.codex_app_server_pid {
         running.codex_app_server_pid = Some(pid);
     }
+    if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
+        running.terminal_transition_permitted = true;
+    }
     running.last_codex_event = Some(event.event.clone());
     running.last_codex_timestamp = Some(event.timestamp);
     running.last_codex_message = event
@@ -1169,9 +1242,48 @@ fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent)
         event: event.event,
         message: running.last_codex_message.clone(),
     });
-    if running.recent_events.len() > 20 {
-        let drain = running.recent_events.len() - 20;
+    if running.recent_events.len() > 100 {
+        let drain = running.recent_events.len() - 100;
         running.recent_events.drain(0..drain);
+    }
+}
+
+fn todoist_close_task_succeeded(payload: Option<&Value>, issue_id: &str) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+
+    let tool = payload
+        .get("params")
+        .and_then(|params| params.get("tool").or_else(|| params.get("name")))
+        .and_then(Value::as_str);
+    let action = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .and_then(|arguments| arguments.get("action"))
+        .and_then(Value::as_str);
+    let task_id = payload
+        .get("params")
+        .and_then(|params| params.get("arguments"))
+        .and_then(|arguments| arguments.get("task_id"))
+        .and_then(json_id_string);
+    let success = payload
+        .get("toolResult")
+        .and_then(|value| value.get("success"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    success
+        && tool == Some("todoist")
+        && action == Some("close_task")
+        && task_id.as_deref() == Some(issue_id)
+}
+
+fn json_id_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -1461,16 +1573,17 @@ async fn run_worker(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
     use std::{fs, path::PathBuf, sync::Arc, time::Instant};
     use tempfile::tempdir;
     use tokio::{sync::oneshot, task::JoinHandle};
     use tokio_util::sync::CancellationToken;
 
-    use crate::issue::{BlockerRef, Issue};
+    use crate::issue::Issue;
 
     use super::{
         RetryEntry, RunningEntry, State, build_snapshot, candidate_issue,
-        handle_retry_issue_with_tracker, sort_issues_for_dispatch,
+        handle_retry_issue_with_tracker, sort_issues_for_dispatch, todoist_close_task_succeeded,
     };
     use crate::{orchestrator::build_issue_detail, workflow::WorkflowStore};
 
@@ -1503,17 +1616,12 @@ mod tests {
     }
 
     #[test]
-    fn todo_issue_with_dependencies_is_still_a_candidate() {
+    fn todo_issue_with_required_fields_is_a_candidate() {
         let issue = Issue {
             id: "1".to_string(),
             identifier: "A".to_string(),
             title: "a".to_string(),
             state: "Todo".to_string(),
-            blocked_by: vec![BlockerRef {
-                id: Some("2".to_string()),
-                identifier: Some("B".to_string()),
-                state: Some("In Progress".to_string()),
-            }],
             ..Issue::default()
         };
         let active: std::collections::BTreeSet<String> = ["todo".to_string()].into_iter().collect();
@@ -1528,6 +1636,25 @@ mod tests {
         let snapshot = build_snapshot(&State::default());
         assert_eq!(snapshot.counts.running, 0);
         assert_eq!(snapshot.counts.retrying, 0);
+    }
+
+    #[test]
+    fn detects_guarded_todoist_close_task_events() {
+        let payload = json!({
+            "params": {
+                "name": "todoist",
+                "arguments": {
+                    "action": "close_task",
+                    "task_id": "task-1"
+                }
+            },
+            "toolResult": {
+                "success": true
+            }
+        });
+
+        assert!(todoist_close_task_succeeded(Some(&payload), "task-1"));
+        assert!(!todoist_close_task_succeeded(Some(&payload), "task-2"));
     }
 
     #[tokio::test]
@@ -1566,6 +1693,7 @@ mod tests {
                 turn_count: 0,
                 retry_attempt: 0,
                 started_at: Utc::now(),
+                terminal_transition_permitted: false,
                 recent_events: Vec::new(),
             },
         );

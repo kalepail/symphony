@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::runtime_env;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub tracker: TrackerConfig,
@@ -26,6 +28,7 @@ pub struct TrackerConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub project_id: Option<String>,
+    pub label: Option<String>,
     pub fixture_path: Option<PathBuf>,
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
@@ -192,6 +195,7 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
             .unwrap_or_else(|| "https://api.todoist.com/api/v1".to_string()),
         api_key,
         project_id: resolve_env_string(map.get("project_id"), "tracker.project_id")?,
+        label: resolve_env_string(map.get("label"), "tracker.label")?,
         fixture_path: optional_string(map.get("fixture_path"), "tracker.fixture_path")?.map(
             |path| resolve_path_value(Some(path.as_str()), PathBuf::from("memory_issues.json")),
         ),
@@ -304,10 +308,10 @@ fn parse_codex_config(
             .get("thread_sandbox")
             .cloned()
             .unwrap_or_else(|| Value::String("workspace-write".to_string())),
-        turn_sandbox_policy: map
-            .get("turn_sandbox_policy")
-            .cloned()
-            .unwrap_or_else(|| default_turn_sandbox_policy(workspace_root)),
+        turn_sandbox_policy: parse_turn_sandbox_policy(
+            map.get("turn_sandbox_policy"),
+            workspace_root,
+        )?,
         turn_timeout_ms: parse_positive_u64(map.get("turn_timeout_ms"), "codex.turn_timeout_ms")?
             .unwrap_or(3_600_000),
         read_timeout_ms: parse_positive_u64(map.get("read_timeout_ms"), "codex.read_timeout_ms")?
@@ -472,10 +476,10 @@ fn parse_i64(value: Option<&Value>, field: &str) -> Result<Option<i64>, ConfigEr
 fn resolve_secret(value: Option<&Value>, env_name: &str) -> Result<Option<String>, ConfigError> {
     let value = optional_string(value, env_name)?;
     Ok(match value {
-        None => normalize_string(env::var(env_name).ok()),
+        None => normalize_string(runtime_env::get(env_name)),
         Some(value) => {
             if let Some(reference) = env_reference(&value) {
-                normalize_string(env::var(reference).ok())
+                normalize_string(runtime_env::get(reference))
             } else {
                 normalize_string(Some(value))
             }
@@ -489,7 +493,7 @@ fn resolve_env_string(value: Option<&Value>, field: &str) -> Result<Option<Strin
         None => None,
         Some(value) => {
             if let Some(reference) = env_reference(&value) {
-                normalize_string(env::var(reference).ok())
+                normalize_string(runtime_env::get(reference))
             } else {
                 normalize_string(Some(value))
             }
@@ -516,7 +520,7 @@ fn resolve_path_value(value: Option<&str>, default: PathBuf) -> PathBuf {
     let raw = value
         .and_then(|value| {
             env_reference(value)
-                .map(|name| env::var(name).ok())
+                .map(runtime_env::get)
                 .unwrap_or_else(|| Some(value.to_string()))
         })
         .filter(|value| !value.is_empty())
@@ -554,6 +558,29 @@ fn default_approval_policy() -> Value {
     })
 }
 
+fn parse_turn_sandbox_policy(
+    value: Option<&Value>,
+    workspace_root: &Path,
+) -> Result<Value, ConfigError> {
+    let mut policy = default_turn_sandbox_policy(workspace_root);
+    let Some(value) = value else {
+        return Ok(policy);
+    };
+    let Some(overrides) = value.as_object() else {
+        return Err(ConfigError::Invalid(
+            "codex.turn_sandbox_policy must be an object".to_string(),
+        ));
+    };
+
+    let policy_map = policy
+        .as_object_mut()
+        .expect("default turn sandbox policy is an object");
+    for (key, override_value) in overrides {
+        policy_map.insert(key.clone(), override_value.clone());
+    }
+    Ok(policy)
+}
+
 fn default_turn_sandbox_policy(workspace_root: &Path) -> Value {
     serde_json::json!({
         "type": "workspaceWrite",
@@ -571,16 +598,10 @@ pub fn normalize_state_key(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use super::ServiceConfig;
+    use crate::runtime_env;
     use serde_json::json;
     use tempfile::tempdir;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn parses_defaults_and_limits() {
@@ -589,7 +610,8 @@ mod tests {
                 "tracker": {
                     "kind": "todoist",
                     "api_key": "token",
-                    "project_id": "proj"
+                    "project_id": "proj",
+                    "label": "symphony-full-smoke"
                 },
                 "agent": {
                     "max_concurrent_agents_by_state": {
@@ -604,6 +626,7 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.polling.interval_ms, 30_000);
+        assert_eq!(config.tracker.label.as_deref(), Some("symphony-full-smoke"));
         assert_eq!(config.max_concurrent_agents_for_state("in progress"), 2);
         assert_eq!(config.max_concurrent_agents_for_state("review"), 3);
     }
@@ -711,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_explicit_codex_passthrough_values() {
+    fn merges_explicit_turn_sandbox_policy_into_safe_defaults() {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
@@ -736,12 +759,69 @@ mod tests {
         assert_eq!(config.codex.approval_policy, json!("future-policy"));
         assert_eq!(config.codex.thread_sandbox, json!("future-sandbox"));
         assert_eq!(
-            config.codex.turn_sandbox_policy,
-            json!({
-                "type": "futureSandbox",
-                "flag": true
-            })
+            config.codex.turn_sandbox_policy.get("type"),
+            Some(&json!("futureSandbox"))
         );
+        assert_eq!(
+            config.codex.turn_sandbox_policy.get("flag"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            config.codex.turn_sandbox_policy.get("networkAccess"),
+            Some(&json!(false))
+        );
+        assert!(
+            config
+                .codex
+                .turn_sandbox_policy
+                .get("writableRoots")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn config_reads_runtime_env_overlay_without_exporting_process_env() {
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        runtime_env::clear_for_tests();
+        unsafe {
+            std::env::remove_var("TODOIST_API_TOKEN");
+            std::env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(
+            dir.path().join(".env"),
+            "TODOIST_API_TOKEN=dotenv-token\nSYMPHONY_WORKSPACE_ROOT=/tmp/overlay-root\n",
+        )
+        .expect("dotenv");
+        std::fs::write(&workflow_path, "---\ntracker:\n  kind: todoist\n  project_id: proj\nworkspace:\n  root: $SYMPHONY_WORKSPACE_ROOT\n---\n")
+            .expect("workflow");
+
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "$TODOIST_API_TOKEN",
+                    "project_id": "proj"
+                },
+                "workspace": {
+                    "root": "$SYMPHONY_WORKSPACE_ROOT"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(config.tracker.api_key.as_deref(), Some("dotenv-token"));
+        assert_eq!(config.workspace.root.to_string_lossy(), "/tmp/overlay-root");
+        assert!(std::env::var("TODOIST_API_TOKEN").is_err());
+        assert!(std::env::var("SYMPHONY_WORKSPACE_ROOT").is_err());
+        runtime_env::clear_for_tests();
     }
 
     #[test]
@@ -831,7 +911,9 @@ mod tests {
 
     #[test]
     fn resolves_project_id_from_env_reference() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let env_name = "SYMPHONY_TEST_PROJECT_ID";
         unsafe {
             std::env::set_var(env_name, "proj-from-env");
@@ -859,7 +941,9 @@ mod tests {
 
     #[test]
     fn resolves_workspace_root_from_env_reference() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let env_name = "SYMPHONY_TEST_WORKSPACE_ROOT";
         unsafe {

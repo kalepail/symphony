@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    path::{Path, PathBuf},
-};
+use std::{env, path::PathBuf};
 
 use clap::Parser;
 use tracing::info;
@@ -44,7 +40,6 @@ async fn run_with_args(args: Args) -> Result<(), String> {
     let log_file = logging::init(args.logs_root.as_deref())?;
     info!("logging=status=initialized file={}", log_file.display());
     let workflow_path = args.workflow_path.unwrap_or_else(default_workflow_path);
-    load_dotenv_for_workflow(&workflow_path)?;
 
     let workflow_store =
         WorkflowStore::new(workflow_path.clone()).map_err(format_workflow_error)?;
@@ -92,54 +87,6 @@ fn default_workflow_path() -> PathBuf {
         .join("WORKFLOW.md")
 }
 
-fn load_dotenv_for_workflow(workflow_path: &Path) -> Result<(), String> {
-    let mut directories = Vec::new();
-
-    if let Some(parent) = workflow_path.parent() {
-        directories.push(parent.to_path_buf());
-    }
-
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if !directories.iter().any(|candidate| candidate == &cwd) {
-        directories.push(cwd);
-    }
-
-    for directory in directories {
-        load_dotenv_files_in_dir(&directory)?;
-    }
-
-    Ok(())
-}
-
-fn load_dotenv_files_in_dir(directory: &Path) -> Result<(), String> {
-    let mut merged = BTreeMap::new();
-
-    for filename in [".env", ".env.local"] {
-        let path = directory.join(filename);
-        if !path.is_file() {
-            continue;
-        }
-
-        let iter = dotenvy::from_path_iter(&path)
-            .map_err(|error| format!("dotenv_error path={} reason={error}", path.display()))?;
-        for entry in iter {
-            let (key, value) = entry
-                .map_err(|error| format!("dotenv_error path={} reason={error}", path.display()))?;
-            merged.insert(key, value);
-        }
-    }
-
-    for (key, value) in merged {
-        if env::var_os(&key).is_none() {
-            unsafe {
-                env::set_var(key, value);
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn format_workflow_error(error: WorkflowError) -> String {
     error.to_string()
 }
@@ -179,23 +126,16 @@ fn acknowledgement_banner() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        sync::{Mutex, OnceLock},
-    };
+    use std::env;
 
     use clap::Parser;
     use tempfile::tempdir;
 
     use super::{
         ACKNOWLEDGEMENT_FLAG, Args, acknowledgement_banner, default_workflow_path,
-        load_dotenv_for_workflow, require_guardrails_acknowledgement, run_with_args,
+        require_guardrails_acknowledgement, run_with_args,
     };
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::runtime_env;
 
     #[test]
     fn acknowledgement_flag_is_required() {
@@ -231,7 +171,9 @@ mod tests {
 
     #[test]
     fn default_workflow_path_uses_current_directory() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let previous = env::current_dir().expect("cwd");
         env::set_current_dir(dir.path()).expect("set cwd");
@@ -245,7 +187,9 @@ mod tests {
 
     #[test]
     fn missing_default_workflow_file_fails_startup() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let previous = env::current_dir().expect("cwd");
         env::set_current_dir(dir.path()).expect("set cwd");
@@ -269,7 +213,9 @@ mod tests {
 
     #[test]
     fn loads_dotenv_from_workflow_directory() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let workflow_path = dir.path().join("WORKFLOW.md");
         let dotenv_path = dir.path().join(".env");
@@ -283,27 +229,29 @@ mod tests {
             env::remove_var("TODOIST_API_TOKEN");
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
         }
+        runtime_env::clear_for_tests();
 
-        load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
 
         assert_eq!(
-            env::var("TODOIST_API_TOKEN").ok().as_deref(),
+            runtime_env::get("TODOIST_API_TOKEN").as_deref(),
             Some("dotenv-token")
         );
         assert_eq!(
-            env::var("SYMPHONY_WORKSPACE_ROOT").ok().as_deref(),
+            runtime_env::get("SYMPHONY_WORKSPACE_ROOT").as_deref(),
             Some("/tmp/dotenv-workspaces")
         );
+        assert!(env::var("TODOIST_API_TOKEN").is_err());
+        assert!(env::var("SYMPHONY_WORKSPACE_ROOT").is_err());
 
-        unsafe {
-            env::remove_var("TODOIST_API_TOKEN");
-            env::remove_var("SYMPHONY_WORKSPACE_ROOT");
-        }
+        runtime_env::clear_for_tests();
     }
 
     #[test]
     fn dotenv_local_overrides_dotenv_when_shell_env_is_absent() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let workflow_path = dir.path().join("WORKFLOW.md");
         std::fs::write(&workflow_path, "---\ntracker:\n  kind: todoist\n---\n").expect("workflow");
@@ -316,22 +264,23 @@ mod tests {
         unsafe {
             env::remove_var("TODOIST_API_TOKEN");
         }
+        runtime_env::clear_for_tests();
 
-        load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
 
         assert_eq!(
-            env::var("TODOIST_API_TOKEN").ok().as_deref(),
+            runtime_env::get("TODOIST_API_TOKEN").as_deref(),
             Some("local-token")
         );
-
-        unsafe {
-            env::remove_var("TODOIST_API_TOKEN");
-        }
+        assert!(env::var("TODOIST_API_TOKEN").is_err());
+        runtime_env::clear_for_tests();
     }
 
     #[test]
     fn existing_shell_env_wins_over_dotenv_files() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = tempdir().expect("tempdir");
         let workflow_path = dir.path().join("WORKFLOW.md");
         std::fs::write(&workflow_path, "---\ntracker:\n  kind: todoist\n---\n").expect("workflow");
@@ -339,16 +288,18 @@ mod tests {
         unsafe {
             env::set_var("TODOIST_API_TOKEN", "shell-token");
         }
+        runtime_env::clear_for_tests();
 
-        load_dotenv_for_workflow(&workflow_path).expect("dotenv");
+        runtime_env::load_dotenv_for_workflow(&workflow_path).expect("dotenv");
 
         assert_eq!(
-            env::var("TODOIST_API_TOKEN").ok().as_deref(),
+            runtime_env::get("TODOIST_API_TOKEN").as_deref(),
             Some("shell-token")
         );
 
         unsafe {
             env::remove_var("TODOIST_API_TOKEN");
         }
+        runtime_env::clear_for_tests();
     }
 }

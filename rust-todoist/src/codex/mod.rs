@@ -128,6 +128,7 @@ impl AppServerClient {
             .arg("-lc")
             .arg(&self.config.codex.command)
             .current_dir(&workspace)
+            .env_remove("TODOIST_API_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -507,6 +508,7 @@ impl AppServerSession {
                 let result =
                     dynamic_tool::execute(&self.config, self.tracker.as_ref(), &tool, arguments)
                         .await;
+                let event_payload = tool_event_payload(message, &result);
                 self.send_json(&json!({
                     "id": request_id,
                     "result": result
@@ -526,7 +528,7 @@ impl AppServerSession {
                 } else {
                     "unsupported_tool_call"
                 };
-                on_event(event(turn, event_name, None, None, message.clone(), None));
+                on_event(event(turn, event_name, None, None, event_payload, None));
                 Ok(None)
             }
             "item/tool/requestUserInput" => {
@@ -875,6 +877,12 @@ fn tool_call_arguments(params: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+fn tool_event_payload(message: &Value, result: &Value) -> Value {
+    let mut payload = message.as_object().cloned().unwrap_or_default();
+    payload.insert("toolResult".to_string(), result.clone());
+    Value::Object(payload)
+}
+
 fn input_required_method(method: &str, message: &Value) -> bool {
     matches!(
         method,
@@ -1134,6 +1142,68 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(outside_error, CodexError::InvalidWorkspaceCwd(_)));
+    }
+
+    #[tokio::test]
+    async fn start_session_strips_todoist_token_from_child_environment() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let trace = dir.path().join("token.log");
+        let script = dir.path().join("fake-codex.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/bin/sh
+trace_file="{}"
+printf '%s\n' "${{TODOIST_API_TOKEN:-missing}}" > "$trace_file"
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{{"id":1,"result":{{}}}}'
+      ;;
+    2)
+      ;;
+    3)
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-env"}}}}}}'
+      exit 0
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+done
+"#,
+                trace.display()
+            ),
+        );
+
+        unsafe {
+            std::env::set_var("TODOIST_API_TOKEN", "secret-token");
+        }
+
+        let config = sample_config(&workspace, &script, None);
+        let app = AppServerClient::new(
+            config,
+            Arc::new(StubTracker {
+                tool_result: Ok(json!({ "data": {} })),
+            }),
+        );
+
+        let mut session = app.start_session(&workspace).await.expect("session");
+        session.stop().await;
+
+        let captured = fs::read_to_string(trace).expect("trace");
+        assert_eq!(captured.trim(), "missing");
+
+        unsafe {
+            std::env::remove_var("TODOIST_API_TOKEN");
+        }
     }
 
     #[cfg(unix)]

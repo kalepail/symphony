@@ -139,6 +139,12 @@ The final spec now locks the implementation choice:
 - subtasks are real child work items for decomposition or delegated child steps, not the default
   representation for unrelated backlog work
 - labels are orthogonal metadata, not workflow state
+- labels are also the clean Todoist-native way to partition runtime ownership when multiple
+  Symphony runtimes share one project
+- when that runtime label scope is configured, new follow-up tasks should inherit the label
+  automatically so they stay inside the same ownership slice
+- top-level follow-up tasks should default into the project's `Todo` section when no explicit
+  `section_id` is supplied
 - due dates, deadlines, and reminders are planning metadata that should be surfaced when available
 - assignment and collaborators define ownership in shared projects
 
@@ -156,6 +162,7 @@ tracker:
   base_url: https://api.todoist.com/api/v1
   api_key: $TODOIST_API_TOKEN
   project_id: "6XGgm6PHrGgMpCFX"
+  label: symphony-full-smoke
   assignee: me
   active_states:
     - Todo
@@ -188,12 +195,14 @@ This replaces Linear ticket keys for workspace naming, logs, and status routes.
 Preserve the single persistent comment model with:
 
 - marker header: `## Codex Workpad`
-- optional secondary marker: `<!-- symphony:workpad -->`
+- hidden marker: `<!-- symphony:workpad -->`
 
 Hard rule:
 
 - the workpad is always a task comment addressed by `task_id`
 - project comments remain available only for project-level operator discussion
+- the runtime should expose dedicated `get_workpad`, `upsert_workpad`, and `delete_workpad`
+  actions so agents do not need to hand-roll workpad discovery logic on every turn
 
 Because Todoist comments are limited to 15,000 characters, `rust-todoist/` must use bounded
 workpad compaction rather than append-only growth.
@@ -247,10 +256,12 @@ Preserve `github_api` and replace `linear_graphql` with a structured `todoist` t
 - list/get tasks
 - list/get sections
 - list labels
-- list/create/update comments
+- list/get/delete comments
+- create project comments only through an explicit project-comment action
+- manage task comments only through the single-workpad actions
 - move task
 - update task
-- close task
+- close task only after verified merged-PR completion from `Merging`
 - reopen task
 - create task for follow-up work or subtasks via `parent_id`
 - list/create/update/delete reminders when the account plan supports reminders

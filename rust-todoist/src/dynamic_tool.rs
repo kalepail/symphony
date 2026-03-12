@@ -1,10 +1,14 @@
+use regex::Regex;
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::{env, process::Command as StdCommand, sync::OnceLock};
+use std::{process::Command as StdCommand, sync::OnceLock};
 use tokio::process::Command;
+use tracing::info;
 
 use crate::{
     config::ServiceConfig,
+    issue::normalize_state_name,
+    runtime_env,
     tracker::{TrackerClient, TrackerError},
 };
 
@@ -12,6 +16,8 @@ pub const GITHUB_API_TOOL: &str = "github_api";
 pub const TODOIST_TOOL: &str = "todoist";
 const GITHUB_API_BASE_URL_ENV: &str = "SYMPHONY_GITHUB_API_URL";
 const GITHUB_API_DEFAULT_BASE_URL: &str = "https://api.github.com";
+const WORKPAD_HEADER: &str = "## Codex Workpad";
+const WORKPAD_MARKER: &str = "<!-- symphony:workpad -->";
 const GITHUB_API_TOOL_DESCRIPTION: &str = concat!(
     "Execute a GitHub REST API request using host-side auth from Symphony's runtime.\n",
     "Use this when `gh` transport is flaky inside Codex sessions but the host can still reach GitHub.\n",
@@ -23,10 +29,20 @@ const GITHUB_API_TOOL_DESCRIPTION: &str = concat!(
 const TODOIST_TOOL_DESCRIPTION: &str = concat!(
     "Execute a structured Todoist API action using Symphony's configured tracker auth.\n",
     "Supported actions: list_projects, get_project, get_current_user, list_collaborators, ",
-    "list_tasks, get_task, list_sections, get_section, list_labels, list_comments, create_comment, ",
-    "update_comment, update_task, move_task, close_task, reopen_task, create_task, list_reminders, ",
+    "list_tasks, get_task, list_sections, get_section, list_labels, get_comment, list_comments, ",
+    "create_project_comment, update_comment, delete_comment, get_workpad, upsert_workpad, delete_workpad, ",
+    "update_task, move_task, close_task, reopen_task, create_task, list_reminders, list_activities, ",
     "create_reminder, update_reminder, delete_reminder.\n",
-    "Use this tool instead of raw HTTP. Keep each call narrow and specific."
+    "Use this tool instead of raw HTTP. Keep each call narrow and specific.\n",
+    "Task comments require `task_id` only; project comments require `project_id` only. ",
+    "Todoist comment responses identify task comments with `item_id`.\n",
+    "Use `create_project_comment` for project comments and `upsert_workpad` for the single persistent task workpad.\n",
+    "When `tracker.label` is configured, `create_task` automatically inherits that label. ",
+    "Top-level `create_task` calls also default into the project's `Todo` section when no section is supplied.\n",
+    "`close_task` is guarded: the task must already be in `Merging`, the workpad must contain a linked GitHub PR URL, ",
+    "and Symphony verifies that the PR is actually merged before completing the task.\n",
+    "For Symphony's persistent task workpad, prefer `get_workpad`, `upsert_workpad`, and `delete_workpad` ",
+    "instead of raw comment mutations."
 );
 
 pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
@@ -45,6 +61,39 @@ pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
                         "type": "string",
                         "description": "Todoist action to execute."
                     },
+                    "content": {
+                        "type": ["string", "null"],
+                        "description": "Primary content for create_task, create_project_comment, update_comment, or upsert_workpad."
+                    },
+                    "description": {
+                        "type": ["string", "null"],
+                        "description": "Todoist task description for create_task or update_task."
+                    },
+                    "labels": {
+                        "description": "Todoist label names for create_task or update_task."
+                    },
+                    "assignee_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Todoist assignee id for create_task or update_task."
+                    },
+                    "priority": {
+                        "type": ["integer", "null"],
+                        "description": "Todoist task priority from 1 (normal) to 4 (urgent)."
+                    },
+                    "due": {
+                        "description": "Todoist due object for create_task, update_task, create_reminder, or update_reminder."
+                    },
+                    "deadline": {
+                        "description": "Todoist deadline object for create_task or update_task."
+                    },
+                    "cursor": {
+                        "type": ["string", "null"],
+                        "description": "Cursor for paginated list actions."
+                    },
+                    "limit": {
+                        "type": ["integer", "null"],
+                        "description": "Requested page size for paginated list actions."
+                    },
                     "task_id": {
                         "type": ["string", "number", "null"],
                         "description": "Task identifier for get/update/move/close/reopen task actions."
@@ -53,17 +102,77 @@ pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
                         "type": ["string", "number", "null"],
                         "description": "Section identifier for get/update section-based actions."
                     },
+                    "parent_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Parent task identifier for subtask listing, creation, or task reparenting."
+                    },
+                    "label": {
+                        "type": ["string", "null"],
+                        "description": "Todoist label name for list_tasks filtering."
+                    },
+                    "ids": {
+                        "description": "Comma-separated task ids or an array of task ids for list_tasks."
+                    },
+                    "filter": {
+                        "type": ["string", "null"],
+                        "description": "Todoist filter query for list_tasks. When provided, Symphony uses `/tasks/filter`."
+                    },
+                    "lang": {
+                        "type": ["string", "null"],
+                        "description": "IETF language tag for Todoist filter queries."
+                    },
                     "comment_id": {
                         "type": ["string", "number", "null"],
-                        "description": "Comment identifier for update_comment."
+                        "description": "Comment identifier for get_comment, update_comment, or delete_comment."
                     },
                     "project_id": {
                         "type": ["string", "number", "null"],
-                        "description": "Optional project identifier; defaults to tracker.project_id where applicable."
+                        "description": "Optional project identifier; defaults to tracker.project_id where applicable. Do not send this for task comment actions."
+                    },
+                    "attachment": {
+                        "description": "Optional Todoist comment attachment object."
+                    },
+                    "uids_to_notify": {
+                        "description": "Optional list of Todoist user ids to notify for comment creation."
                     },
                     "reminder_id": {
                         "type": ["string", "number", "null"],
                         "description": "Reminder identifier for update_reminder and delete_reminder."
+                    },
+                    "object_type": {
+                        "type": ["string", "null"],
+                        "description": "Activity-log object type such as `project`, `item`, or `note`."
+                    },
+                    "object_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Activity-log object identifier, used with object_type."
+                    },
+                    "event_type": {
+                        "type": ["string", "null"],
+                        "description": "Todoist activity event type such as `added`, `updated`, `completed`, or `moved`."
+                    },
+                    "object_event_types": {
+                        "description": "Single value or array using Todoist `object_type:event_type` syntax, for example `item:completed`."
+                    },
+                    "parent_project_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Activity-log parent project identifier."
+                    },
+                    "parent_item_id": {
+                        "type": ["string", "number", "null"],
+                        "description": "Activity-log parent task identifier."
+                    },
+                    "date_from": {
+                        "type": ["string", "null"],
+                        "description": "RFC3339 lower bound for list_activities."
+                    },
+                    "date_to": {
+                        "type": ["string", "null"],
+                        "description": "RFC3339 exclusive upper bound for list_activities."
+                    },
+                    "initiator_id_null": {
+                        "type": ["boolean", "null"],
+                        "description": "Filter activities by whether the initiator is absent (`true`) or present (`false`)."
                     }
                 }
             }
@@ -114,7 +223,7 @@ pub async fn execute(
                 }));
             }
 
-            match execute_todoist(tracker, arguments).await {
+            match execute_todoist(config, tracker, arguments).await {
                 Ok(body) => success_payload(body),
                 Err(error) => failure_payload(tool_error_payload(error)),
             }
@@ -136,6 +245,7 @@ pub async fn execute(
 }
 
 async fn execute_todoist(
+    config: &ServiceConfig,
     tracker: &dyn TrackerClient,
     arguments: Value,
 ) -> Result<Value, TrackerError> {
@@ -152,6 +262,7 @@ async fn execute_todoist(
         .ok_or_else(|| {
             TrackerError::TrackerOperationUnsupported("`todoist.action` is required".to_string())
         })?;
+    info!(tool = "todoist", action);
 
     match action {
         "list_projects" => tracker.list_projects(Value::Object(args)).await,
@@ -171,8 +282,26 @@ async fn execute_todoist(
                 .await
         }
         "list_labels" => tracker.list_labels(Value::Object(args)).await,
+        "get_comment" => {
+            tracker
+                .get_comment(&required_id(&args, "comment_id")?)
+                .await
+        }
+        "delete_comment" => {
+            tracker
+                .delete_comment(&required_id(&args, "comment_id")?)
+                .await
+        }
         "list_comments" => tracker.list_comments(Value::Object(args)).await,
-        "create_comment" => tracker.create_comment(Value::Object(args)).await,
+        "get_workpad" => get_workpad(tracker, &required_id(&args, "task_id")?).await,
+        "upsert_workpad" => {
+            let task_id = required_id(&args, "task_id")?;
+            let content = required_string(&args, "content")?;
+            upsert_workpad(tracker, &task_id, &content).await
+        }
+        "delete_workpad" => delete_workpad(tracker, &required_id(&args, "task_id")?).await,
+        "create_project_comment" => create_project_comment(tracker, args).await,
+        "create_comment" => reject_generic_comment_creation(),
         "update_comment" => {
             let comment_id = required_id(&args, "comment_id")?;
             tracker
@@ -187,10 +316,11 @@ async fn execute_todoist(
             let task_id = required_id(&args, "task_id")?;
             tracker.move_task(&task_id, Value::Object(args)).await
         }
-        "close_task" => tracker.close_task(&required_id(&args, "task_id")?).await,
+        "close_task" => close_task_guarded(config, tracker, &required_id(&args, "task_id")?).await,
         "reopen_task" => tracker.reopen_task(&required_id(&args, "task_id")?).await,
         "create_task" => tracker.create_task(Value::Object(args)).await,
         "list_reminders" => tracker.list_reminders(Value::Object(args)).await,
+        "list_activities" => tracker.list_activities(Value::Object(args)).await,
         "create_reminder" => tracker.create_reminder(Value::Object(args)).await,
         "update_reminder" => {
             let reminder_id = required_id(&args, "reminder_id")?;
@@ -217,6 +347,279 @@ fn required_id(map: &serde_json::Map<String, Value>, key: &str) -> Result<String
             "`todoist.{key}` is required"
         ))),
     }
+}
+
+fn required_string(
+    map: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, TrackerError> {
+    map.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            TrackerError::TrackerOperationUnsupported(format!("`todoist.{key}` is required"))
+        })
+}
+
+fn reject_generic_comment_creation() -> Result<Value, TrackerError> {
+    Err(TrackerError::TrackerOperationUnsupported(
+        "Use `upsert_workpad` for task-scoped Symphony comments or `create_project_comment` for project comments.".to_string(),
+    ))
+}
+
+async fn create_project_comment(
+    tracker: &dyn TrackerClient,
+    mut args: serde_json::Map<String, Value>,
+) -> Result<Value, TrackerError> {
+    let project_id = required_id(&args, "project_id")?;
+    args.remove("task_id");
+    args.insert("project_id".to_string(), Value::String(project_id));
+    tracker.create_comment(Value::Object(args)).await
+}
+
+async fn get_workpad(tracker: &dyn TrackerClient, task_id: &str) -> Result<Value, TrackerError> {
+    let comment = find_workpad_comment(tracker, task_id).await?;
+    Ok(json!({
+        "task_id": task_id,
+        "found": comment.is_some(),
+        "comment_id": comment.as_ref().and_then(|value| value.get("id")).cloned().unwrap_or(Value::Null),
+        "comment": comment
+    }))
+}
+
+async fn upsert_workpad(
+    tracker: &dyn TrackerClient,
+    task_id: &str,
+    content: &str,
+) -> Result<Value, TrackerError> {
+    let content = normalize_workpad_content(content);
+    if let Some(existing) = find_workpad_comment(tracker, task_id).await? {
+        let comment_id = existing.get("id").and_then(Value::as_str).ok_or_else(|| {
+            TrackerError::TrackerOperationUnsupported(
+                "existing workpad comment is missing an `id`".to_string(),
+            )
+        })?;
+        let comment = tracker
+            .update_comment(comment_id, json!({ "content": content }))
+            .await?;
+        return Ok(json!({
+            "task_id": task_id,
+            "created": false,
+            "comment_id": comment.get("id").cloned().unwrap_or(Value::Null),
+            "comment": comment
+        }));
+    }
+
+    let comment = tracker
+        .create_comment(json!({ "task_id": task_id, "content": content }))
+        .await?;
+    Ok(json!({
+        "task_id": task_id,
+        "created": true,
+        "comment_id": comment.get("id").cloned().unwrap_or(Value::Null),
+        "comment": comment
+    }))
+}
+
+async fn delete_workpad(tracker: &dyn TrackerClient, task_id: &str) -> Result<Value, TrackerError> {
+    let Some(comment) = find_workpad_comment(tracker, task_id).await? else {
+        return Ok(json!({
+            "task_id": task_id,
+            "deleted": false,
+            "comment_id": Value::Null
+        }));
+    };
+    let comment_id = comment.get("id").and_then(Value::as_str).ok_or_else(|| {
+        TrackerError::TrackerOperationUnsupported(
+            "existing workpad comment is missing an `id`".to_string(),
+        )
+    })?;
+    tracker.delete_comment(comment_id).await?;
+    Ok(json!({
+        "task_id": task_id,
+        "deleted": true,
+        "comment_id": comment_id
+    }))
+}
+
+async fn close_task_guarded(
+    _config: &ServiceConfig,
+    tracker: &dyn TrackerClient,
+    task_id: &str,
+) -> Result<Value, TrackerError> {
+    let issue = tracker
+        .fetch_issue_states_by_ids(&[task_id.to_string()])
+        .await?
+        .into_iter()
+        .find(|issue| issue.id == task_id)
+        .ok_or_else(|| {
+            TrackerError::TrackerOperationUnsupported(format!(
+                "`close_task` could not load Todoist task `{task_id}`"
+            ))
+        })?;
+
+    if normalize_state_name(&issue.state) != "merging" {
+        return Err(TrackerError::TrackerOperationUnsupported(format!(
+            "`close_task` is only allowed from `Merging`. Current state is `{}`.",
+            issue.state
+        )));
+    }
+
+    let workpad = find_workpad_comment(tracker, task_id)
+        .await?
+        .ok_or_else(|| {
+            TrackerError::TrackerOperationUnsupported(
+                "`close_task` requires the persistent task workpad comment.".to_string(),
+            )
+        })?;
+    let workpad_content = workpad
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            TrackerError::TrackerOperationUnsupported(
+                "`close_task` requires readable workpad content.".to_string(),
+            )
+        })?;
+    let pr_url = extract_github_pr_url(workpad_content).ok_or_else(|| {
+        TrackerError::TrackerOperationUnsupported(
+            "`close_task` requires a linked GitHub PR URL in the workpad comment.".to_string(),
+        )
+    })?;
+    verify_pull_request_merged(&pr_url).await?;
+    info!(tool = "todoist", action = "close_task", task_id, pr_url);
+    tracker.close_task(task_id).await?;
+    Ok(json!({
+        "closed": true,
+        "task_id": task_id,
+        "pr_url": pr_url,
+        "state": issue.state
+    }))
+}
+
+async fn find_workpad_comment(
+    tracker: &dyn TrackerClient,
+    task_id: &str,
+) -> Result<Option<Value>, TrackerError> {
+    let mut cursor: Option<String> = None;
+    let mut best: Option<Value> = None;
+
+    loop {
+        let mut arguments = json!({ "task_id": task_id });
+        if let Some(next_cursor) = cursor.as_ref() {
+            arguments["cursor"] = Value::String(next_cursor.clone());
+        }
+        let page = tracker.list_comments(arguments).await?;
+        let results = page
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or(TrackerError::TodoistUnknownPayload)?;
+        for comment in results {
+            if !is_workpad_comment(comment) {
+                continue;
+            }
+            let replace = best
+                .as_ref()
+                .is_none_or(|current| workpad_sort_key(comment) >= workpad_sort_key(current));
+            if replace {
+                best = Some(comment.clone());
+            }
+        }
+        cursor = page
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(best)
+}
+
+fn normalize_workpad_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return format!("{WORKPAD_HEADER}\n\n{WORKPAD_MARKER}");
+    }
+    if trimmed.contains(WORKPAD_MARKER) {
+        return trimmed.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix(WORKPAD_HEADER) {
+        return format!("{WORKPAD_HEADER}\n\n{WORKPAD_MARKER}{}", rest);
+    }
+    format!("{WORKPAD_HEADER}\n\n{WORKPAD_MARKER}\n\n{trimmed}")
+}
+
+fn is_workpad_comment(comment: &Value) -> bool {
+    comment
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| {
+            content.contains(WORKPAD_MARKER) || content.trim_start().starts_with(WORKPAD_HEADER)
+        })
+}
+
+fn workpad_sort_key(comment: &Value) -> &str {
+    comment
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .or_else(|| comment.get("posted_at").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn extract_github_pr_url(content: &str) -> Option<String> {
+    static PR_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let regex = PR_URL_RE.get_or_init(|| {
+        Regex::new(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+")
+            .expect("valid github pr regex")
+    });
+    regex
+        .find(content)
+        .map(|matched| matched.as_str().to_string())
+}
+
+async fn verify_pull_request_merged(pr_url: &str) -> Result<(), TrackerError> {
+    let output = Command::new("gh")
+        .args(["pr", "view", pr_url, "--json", "url,state,mergedAt,isDraft"])
+        .output()
+        .await
+        .map_err(|error| {
+            TrackerError::TrackerOperationUnsupported(format!(
+                "`close_task` could not run `gh pr view`: {error}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(TrackerError::TrackerOperationUnsupported(format!(
+            "`close_task` could not verify GitHub PR merge status: {detail}"
+        )));
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        TrackerError::TrackerOperationUnsupported(format!(
+            "`close_task` could not parse `gh pr view` output: {error}"
+        ))
+    })?;
+    let merged_at = payload.get("mergedAt");
+    if merged_at.is_none() || merged_at.is_some_and(Value::is_null) {
+        let state = payload
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("OPEN");
+        return Err(TrackerError::TrackerOperationUnsupported(format!(
+            "`close_task` requires the linked PR to be merged. Current PR state is `{state}`."
+        )));
+    }
+
+    Ok(())
 }
 
 fn success_payload(body: Value) -> Value {
@@ -259,17 +662,15 @@ fn gh_cli_available() -> bool {
 }
 
 fn github_api_base_url() -> String {
-    env::var(GITHUB_API_BASE_URL_ENV)
-        .ok()
+    runtime_env::get(GITHUB_API_BASE_URL_ENV)
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| GITHUB_API_DEFAULT_BASE_URL.to_string())
 }
 
 fn github_token_from_env() -> Option<String> {
-    env::var("GH_TOKEN")
-        .ok()
-        .or_else(|| env::var("GITHUB_TOKEN").ok())
+    runtime_env::get("GH_TOKEN")
+        .or_else(|| runtime_env::get("GITHUB_TOKEN"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -497,6 +898,11 @@ fn tool_error_payload(error: TrackerError) -> Value {
                 "message": "Todoist reminders are unavailable for this account or plan."
             }
         }),
+        TrackerError::TodoistActivityLogUnavailable => json!({
+            "error": {
+                "message": "Todoist activity log is unavailable for this account or plan."
+            }
+        }),
         TrackerError::TodoistCommentTooLarge { limit, actual } => json!({
             "error": {
                 "message": format!("Todoist comment content exceeds the {limit}-character limit."),
@@ -562,6 +968,11 @@ fn tool_error_payload(error: TrackerError) -> Value {
 mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
+    use std::{
+        env, fs,
+        sync::{Arc, Mutex},
+    };
+    use tempfile::tempdir;
 
     use crate::{
         config::ServiceConfig,
@@ -569,9 +980,22 @@ mod tests {
         tracker::{TrackerClient, TrackerError},
     };
 
-    use super::{TODOIST_TOOL, execute, tool_specs};
+    use super::{TODOIST_TOOL, execute, extract_github_pr_url, tool_specs};
 
-    struct StubTodoistTracker;
+    #[derive(Clone, Default)]
+    struct StubTodoistTracker {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StubTodoistTracker {
+        fn record(&self, call: impl Into<String>) {
+            self.calls.lock().expect("calls").push(call.into());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
 
     #[async_trait]
     impl TrackerClient for StubTodoistTracker {
@@ -601,8 +1025,75 @@ mod tests {
             Ok(json!({ "id": project_id, "name": "Project" }))
         }
 
+        async fn get_comment(&self, comment_id: &str) -> Result<Value, TrackerError> {
+            Ok(json!({ "id": comment_id, "item_id": "task-1", "content": "## Codex Workpad" }))
+        }
+
+        async fn delete_comment(&self, comment_id: &str) -> Result<Value, TrackerError> {
+            self.record(format!("delete_comment:{comment_id}"));
+            Ok(Value::Null)
+        }
+
+        async fn list_comments(&self, arguments: Value) -> Result<Value, TrackerError> {
+            let task_id = arguments
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let results = match task_id {
+                "task-workpad" => vec![json!({
+                    "id": "comment-workpad",
+                    "item_id": "task-workpad",
+                    "content": "## Codex Workpad\n\nExisting",
+                    "posted_at": "2026-03-11T20:00:00Z"
+                })],
+                _ => Vec::new(),
+            };
+            Ok(json!({ "results": results, "next_cursor": null }))
+        }
+
+        async fn create_comment(&self, arguments: Value) -> Result<Value, TrackerError> {
+            let task_id = arguments
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.record(format!("create_comment:{task_id}"));
+            Ok(json!({
+                "id": "comment-created",
+                "item_id": task_id,
+                "content": content
+            }))
+        }
+
+        async fn update_comment(
+            &self,
+            comment_id: &str,
+            arguments: Value,
+        ) -> Result<Value, TrackerError> {
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.record(format!("update_comment:{comment_id}"));
+            Ok(json!({
+                "id": comment_id,
+                "item_id": "task-workpad",
+                "content": content
+            }))
+        }
+
         async fn create_reminder(&self, arguments: Value) -> Result<Value, TrackerError> {
             Ok(json!({ "created": true, "task_id": arguments["task_id"] }))
+        }
+
+        async fn list_activities(&self, _arguments: Value) -> Result<Value, TrackerError> {
+            Ok(json!({
+                "events": [{"id": 1, "object_type": "item", "event_type": "updated"}],
+                "next_cursor": null
+            }))
         }
 
         async fn update_reminder(
@@ -621,6 +1112,32 @@ mod tests {
     }
 
     struct ReminderErrorTracker;
+
+    struct CloseGuardTracker {
+        issue: Issue,
+        workpad_content: String,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CloseGuardTracker {
+        fn new(state: &str, workpad_content: &str) -> Self {
+            Self {
+                issue: Issue {
+                    id: "task-close".to_string(),
+                    identifier: "TD-task-close".to_string(),
+                    title: "Close guard".to_string(),
+                    state: state.to_string(),
+                    ..Issue::default()
+                },
+                workpad_content: workpad_content.to_string(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
 
     #[async_trait]
     impl TrackerClient for ReminderErrorTracker {
@@ -644,6 +1161,51 @@ mod tests {
 
         async fn create_reminder(&self, _arguments: Value) -> Result<Value, TrackerError> {
             Err(TrackerError::TodoistRemindersUnavailable)
+        }
+
+        async fn list_activities(&self, _arguments: Value) -> Result<Value, TrackerError> {
+            Err(TrackerError::TodoistActivityLogUnavailable)
+        }
+    }
+
+    #[async_trait]
+    impl TrackerClient for CloseGuardTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            unreachable!()
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
+            Ok(vec![self.issue.clone()])
+        }
+
+        async fn list_comments(&self, _arguments: Value) -> Result<Value, TrackerError> {
+            Ok(json!({
+                "results": [{
+                    "id": "comment-workpad",
+                    "item_id": "task-close",
+                    "content": self.workpad_content,
+                    "posted_at": "2026-03-12T04:00:00Z"
+                }],
+                "next_cursor": null
+            }))
+        }
+
+        async fn close_task(&self, task_id: &str) -> Result<Value, TrackerError> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("close_task:{task_id}"));
+            Ok(Value::Null)
         }
     }
 
@@ -677,13 +1239,18 @@ mod tests {
         assert!(description.contains("list_projects"));
         assert!(description.contains("list_collaborators"));
         assert!(description.contains("list_labels"));
+        assert!(description.contains("get_comment"));
+        assert!(description.contains("delete_comment"));
+        assert!(description.contains("upsert_workpad"));
+        assert!(description.contains("create_project_comment"));
         assert!(description.contains("create_reminder"));
+        assert!(description.contains("list_activities"));
     }
 
     #[tokio::test]
     async fn execute_todoist_routes_project_and_reminder_actions() {
         let config = test_config();
-        let tracker = StubTodoistTracker;
+        let tracker = StubTodoistTracker::default();
 
         let projects = execute(
             &config,
@@ -704,6 +1271,24 @@ mod tests {
         .await;
         assert_eq!(payload_body(&project)["id"], "proj-9");
 
+        let comment = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "get_comment", "comment_id": "comment-7"}),
+        )
+        .await;
+        assert_eq!(payload_body(&comment)["item_id"], "task-1");
+
+        let project_comment = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "create_project_comment", "project_id": "proj-9", "content": "Project note"}),
+        )
+        .await;
+        assert_eq!(payload_body(&project_comment)["content"], "Project note");
+
         let reminder = execute(
             &config,
             &tracker,
@@ -713,6 +1298,18 @@ mod tests {
         .await;
         assert_eq!(payload_body(&reminder)["id"], "rem-1");
 
+        let activities = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "list_activities", "object_type": "item", "object_id": "task-1"}),
+        )
+        .await;
+        assert_eq!(
+            payload_body(&activities)["events"][0]["event_type"],
+            "updated"
+        );
+
         let deleted = execute(
             &config,
             &tracker,
@@ -721,6 +1318,178 @@ mod tests {
         )
         .await;
         assert_eq!(payload_body(&deleted)["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_workpad_actions_reuse_single_comment() {
+        let config = test_config();
+        let tracker = StubTodoistTracker::default();
+
+        let existing = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "get_workpad", "task_id": "task-workpad"}),
+        )
+        .await;
+        assert_eq!(payload_body(&existing)["found"], true);
+        assert_eq!(payload_body(&existing)["comment_id"], "comment-workpad");
+
+        let updated = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "upsert_workpad", "task_id": "task-workpad", "content": "## Codex Workpad\n\nBody"}),
+        )
+        .await;
+        assert_eq!(payload_body(&updated)["created"], false);
+        assert!(
+            payload_body(&updated)["comment"]["content"]
+                .as_str()
+                .expect("content")
+                .contains("<!-- symphony:workpad -->")
+        );
+
+        let created = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "upsert_workpad", "task_id": "task-empty", "content": "Body"}),
+        )
+        .await;
+        assert_eq!(payload_body(&created)["created"], true);
+        assert!(
+            payload_body(&created)["comment"]["content"]
+                .as_str()
+                .expect("content")
+                .starts_with("## Codex Workpad")
+        );
+
+        let deleted = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "delete_workpad", "task_id": "task-workpad"}),
+        )
+        .await;
+        assert_eq!(payload_body(&deleted)["deleted"], true);
+
+        assert_eq!(
+            tracker.calls(),
+            vec![
+                "update_comment:comment-workpad".to_string(),
+                "create_comment:task-empty".to_string(),
+                "delete_comment:comment-workpad".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_rejects_generic_comment_creation() {
+        let config = test_config();
+        let tracker = StubTodoistTracker::default();
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "create_comment", "task_id": "task-1", "content": "summary"}),
+        )
+        .await;
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "Use `upsert_workpad` for task-scoped Symphony comments or `create_project_comment` for project comments."
+        );
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_task_requires_merging_state() {
+        let config = test_config();
+        let tracker = CloseGuardTracker::new(
+            "In Progress",
+            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nPR: https://github.com/example/repo/pull/1",
+        );
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "close_task", "task_id": "task-close"}),
+        )
+        .await;
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "`close_task` is only allowed from `Merging`. Current state is `In Progress`."
+        );
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_task_requires_merged_pr_in_workpad() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let gh_path = bin_dir.join("gh");
+        fs::write(
+            &gh_path,
+            "#!/bin/sh\nprintf '%s\\n' '{\"url\":\"https://github.com/example/repo/pull/1\",\"state\":\"OPEN\",\"mergedAt\":null,\"isDraft\":false}'\n",
+        )
+        .expect("fake gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&gh_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&gh_path, permissions).expect("chmod");
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        unsafe {
+            env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
+        }
+
+        let config = test_config();
+        let tracker = CloseGuardTracker::new(
+            "Merging",
+            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nPR: https://github.com/example/repo/pull/1",
+        );
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "close_task", "task_id": "task-close"}),
+        )
+        .await;
+
+        unsafe {
+            env::set_var("PATH", original_path);
+        }
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "`close_task` requires the linked PR to be merged. Current PR state is `OPEN`."
+        );
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[test]
+    fn extracts_github_pr_urls_from_workpad_content() {
+        let content = "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nTracking https://github.com/example/repo/pull/42";
+        assert_eq!(
+            extract_github_pr_url(content).as_deref(),
+            Some("https://github.com/example/repo/pull/42")
+        );
     }
 
     #[tokio::test]
@@ -744,9 +1513,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_todoist_maps_activity_log_availability_errors() {
+        let config = test_config();
+        let tracker = ReminderErrorTracker;
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "list_activities", "object_type": "item", "object_id": "task-1"}),
+        )
+        .await;
+
+        assert!(!result["success"].as_bool().expect("success"));
+        assert_eq!(
+            payload_body(&result)["error"]["message"],
+            "Todoist activity log is unavailable for this account or plan."
+        );
+    }
+
+    #[tokio::test]
     async fn execute_todoist_requires_reminder_id_for_update() {
         let config = test_config();
-        let tracker = StubTodoistTracker;
+        let tracker = StubTodoistTracker::default();
 
         let result = execute(
             &config,

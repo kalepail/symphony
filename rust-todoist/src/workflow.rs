@@ -12,7 +12,10 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
 
-use crate::config::{ConfigError, ServiceConfig};
+use crate::{
+    config::{ConfigError, ServiceConfig},
+    runtime_env,
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkflowDefinition {
@@ -179,6 +182,7 @@ impl WorkflowStore {
     }
 
     pub fn load_path(path: &Path) -> Result<LoadedWorkflow, WorkflowError> {
+        runtime_env::load_dotenv_for_workflow(path).map_err(WorkflowError::InvalidConfig)?;
         let raw = fs::read_to_string(path).map_err(|error| WorkflowError::MissingWorkflowFile {
             path: path.to_path_buf(),
             reason: error.to_string(),
@@ -271,20 +275,12 @@ fn parse_workflow(raw: &str) -> Result<WorkflowDefinition, WorkflowError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        sync::{Mutex, OnceLock},
-    };
+    use std::{env, fs};
 
     use serde_json::Value;
     use tempfile::tempdir;
 
     use super::{WorkflowError, fingerprint_for, parse_workflow};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn parses_prompt_only_workflows() {
@@ -370,7 +366,9 @@ mod tests {
 
     #[test]
     fn bundled_workflows_are_dispatch_ready_with_test_env() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let workspace_root = tempdir().expect("tempdir");
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 

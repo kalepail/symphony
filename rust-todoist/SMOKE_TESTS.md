@@ -23,6 +23,7 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
+Seed minimal smoke tasks with the label `symphony-smoke-minimal` and full/rework/merge smoke tasks with the label `symphony-smoke-full`.
 
 ## Canonical Todoist Sections
 
@@ -31,7 +32,8 @@ For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), th
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
 
-Compatibility substitutes such as `In Review` remain supported for non-smoke migrations, but smoke parity runs should use the canonical names above.
+Smoke parity runs and production workflows should use the canonical names above directly.
+For workpad validation, treat task-scoped comments and their `item_id` field as the canonical Todoist comment surface for a task. Full workflow runs should leave exactly one surviving task-scoped workpad comment marked by both `## Codex Workpad` and `<!-- symphony:workpad -->`.
 
 ## Operator Preflight
 
@@ -66,12 +68,14 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 
 1. `smoke-minimal`
    - Workflow: `WORKFLOW.smoke.minimal.md`
-   - Proves: live Todoist polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, `todoist` comment, `Done` transition, workspace cleanup, terminal/web observability during a live run
+   - Seed task label: `symphony-smoke-minimal`
+   - Proves: live Todoist polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, single-workpad comment discipline, a bounded non-terminal state transition back to `Backlog`, and terminal/web observability during a live run
    - Expected repo effect: one appended bullet in `SMOKE_TARGET.md`
 
 2. `smoke-pr`
    - Workflow: `WORKFLOW.smoke.full.md`
    - Seed the issue in `Todo`
+   - Seed task label: `symphony-smoke-full`
    - Task body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR details to the Todoist task
    - Expected outcome: issue reaches `Human Review` with a green PR
    - Expected observability: SSE dashboard stays live during publish; terminal dashboard shows live activity and any retry pressure without flooding

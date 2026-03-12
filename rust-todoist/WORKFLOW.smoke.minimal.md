@@ -3,6 +3,9 @@ tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
   project_id: $SYMPHONY_SMOKE_PROJECT_ID
+  label: symphony-smoke-minimal
+  active_states:
+    - Todo
 polling:
   interval_ms: 5000
 workspace:
@@ -14,7 +17,7 @@ agent:
   max_concurrent_agents: 1
   max_turns: 8
 codex:
-  command: codex app-server
+  command: codex --config shell_environment_policy.inherit=core app-server
 server:
   port: 3000
 ---
@@ -35,14 +38,15 @@ Steps:
    - the current UTC date in `YYYY-MM-DD` form
    - one short phrase saying it was created by a Symphony minimal smoke test
 5. Run `sh scripts/validate-smoke-repo.sh`.
-6. Use the `todoist` tool to add a short comment to the task summarizing the exact file change you made.
-7. Use the `todoist` tool to close the task so it reaches `Done`.
+6. Use the `todoist` tool to create or update the task workpad with a short summary of the exact file change you made.
+7. Resolve the `Backlog` section id and move the task back to `Backlog` instead of completing it.
 8. Stop after that.
 
 Todoist tool notes:
 - Read the current task with `{"action":"get_task","task_id":"<task-id>"}`.
-- Add the comment with `{"action":"create_comment","task_id":"<task-id>","content":"..."}`.
-- Close the task with `{"action":"close_task","task_id":"<task-id>"}`.
+- Write the task summary with `{"action":"upsert_workpad","task_id":"<task-id>","content":"..."}`.
+- The workpad is the single agent-owned task comment, and Todoist comment responses identify that task with `item_id`.
+- Resolve sections with `{"action":"list_sections"}` and move the task with `{"action":"move_task","task_id":"<task-id>","section_id":"<backlog-section-id>"}`.
 - Keep each `todoist` call to one narrow operation.
 
 Constraints:

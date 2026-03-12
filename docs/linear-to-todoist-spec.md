@@ -350,6 +350,7 @@ Use labels for:
 - bug or feature classification
 - risk or waiting markers
 - human routing hints that are not equivalent to ownership
+- runtime ownership boundaries when multiple Symphony runtimes share one Todoist project
 
 Todoist due dates, deadlines, and reminders are also first-class native features.
 
@@ -473,7 +474,7 @@ Phase 1 should copy and adapt. Do not prematurely abstract shared code into a co
 | [`rust/src/observability.rs`](../rust/src/observability.rs) | copy; update tracker wording, links, and identifiers |
 | [`rust/src/http.rs`](../rust/src/http.rs) | copy; preserve routes and SSE behavior |
 | [`rust/src/config.rs`](../rust/src/config.rs) | copy, then adapt tracker config from Linear to Todoist |
-| [`rust/src/issue.rs`](../rust/src/issue.rs) | copy, then make unsupported fields explicit compatibility shims |
+| [`rust/src/issue.rs`](../rust/src/issue.rs) | copy, then remove unsupported Linear-only fields and keep the Todoist shape explicit |
 | [`rust/src/tracker/linear.rs`](../rust/src/tracker/linear.rs) | use only as HTTP-client and pagination pattern reference |
 | [`rust/src/tracker/memory.rs`](../rust/src/tracker/memory.rs) | copy, then expand fixture model and structured tool support |
 | [`rust/src/dynamic_tool.rs`](../rust/src/dynamic_tool.rs) | preserve `github_api`; replace `linear_graphql` with structured `todoist` actions |
@@ -947,8 +948,12 @@ Required actions:
 - `get_section`
 - `list_labels`
 - `list_comments`
-- `create_comment`
+- `create_project_comment`
 - `update_comment`
+- `delete_comment`
+- `get_workpad`
+- `upsert_workpad`
+- `delete_workpad`
 - `move_task`
 - `update_task`
 - `close_task`
@@ -1001,17 +1006,43 @@ Required actions:
 - task comments are the required workpad surface
 - project comments are operator-only and must not be used for the persistent workpad
 
-`create_comment`
+`create_project_comment`
 
 - requires `content`
-- requires exactly one of `task_id` or `project_id`
+- requires `project_id`
 - rejects content over `15,000` characters
-- workpad creation must target `task_id`
+- generic raw comment creation is not exposed for task comments in the agent-facing tool surface
+- task workpad creation must flow through `upsert_workpad`
 
 `update_comment`
 
 - requires `comment_id`
 - enforces the same content-size bound
+
+`delete_comment`
+
+- requires `comment_id`
+- deletes the comment directly without introducing archive-only soft-delete behavior
+
+`get_workpad`
+
+- requires `task_id`
+- returns the current Symphony task workpad when present
+- identifies the workpad with both `## Codex Workpad` and `<!-- symphony:workpad -->`
+
+`upsert_workpad`
+
+- requires `task_id`
+- requires `content`
+- reuses the existing task workpad comment when present
+- creates exactly one task workpad when missing
+- normalizes the hidden workpad marker if the caller omitted it
+
+`delete_workpad`
+
+- requires `task_id`
+- removes the current task workpad comment when present
+- never falls back to project comments
 
 `move_task`
 
@@ -1025,7 +1056,10 @@ Required actions:
 
 `close_task`
 
-- closes the task and returns success even when the response body is null
+- is a guarded completion action rather than a raw passthrough
+- requires the current normalized task state to already be `Merging`
+- requires the workpad comment to contain the canonical GitHub PR URL
+- requires Symphony to verify the linked PR is actually merged before closing the Todoist task
 
 `reopen_task`
 
@@ -1044,6 +1078,10 @@ Required actions:
   - `assignee_id`
   - `due`
   - `deadline`
+- defaults `project_id` from tracker config when absent
+- inherits `tracker.label` automatically when runtime label scoping is configured
+- defaults top-level follow-up tasks into the project's `Todo` section when no `section_id` is
+  supplied and a `Todo` section exists
 
 `list_reminders`
 
@@ -1232,6 +1270,9 @@ What changes:
 - no `related` graph
 - no `blockedBy` graph
 - follow-up linkage becomes textual and workflow-local
+- runtime-owned follow-up tasks inherit the current runtime label scope automatically
+- top-level follow-up tasks default into the project's `Todo` lane unless the workflow chooses a
+  different target explicitly
 
 ### Workpad Format Rule
 
@@ -1268,11 +1309,12 @@ Required changes:
 - `tracker.kind: todoist` parses
 - `tracker.kind: memory` still parses
 - `tracker.project_id` is required
+- `tracker.label` optionally narrows runtime ownership inside a shared Todoist project
 - `tracker.base_url` default and override work
 - `TODOIST_API_TOKEN` fallback resolves
 - `TODOIST_ASSIGNEE` fallback works if retained
 - YAML-list and CSV state parsing both work
-- explicit turn sandbox policy still passes through unchanged
+- explicit turn sandbox policy merges into the safe runtime defaults rather than replacing them
 
 ### Todoist Client
 
@@ -1300,7 +1342,7 @@ Required changes:
 - transport error mapping
 - structured JSON output
 - project, collaborator, and label actions
-- `create_task` behavior
+- `create_task` behavior, including runtime label inheritance and Todo-section defaults
 - `create_task` with `parent_id` behavior
 - `move_task` reparent behavior
 - reminder action gating
