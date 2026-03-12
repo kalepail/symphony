@@ -26,7 +26,7 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 
 ## Canonical Linear Columns
 
-For exact parity with the original Elixir workflow and [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the dedicated smoke Linear setup now uses this board organization:
+For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), the dedicated smoke Linear setup now uses this board organization:
 
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`

@@ -1,6 +1,6 @@
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::{env, process::Command as StdCommand};
+use std::{env, process::Command as StdCommand, sync::OnceLock};
 use tokio::process::Command;
 
 use crate::{
@@ -244,13 +244,18 @@ fn failure_payload(body: Value) -> Value {
 }
 
 fn github_api_available() -> bool {
-    github_token_from_env().is_some()
-        || StdCommand::new("sh")
-            .arg("-lc")
-            .arg("command -v gh >/dev/null 2>&1")
+    github_token_from_env().is_some() || gh_cli_available()
+}
+
+fn gh_cli_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        StdCommand::new("gh")
+            .arg("--version")
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    })
 }
 
 fn github_api_base_url() -> String {
@@ -388,9 +393,10 @@ async fn execute_github_api(
         .map_err(|error| json!({ "error": { "message": error.to_string() } }))?;
 
     let mut request = client
-        .request(method, &url)
+        .request(method.clone(), &url)
         .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json");
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -399,17 +405,59 @@ async fn execute_github_api(
         json!({
             "error": {
                 "message": "GitHub API request failed before receiving a response.",
-                "reason": error.to_string()
+                "reason": error.to_string(),
+                "method": method.as_str(),
+                "path": path
             }
         })
     })?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if body.trim().is_empty() {
-        return Ok(json!({ "status": status.as_u16() }));
+    let body_text = response.text().await.map_err(|error| {
+        json!({
+            "error": {
+                "message": "GitHub API response body could not be read.",
+                "reason": error.to_string(),
+                "method": method.as_str(),
+                "path": path
+            }
+        })
+    })?;
+    if body_text.trim().is_empty() {
+        if status.is_success() {
+            return Ok(json!({ "status": status.as_u16() }));
+        }
+        return Err(json!({
+            "error": {
+                "message": "GitHub API request returned a non-success status with an empty body.",
+                "status": status.as_u16(),
+                "method": method.as_str(),
+                "path": path
+            }
+        }));
     }
-    serde_json::from_str::<Value>(&body)
-        .or_else(|_| Ok(json!({ "status": status.as_u16(), "body": body })))
+
+    let parsed_body = parse_error_body(&body_text);
+    if status.is_success() {
+        Ok(parsed_body)
+    } else {
+        Err(json!({
+            "error": {
+                "message": format!("GitHub API request failed with HTTP {}.", status.as_u16()),
+                "status": status.as_u16(),
+                "method": method.as_str(),
+                "path": path,
+                "response": parsed_body
+            }
+        }))
+    }
+}
+
+fn parse_error_body(body: &str) -> Value {
+    if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({ "raw": body }))
+    }
 }
 
 fn tool_error_payload(error: TrackerError) -> Value {

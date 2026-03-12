@@ -22,8 +22,10 @@ hooks:
   after_create: |
     git clone --depth 1 git@github.com:your-org/your-repo.git .
   before_remove: |
-    if [ -f rust/scripts/workspace_before_remove.sh ]; then
-      sh rust/scripts/workspace_before_remove.sh
+    if [ -f scripts/workspace_before_remove.sh ]; then
+      sh scripts/workspace_before_remove.sh
+    elif [ -f rust-todoist/scripts/workspace_before_remove.sh ]; then
+      sh rust-todoist/scripts/workspace_before_remove.sh
     fi
 agent:
   max_concurrent_agents: 10

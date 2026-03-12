@@ -157,7 +157,7 @@ Rust Operations Dashboard
 
 ## Canonical Linear Workflow
 
-For parity with the original Elixir implementation and the root [SPEC.md](/Users/kalepail/Desktop/symphony/SPEC.md), the dedicated smoke workflow now uses this Linear board layout:
+For parity with the original Elixir implementation and the root [SPEC.md](../SPEC.md), the dedicated smoke workflow now uses this Linear board layout:
 
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`

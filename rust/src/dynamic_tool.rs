@@ -1,6 +1,6 @@
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::{env, process::Command as StdCommand};
+use std::{env, process::Command as StdCommand, sync::OnceLock};
 use tokio::process::Command;
 
 use crate::{
@@ -198,13 +198,18 @@ fn failure_payload(body: Value) -> Value {
 }
 
 fn github_api_available() -> bool {
-    github_token_from_env().is_some()
-        || StdCommand::new("sh")
-            .arg("-lc")
-            .arg("command -v gh >/dev/null 2>&1")
+    github_token_from_env().is_some() || gh_cli_available()
+}
+
+fn gh_cli_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        StdCommand::new("gh")
+            .arg("--version")
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    })
 }
 
 fn github_api_base_url() -> String {
@@ -543,6 +548,32 @@ mod tests {
         LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var(key).ok();
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn accepts_multiple_operations() {
         let config = linear_config();
@@ -659,9 +690,7 @@ mod tests {
     #[tokio::test]
     async fn exposes_github_api_tool_when_token_is_present() {
         let _guard = env_lock().lock().await;
-        unsafe {
-            env::set_var("GH_TOKEN", "token");
-        }
+        let _token = ScopedEnvVar::set("GH_TOKEN", "token");
 
         let config = linear_config();
         let specs = tool_specs(&config);
@@ -671,10 +700,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(tool_names.contains(&GITHUB_API_TOOL));
-
-        unsafe {
-            env::remove_var("GH_TOKEN");
-        }
     }
 
     #[tokio::test]
@@ -685,10 +710,8 @@ mod tests {
             json!({ "html_url": "https://github.com/kalepail/symphony-smoke-lab/pull/2" }),
         )])
         .await;
-        unsafe {
-            env::set_var("GH_TOKEN", "token");
-            env::set_var("SYMPHONY_GITHUB_API_URL", server.endpoint());
-        }
+        let _token = ScopedEnvVar::set("GH_TOKEN", "token");
+        let _base_url = ScopedEnvVar::set("SYMPHONY_GITHUB_API_URL", &server.endpoint());
 
         let payload = execute(
             &linear_config(),
@@ -714,11 +737,6 @@ mod tests {
             payload.get("success").and_then(serde_json::Value::as_bool),
             Some(true)
         );
-
-        unsafe {
-            env::remove_var("GH_TOKEN");
-            env::remove_var("SYMPHONY_GITHUB_API_URL");
-        }
         server.abort();
     }
 
@@ -730,10 +748,8 @@ mod tests {
             json!({ "message": "Validation Failed" }),
         )])
         .await;
-        unsafe {
-            env::set_var("GH_TOKEN", "token");
-            env::set_var("SYMPHONY_GITHUB_API_URL", server.endpoint());
-        }
+        let _token = ScopedEnvVar::set("GH_TOKEN", "token");
+        let _base_url = ScopedEnvVar::set("SYMPHONY_GITHUB_API_URL", &server.endpoint());
 
         let payload = execute(
             &linear_config(),
@@ -763,11 +779,6 @@ mod tests {
         );
         assert!(rendered.contains("\"status\": 422"));
         assert!(rendered.contains("Validation Failed"));
-
-        unsafe {
-            env::remove_var("GH_TOKEN");
-            env::remove_var("SYMPHONY_GITHUB_API_URL");
-        }
         server.abort();
     }
 
@@ -779,10 +790,8 @@ mod tests {
             json!({ "ok": true }),
         )])
         .await;
-        unsafe {
-            env::set_var("GH_TOKEN", "token");
-            env::set_var("SYMPHONY_GITHUB_API_URL", server.endpoint());
-        }
+        let _token = ScopedEnvVar::set("GH_TOKEN", "token");
+        let _base_url = ScopedEnvVar::set("SYMPHONY_GITHUB_API_URL", &server.endpoint());
 
         let payload = execute(
             &linear_config(),
@@ -803,11 +812,6 @@ mod tests {
             payload.get("success").and_then(serde_json::Value::as_bool),
             Some(true)
         );
-
-        unsafe {
-            env::remove_var("GH_TOKEN");
-            env::remove_var("SYMPHONY_GITHUB_API_URL");
-        }
         server.abort();
     }
 
@@ -819,10 +823,8 @@ mod tests {
             json!({ "ok": true }),
         )])
         .await;
-        unsafe {
-            env::set_var("GH_TOKEN", "token");
-            env::set_var("SYMPHONY_GITHUB_API_URL", server.endpoint());
-        }
+        let _token = ScopedEnvVar::set("GH_TOKEN", "token");
+        let _base_url = ScopedEnvVar::set("SYMPHONY_GITHUB_API_URL", &server.endpoint());
 
         let payload = execute(
             &linear_config(),
@@ -843,11 +845,6 @@ mod tests {
             payload.get("success").and_then(serde_json::Value::as_bool),
             Some(true)
         );
-
-        unsafe {
-            env::remove_var("GH_TOKEN");
-            env::remove_var("SYMPHONY_GITHUB_API_URL");
-        }
         server.abort();
     }
 
