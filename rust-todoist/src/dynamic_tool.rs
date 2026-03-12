@@ -1,9 +1,13 @@
 use regex::Regex;
-use reqwest::Method;
+use reqwest::{
+    Method, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
 use serde_json::{Value, json};
-use std::{process::Command as StdCommand, sync::OnceLock};
+use std::{process::Command as StdCommand, sync::OnceLock, time::Duration};
 use tokio::process::Command;
-use tracing::info;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::{
     config::ServiceConfig,
@@ -16,6 +20,9 @@ pub const GITHUB_API_TOOL: &str = "github_api";
 pub const TODOIST_TOOL: &str = "todoist";
 const GITHUB_API_BASE_URL_ENV: &str = "SYMPHONY_GITHUB_API_URL";
 const GITHUB_API_DEFAULT_BASE_URL: &str = "https://api.github.com";
+const GITHUB_API_MAX_RETRIES: usize = 2;
+const GITHUB_API_DEFAULT_DELAY_SECS: u64 = 2;
+const GITHUB_API_MAX_DELAY_SECS: u64 = 60;
 const WORKPAD_HEADER: &str = "## Codex Workpad";
 const WORKPAD_MARKER: &str = "<!-- symphony:workpad -->";
 const GITHUB_API_TOOL_DESCRIPTION: &str = concat!(
@@ -42,7 +49,8 @@ const TODOIST_TOOL_DESCRIPTION: &str = concat!(
     "`close_task` is guarded: the task must already be in `Merging`, the workpad must contain a linked GitHub PR URL, ",
     "and Symphony verifies that the PR is actually merged before completing the task.\n",
     "For Symphony's persistent task workpad, prefer `get_workpad`, `upsert_workpad`, and `delete_workpad` ",
-    "instead of raw comment mutations."
+    "instead of raw comment mutations. When `get_workpad` returns a `comment_id`, pass that optional hint back into ",
+    "`upsert_workpad` so Symphony can update the workpad directly without re-listing comments."
 );
 
 pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
@@ -123,7 +131,7 @@ pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
                     },
                     "comment_id": {
                         "type": ["string", "number", "null"],
-                        "description": "Comment identifier for get_comment, update_comment, or delete_comment."
+                        "description": "Comment identifier for get_comment, update_comment, delete_comment, or as an optional workpad hint for upsert_workpad."
                     },
                     "project_id": {
                         "type": ["string", "number", "null"],
@@ -297,7 +305,8 @@ async fn execute_todoist(
         "upsert_workpad" => {
             let task_id = required_id(&args, "task_id")?;
             let content = required_string(&args, "content")?;
-            upsert_workpad(tracker, &task_id, &content).await
+            let comment_id = optional_id(&args, "comment_id");
+            upsert_workpad(tracker, &task_id, &content, comment_id.as_deref()).await
         }
         "delete_workpad" => delete_workpad(tracker, &required_id(&args, "task_id")?).await,
         "create_project_comment" => create_project_comment(tracker, args).await,
@@ -349,6 +358,14 @@ fn required_id(map: &serde_json::Map<String, Value>, key: &str) -> Result<String
     }
 }
 
+fn optional_id(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    match map.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Some(Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn required_string(
     map: &serde_json::Map<String, Value>,
     key: &str,
@@ -393,9 +410,43 @@ async fn upsert_workpad(
     tracker: &dyn TrackerClient,
     task_id: &str,
     content: &str,
+    comment_id: Option<&str>,
 ) -> Result<Value, TrackerError> {
     let content = normalize_workpad_content(content);
+    if let Some(comment_id) = comment_id.filter(|value| !value.trim().is_empty()) {
+        match tracker
+            .update_comment(comment_id, json!({ "content": content.clone() }))
+            .await
+        {
+            Ok(comment) => {
+                return Ok(json!({
+                    "task_id": task_id,
+                    "created": false,
+                    "comment_id": comment.get("id").cloned().unwrap_or(Value::Null),
+                    "comment": comment
+                }));
+            }
+            Err(TrackerError::TodoistApiStatus { status, .. }) if status == 404 => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     if let Some(existing) = find_workpad_comment(tracker, task_id).await? {
+        if existing
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            == Some(content.as_str())
+        {
+            return Ok(json!({
+                "task_id": task_id,
+                "created": false,
+                "updated": false,
+                "comment_id": existing.get("id").cloned().unwrap_or(Value::Null),
+                "comment": existing
+            }));
+        }
+
         let comment_id = existing.get("id").and_then(Value::as_str).ok_or_else(|| {
             TrackerError::TrackerOperationUnsupported(
                 "existing workpad comment is missing an `id`".to_string(),
@@ -580,35 +631,45 @@ fn extract_github_pr_url(content: &str) -> Option<String> {
         .map(|matched| matched.as_str().to_string())
 }
 
+fn github_pr_coordinates(pr_url: &str) -> Option<(String, String, String)> {
+    static PR_COORDINATES_RE: OnceLock<Regex> = OnceLock::new();
+    let regex = PR_COORDINATES_RE.get_or_init(|| {
+        Regex::new(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)$")
+            .expect("valid github pr coordinates regex")
+    });
+
+    regex.captures(pr_url).map(|captures| {
+        (
+            captures[1].to_string(),
+            captures[2].to_string(),
+            captures[3].to_string(),
+        )
+    })
+}
+
 async fn verify_pull_request_merged(pr_url: &str) -> Result<(), TrackerError> {
-    let output = Command::new("gh")
-        .args(["pr", "view", pr_url, "--json", "url,state,mergedAt,isDraft"])
-        .output()
-        .await
-        .map_err(|error| {
-            TrackerError::TrackerOperationUnsupported(format!(
-                "`close_task` could not run `gh pr view`: {error}"
-            ))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            stderr
-        };
+    let Some((owner, repo, number)) = github_pr_coordinates(pr_url) else {
         return Err(TrackerError::TrackerOperationUnsupported(format!(
-            "`close_task` could not verify GitHub PR merge status: {detail}"
+            "`close_task` requires a valid GitHub PR URL in the workpad comment: {pr_url}"
         )));
-    }
+    };
+    let path = format!("/repos/{owner}/{repo}/pulls/{number}");
 
-    let payload: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
-        TrackerError::TrackerOperationUnsupported(format!(
-            "`close_task` could not parse `gh pr view` output: {error}"
-        ))
-    })?;
-    let merged_at = payload.get("mergedAt");
+    match github_api_request(Method::GET, path.clone(), None).await {
+        Ok(payload) => verify_pull_request_merged_payload(&payload),
+        Err(api_error) => verify_pull_request_merged_with_gh(pr_url)
+            .await
+            .map_err(|gh_error| {
+                TrackerError::TrackerOperationUnsupported(format!(
+                    "`close_task` could not verify GitHub PR merge status via runtime API ({}) or `gh pr view` ({gh_error})",
+                    github_error_summary(&api_error)
+                ))
+            }),
+    }
+}
+
+fn verify_pull_request_merged_payload(payload: &Value) -> Result<(), TrackerError> {
+    let merged_at = payload.get("merged_at").or_else(|| payload.get("mergedAt"));
     if merged_at.is_none() || merged_at.is_some_and(Value::is_null) {
         let state = payload
             .get("state")
@@ -620,6 +681,27 @@ async fn verify_pull_request_merged(pr_url: &str) -> Result<(), TrackerError> {
     }
 
     Ok(())
+}
+
+async fn verify_pull_request_merged_with_gh(pr_url: &str) -> Result<(), String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", pr_url, "--json", "url,state,mergedAt,isDraft"])
+        .output()
+        .await
+        .map_err(|error| format!("could not run `gh pr view`: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("could not parse `gh pr view` output: {error}"))?;
+    verify_pull_request_merged_payload(&payload).map_err(|error| error.to_string())
 }
 
 fn success_payload(body: Value) -> Value {
@@ -786,6 +868,14 @@ async fn execute_github_api(
     path: String,
     body: Option<Value>,
 ) -> Result<Value, Value> {
+    github_api_request(method, path, body).await
+}
+
+async fn github_api_request(
+    method: Method,
+    path: String,
+    body: Option<Value>,
+) -> Result<Value, Value> {
     let token = github_auth_token().await?;
     let url = format!("{}{}", github_api_base_url(), path);
     let client = reqwest::Client::builder()
@@ -793,63 +883,173 @@ async fn execute_github_api(
         .build()
         .map_err(|error| json!({ "error": { "message": error.to_string() } }))?;
 
-    let mut request = client
-        .request(method.clone(), &url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28");
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
-
-    let response = request.send().await.map_err(|error| {
-        json!({
-            "error": {
-                "message": "GitHub API request failed before receiving a response.",
-                "reason": error.to_string(),
-                "method": method.as_str(),
-                "path": path
-            }
-        })
-    })?;
-    let status = response.status();
-    let body_text = response.text().await.map_err(|error| {
-        json!({
-            "error": {
-                "message": "GitHub API response body could not be read.",
-                "reason": error.to_string(),
-                "method": method.as_str(),
-                "path": path
-            }
-        })
-    })?;
-    if body_text.trim().is_empty() {
-        if status.is_success() {
-            return Ok(json!({ "status": status.as_u16() }));
+    let mut waited_secs = 0u64;
+    for attempt in 0..=GITHUB_API_MAX_RETRIES {
+        let mut request = client
+            .request(method.clone(), &url)
+            .bearer_auth(&token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(body) = body.as_ref() {
+            request = request.json(body);
         }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(delay_secs) = github_transport_retry_delay_seconds(attempt, waited_secs)
+                {
+                    warn!(
+                        "github_api status=retry method={} path={} attempt={} delay_secs={} reason={}",
+                        method.as_str(),
+                        path,
+                        attempt + 1,
+                        delay_secs,
+                        error
+                    );
+                    waited_secs = waited_secs.saturating_add(delay_secs);
+                    sleep(Duration::from_secs(delay_secs)).await;
+                    continue;
+                }
+
+                return Err(json!({
+                    "error": {
+                        "message": "GitHub API request failed before receiving a response.",
+                        "reason": error.to_string(),
+                        "method": method.as_str(),
+                        "path": path
+                    }
+                }));
+            }
+        };
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body_text = response.text().await.map_err(|error| {
+            json!({
+                "error": {
+                    "message": "GitHub API response body could not be read.",
+                    "reason": error.to_string(),
+                    "method": method.as_str(),
+                    "path": path
+                }
+            })
+        })?;
+        let parsed_body = parse_error_body(&body_text);
+
+        if status.is_success() {
+            if body_text.trim().is_empty() {
+                return Ok(json!({ "status": status.as_u16() }));
+            }
+            return Ok(parsed_body);
+        }
+
+        if let Some(delay_secs) =
+            github_status_retry_delay_seconds(status, &headers, attempt, waited_secs)
+        {
+            warn!(
+                "github_api status=retry method={} path={} attempt={} delay_secs={} http_status={}",
+                method.as_str(),
+                path,
+                attempt + 1,
+                delay_secs,
+                status.as_u16()
+            );
+            waited_secs = waited_secs.saturating_add(delay_secs);
+            sleep(Duration::from_secs(delay_secs)).await;
+            continue;
+        }
+
         return Err(json!({
             "error": {
-                "message": "GitHub API request returned a non-success status with an empty body.",
-                "status": status.as_u16(),
-                "method": method.as_str(),
-                "path": path
-            }
-        }));
-    }
-
-    let parsed_body = parse_error_body(&body_text);
-    if status.is_success() {
-        Ok(parsed_body)
-    } else {
-        Err(json!({
-            "error": {
-                "message": format!("GitHub API request failed with HTTP {}.", status.as_u16()),
+                "message": if body_text.trim().is_empty() {
+                    "GitHub API request returned a non-success status with an empty body.".to_string()
+                } else {
+                    format!("GitHub API request failed with HTTP {}.", status.as_u16())
+                },
                 "status": status.as_u16(),
                 "method": method.as_str(),
                 "path": path,
                 "response": parsed_body
             }
-        }))
+        }));
+    }
+
+    Err(json!({
+        "error": {
+            "message": "GitHub API request exhausted retry budget.",
+            "method": method.as_str(),
+            "path": path
+        }
+    }))
+}
+
+fn github_status_retry_delay_seconds(
+    status: StatusCode,
+    headers: &HeaderMap,
+    attempt: usize,
+    waited_secs: u64,
+) -> Option<u64> {
+    if attempt >= GITHUB_API_MAX_RETRIES || !github_status_is_transient(status) {
+        return None;
+    }
+
+    let retry_after = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let delay_secs = retry_after
+        .unwrap_or_else(|| github_default_retry_delay_seconds(attempt))
+        .min(GITHUB_API_MAX_DELAY_SECS);
+
+    if waited_secs.saturating_add(delay_secs)
+        > GITHUB_API_MAX_DELAY_SECS.saturating_mul((GITHUB_API_MAX_RETRIES + 1) as u64)
+    {
+        return None;
+    }
+
+    Some(delay_secs.max(1))
+}
+
+fn github_transport_retry_delay_seconds(attempt: usize, waited_secs: u64) -> Option<u64> {
+    if attempt >= GITHUB_API_MAX_RETRIES {
+        return None;
+    }
+
+    let delay_secs = github_default_retry_delay_seconds(attempt);
+    if waited_secs.saturating_add(delay_secs)
+        > GITHUB_API_MAX_DELAY_SECS.saturating_mul((GITHUB_API_MAX_RETRIES + 1) as u64)
+    {
+        return None;
+    }
+
+    Some(delay_secs)
+}
+
+fn github_default_retry_delay_seconds(attempt: usize) -> u64 {
+    let shift = attempt.min(5) as u32;
+    GITHUB_API_DEFAULT_DELAY_SECS
+        .saturating_mul(1u64 << shift)
+        .min(GITHUB_API_MAX_DELAY_SECS)
+}
+
+fn github_status_is_transient(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn github_error_summary(error: &Value) -> String {
+    let Some(details) = error.get("error") else {
+        return error.to_string();
+    };
+
+    let message = details
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown GitHub API error");
+    let reason = details.get("reason").and_then(Value::as_str);
+    match reason {
+        Some(reason) if !reason.is_empty() => format!("{message}: {reason}"),
+        _ => message.to_string(),
     }
 }
 
@@ -977,12 +1177,14 @@ fn tool_error_payload(error: TrackerError) -> Value {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use axum::{Json, Router, http::StatusCode as HttpStatusCode, routing::get};
     use serde_json::{Value, json};
     use std::{
         env, fs,
         sync::{Arc, Mutex},
     };
     use tempfile::tempdir;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use crate::{
         config::ServiceConfig,
@@ -1053,11 +1255,12 @@ mod tests {
                 "task-workpad" => vec![json!({
                     "id": "comment-workpad",
                     "item_id": "task-workpad",
-                    "content": "## Codex Workpad\n\nExisting",
+                    "content": "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nExisting",
                     "posted_at": "2026-03-11T20:00:00Z"
                 })],
                 _ => Vec::new(),
             };
+            self.record(format!("list_comments:{task_id}"));
             Ok(json!({ "results": results, "next_cursor": null }))
         }
 
@@ -1147,6 +1350,37 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().expect("calls").clone()
         }
+    }
+
+    fn set_env_var(key: &str, value: &str) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
+
+    async fn spawn_github_pr_server(payload: Value) -> (String, JoinHandle<()>) {
+        async fn pull_response(
+            axum::extract::State(payload): axum::extract::State<Value>,
+        ) -> (HttpStatusCode, Json<Value>) {
+            (HttpStatusCode::OK, Json(payload))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/repos/{owner}/{repo}/pulls/{number}", get(pull_response))
+                .with_state(payload);
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), join)
     }
 
     #[async_trait]
@@ -1349,7 +1583,7 @@ mod tests {
             &config,
             &tracker,
             TODOIST_TOOL,
-            json!({"action": "upsert_workpad", "task_id": "task-workpad", "content": "## Codex Workpad\n\nBody"}),
+            json!({"action": "upsert_workpad", "task_id": "task-workpad", "comment_id": "comment-workpad", "content": "## Codex Workpad\n\nBody"}),
         )
         .await;
         assert_eq!(payload_body(&updated)["created"], false);
@@ -1387,10 +1621,39 @@ mod tests {
         assert_eq!(
             tracker.calls(),
             vec![
+                "list_comments:task-workpad".to_string(),
                 "update_comment:comment-workpad".to_string(),
+                "list_comments:task-empty".to_string(),
                 "create_comment:task-empty".to_string(),
+                "list_comments:task-workpad".to_string(),
                 "delete_comment:comment-workpad".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_todoist_workpad_noops_when_normalized_content_is_unchanged() {
+        let config = test_config();
+        let tracker = StubTodoistTracker::default();
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({
+                "action": "upsert_workpad",
+                "task_id": "task-workpad",
+                "content": "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nExisting"
+            }),
+        )
+        .await;
+
+        assert!(result["success"].as_bool().expect("success"));
+        assert_eq!(payload_body(&result)["created"], false);
+        assert_eq!(payload_body(&result)["updated"], false);
+        assert_eq!(
+            tracker.calls(),
+            vec!["list_comments:task-workpad".to_string()]
         );
     }
 
@@ -1444,28 +1707,12 @@ mod tests {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let dir = tempdir().expect("tempdir");
-        let bin_dir = dir.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-        let gh_path = bin_dir.join("gh");
-        fs::write(
-            &gh_path,
-            "#!/bin/sh\nprintf '%s\\n' '{\"url\":\"https://github.com/example/repo/pull/1\",\"state\":\"OPEN\",\"mergedAt\":null,\"isDraft\":false}'\n",
-        )
-        .expect("fake gh");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = fs::metadata(&gh_path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&gh_path, permissions).expect("chmod");
-        }
-
-        let original_path = env::var("PATH").unwrap_or_default();
-        unsafe {
-            env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
-        }
+        let original_github_api_url = env::var("SYMPHONY_GITHUB_API_URL").ok();
+        let original_gh_token = env::var("GH_TOKEN").ok();
+        let (github_api_url, join) =
+            spawn_github_pr_server(json!({"state": "open", "merged_at": null})).await;
+        set_env_var("SYMPHONY_GITHUB_API_URL", &github_api_url);
+        set_env_var("GH_TOKEN", "test-token");
 
         let config = test_config();
         let tracker = CloseGuardTracker::new(
@@ -1481,16 +1728,123 @@ mod tests {
         )
         .await;
 
-        unsafe {
-            env::set_var("PATH", original_path);
+        join.abort();
+        match original_github_api_url {
+            Some(value) => set_env_var("SYMPHONY_GITHUB_API_URL", &value),
+            None => remove_env_var("SYMPHONY_GITHUB_API_URL"),
+        }
+        match original_gh_token {
+            Some(value) => set_env_var("GH_TOKEN", &value),
+            None => remove_env_var("GH_TOKEN"),
         }
 
         assert!(!result["success"].as_bool().expect("success"));
         assert_eq!(
             payload_body(&result)["error"]["message"],
-            "`close_task` requires the linked PR to be merged. Current PR state is `OPEN`."
+            "`close_task` requires the linked PR to be merged. Current PR state is `open`."
         );
         assert!(tracker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_task_accepts_merged_pr_verified_via_runtime_github_api() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let original_github_api_url = env::var("SYMPHONY_GITHUB_API_URL").ok();
+        let original_gh_token = env::var("GH_TOKEN").ok();
+        let (github_api_url, join) =
+            spawn_github_pr_server(json!({"state": "closed", "merged_at": "2026-03-12T14:00:00Z"}))
+                .await;
+        set_env_var("SYMPHONY_GITHUB_API_URL", &github_api_url);
+        set_env_var("GH_TOKEN", "test-token");
+
+        let config = test_config();
+        let tracker = CloseGuardTracker::new(
+            "Merging",
+            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nPR: https://github.com/example/repo/pull/1",
+        );
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "close_task", "task_id": "task-close"}),
+        )
+        .await;
+
+        join.abort();
+        match original_github_api_url {
+            Some(value) => set_env_var("SYMPHONY_GITHUB_API_URL", &value),
+            None => remove_env_var("SYMPHONY_GITHUB_API_URL"),
+        }
+        match original_gh_token {
+            Some(value) => set_env_var("GH_TOKEN", &value),
+            None => remove_env_var("GH_TOKEN"),
+        }
+
+        assert!(result["success"].as_bool().expect("success"));
+        assert_eq!(payload_body(&result)["closed"], true);
+        assert_eq!(tracker.calls(), vec!["close_task:task-close".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn close_task_falls_back_to_gh_when_runtime_github_api_is_unreachable() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let gh_path = bin_dir.join("gh");
+        fs::write(
+            &gh_path,
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n  printf '%s\\n' '{\"url\":\"https://github.com/example/repo/pull/1\",\"state\":\"MERGED\",\"mergedAt\":\"2026-03-12T14:00:00Z\",\"isDraft\":false}'\n  exit 0\nfi\nprintf 'unsupported gh call\\n' >&2\nexit 1\n",
+        )
+        .expect("fake gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&gh_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&gh_path, permissions).expect("chmod");
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        let original_github_api_url = env::var("SYMPHONY_GITHUB_API_URL").ok();
+        let original_gh_token = env::var("GH_TOKEN").ok();
+        set_env_var("PATH", &format!("{}:{}", bin_dir.display(), original_path));
+        set_env_var("SYMPHONY_GITHUB_API_URL", "http://127.0.0.1:1");
+        set_env_var("GH_TOKEN", "test-token");
+
+        let config = test_config();
+        let tracker = CloseGuardTracker::new(
+            "Merging",
+            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\nPR: https://github.com/example/repo/pull/1",
+        );
+
+        let result = execute(
+            &config,
+            &tracker,
+            TODOIST_TOOL,
+            json!({"action": "close_task", "task_id": "task-close"}),
+        )
+        .await;
+
+        set_env_var("PATH", &original_path);
+        match original_github_api_url {
+            Some(value) => set_env_var("SYMPHONY_GITHUB_API_URL", &value),
+            None => remove_env_var("SYMPHONY_GITHUB_API_URL"),
+        }
+        match original_gh_token {
+            Some(value) => set_env_var("GH_TOKEN", &value),
+            None => remove_env_var("GH_TOKEN"),
+        }
+
+        assert!(result["success"].as_bool().expect("success"));
+        assert_eq!(payload_body(&result)["closed"], true);
+        assert_eq!(tracker.calls(), vec!["close_task:task-close".to_string()]);
     }
 
     #[test]

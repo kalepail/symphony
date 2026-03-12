@@ -3,8 +3,13 @@ use std::collections::{BTreeSet, HashMap};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{
+    Client, Method, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+};
 use serde_json::{Map, Value, json};
+use tokio::time::sleep;
+use tracing::warn;
 
 use crate::{
     config::ServiceConfig,
@@ -18,6 +23,16 @@ const MAX_ACTIVITY_PAGE_SIZE: usize = 100;
 const DEFAULT_TOOL_PAGE_SIZE: usize = 50;
 const COMMENT_SIZE_LIMIT: usize = 15_000;
 const REFRESH_CONCURRENCY: usize = 10;
+const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
+const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
+const TODOIST_RATE_LIMIT_MAX_DELAY_SECS: u64 = 60;
+const TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS: u64 = 300;
+const TODOIST_COMMENT_UPDATE_MAX_RETRIES: usize = 2;
+const TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS: u64 = 15;
+const TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS: u64 = 30;
+const TODOIST_PLAN_LIMITS_MAX_RETRIES: usize = 1;
+const TODOIST_PLAN_LIMITS_MAX_DELAY_SECS: u64 = 5;
+const TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS: u64 = 5;
 
 #[derive(Clone)]
 pub struct TodoistTracker {
@@ -35,6 +50,35 @@ struct ProjectAssignmentCapabilities {
     is_shared: bool,
     can_assign_tasks: bool,
 }
+
+#[derive(Clone, Copy)]
+struct TodoistRetryPolicy {
+    max_retries: usize,
+    default_delay_secs: u64,
+    max_delay_secs: u64,
+    max_total_wait_secs: u64,
+}
+
+const DEFAULT_TODOIST_RETRY_POLICY: TodoistRetryPolicy = TodoistRetryPolicy {
+    max_retries: TODOIST_RATE_LIMIT_MAX_RETRIES,
+    default_delay_secs: TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS,
+    max_delay_secs: TODOIST_RATE_LIMIT_MAX_DELAY_SECS,
+    max_total_wait_secs: TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS,
+};
+
+const COMMENT_UPDATE_TODOIST_RETRY_POLICY: TodoistRetryPolicy = TodoistRetryPolicy {
+    max_retries: TODOIST_COMMENT_UPDATE_MAX_RETRIES,
+    default_delay_secs: TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS,
+    max_delay_secs: TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS,
+    max_total_wait_secs: TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS,
+};
+
+const PLAN_LIMITS_TODOIST_RETRY_POLICY: TodoistRetryPolicy = TodoistRetryPolicy {
+    max_retries: TODOIST_PLAN_LIMITS_MAX_RETRIES,
+    default_delay_secs: TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS,
+    max_delay_secs: TODOIST_PLAN_LIMITS_MAX_DELAY_SECS,
+    max_total_wait_secs: TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS,
+};
 
 impl TodoistTracker {
     pub fn new(config: ServiceConfig) -> Self {
@@ -80,64 +124,170 @@ impl TodoistTracker {
     ) -> Result<Value, TrackerError> {
         let token = self.token()?;
         let url = format!("{}{}", self.base_url(), path);
-        let mut request = self
-            .client
-            .request(method, &url)
-            .bearer_auth(token)
-            .header("Accept", "application/json");
+        let request_id = todoist_request_id(&method);
+        let retry_policy = retry_policy_for_request(&method, path);
+        let mut attempts = 0usize;
+        let mut waited_secs = 0u64;
 
-        if let Some(query) = query {
-            request = request.query(query);
+        loop {
+            let mut request = self
+                .client
+                .request(method.clone(), &url)
+                .bearer_auth(&token)
+                .header("Accept", "application/json");
+
+            if let Some(request_id) = request_id.as_deref() {
+                request = request.header("X-Request-Id", request_id);
+            }
+
+            if let Some(query) = query {
+                request = request.query(query);
+            }
+
+            if let Some(body) = body.as_ref() {
+                request = request.json(body);
+            }
+
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = TrackerError::TodoistApiRequest(error.to_string());
+                    if let Some(delay_secs) =
+                        retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
+                    {
+                        warn!(
+                            method = method.as_str(),
+                            path,
+                            attempt = attempts + 1,
+                            max_retries = retry_policy.max_retries,
+                            delay_secs,
+                            total_wait_secs = waited_secs.saturating_add(delay_secs),
+                            reason = todoist_retry_reason(&error),
+                            "todoist request transient failure; retrying"
+                        );
+                        attempts += 1;
+                        waited_secs = waited_secs.saturating_add(delay_secs);
+                        sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
+
+            if status.is_success() {
+                if text.trim().is_empty() {
+                    return Ok(Value::Null);
+                }
+
+                return serde_json::from_str(&text)
+                    .map_err(|_| TrackerError::TodoistUnknownPayload);
+            }
+
+            let error = map_todoist_status(status, retry_after_hint(&headers, &text), &text);
+            if let Some(delay_secs) =
+                retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
+            {
+                warn!(
+                    method = method.as_str(),
+                    path,
+                    attempt = attempts + 1,
+                    max_retries = retry_policy.max_retries,
+                    delay_secs,
+                    total_wait_secs = waited_secs.saturating_add(delay_secs),
+                    reason = todoist_retry_reason(&error),
+                    "todoist request failed transiently; retrying"
+                );
+                attempts += 1;
+                waited_secs = waited_secs.saturating_add(delay_secs);
+                sleep(std::time::Duration::from_secs(delay_secs)).await;
+                continue;
+            }
+
+            return Err(error);
         }
-
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
-
-        if !status.is_success() {
-            return Err(map_todoist_status(status, &text));
-        }
-
-        if text.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-
-        serde_json::from_str(&text).map_err(|_| TrackerError::TodoistUnknownPayload)
     }
 
     async fn sync_json(&self, form: &[(&str, &str)]) -> Result<Value, TrackerError> {
         let token = self.token()?;
         let url = format!("{}/sync", self.base_url());
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .form(form)
-            .send()
-            .await
-            .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
+        let request_id = sync_id("todoist-sync");
+        let retry_policy = retry_policy_for_sync_form(form);
+        let mut attempts = 0usize;
+        let mut waited_secs = 0u64;
 
-        if !status.is_success() {
-            return Err(map_todoist_status(status, &text));
+        loop {
+            let response = match self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .header("Accept", "application/json")
+                .header("X-Request-Id", &request_id)
+                .form(form)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = TrackerError::TodoistApiRequest(error.to_string());
+                    if let Some(delay_secs) =
+                        retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
+                    {
+                        warn!(
+                            path = "/sync",
+                            attempt = attempts + 1,
+                            max_retries = retry_policy.max_retries,
+                            delay_secs,
+                            total_wait_secs = waited_secs.saturating_add(delay_secs),
+                            reason = todoist_retry_reason(&error),
+                            "todoist sync request transient failure; retrying"
+                        );
+                        attempts += 1;
+                        waited_secs = waited_secs.saturating_add(delay_secs);
+                        sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
+
+            if status.is_success() {
+                return serde_json::from_str(&text)
+                    .map_err(|_| TrackerError::TodoistUnknownPayload);
+            }
+
+            let error = map_todoist_status(status, retry_after_hint(&headers, &text), &text);
+            if let Some(delay_secs) =
+                retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
+            {
+                warn!(
+                    path = "/sync",
+                    attempt = attempts + 1,
+                    max_retries = retry_policy.max_retries,
+                    delay_secs,
+                    total_wait_secs = waited_secs.saturating_add(delay_secs),
+                    reason = todoist_retry_reason(&error),
+                    "todoist sync request failed transiently; retrying"
+                );
+                attempts += 1;
+                waited_secs = waited_secs.saturating_add(delay_secs);
+                sleep(std::time::Duration::from_secs(delay_secs)).await;
+                continue;
+            }
+
+            return Err(error);
         }
-
-        serde_json::from_str(&text).map_err(|_| TrackerError::TodoistUnknownPayload)
     }
 
     async fn sync_commands_json(&self, commands: Value) -> Result<Value, TrackerError> {
@@ -515,7 +665,17 @@ impl TodoistTracker {
     }
 
     async fn ensure_comments_available(&self) -> Result<(), TrackerError> {
-        let limits = self.user_plan_limits().await?;
+        let limits = match self.user_plan_limits().await {
+            Ok(limits) => limits,
+            Err(error) if comments_plan_probe_is_soft_failure(&error) => {
+                warn!(
+                    reason = todoist_retry_reason(&error),
+                    "todoist comments capability probe unavailable; deferring to comment endpoint"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let comments_available = limits
             .get("comments")
             .and_then(Value::as_bool)
@@ -1559,12 +1719,123 @@ fn sync_id(prefix: &str) -> String {
     format!("{prefix}-{nanos}")
 }
 
-fn map_todoist_status(status: StatusCode, text: &str) -> TrackerError {
-    let retry_after = serde_json::from_str::<Value>(text).ok().and_then(|body| {
+fn todoist_request_id(method: &Method) -> Option<String> {
+    matches!(*method, Method::POST | Method::DELETE).then(|| sync_id("todoist-request"))
+}
+
+fn retry_policy_for_request(method: &Method, path: &str) -> TodoistRetryPolicy {
+    if *method == Method::POST && is_comment_update_path(path) {
+        COMMENT_UPDATE_TODOIST_RETRY_POLICY
+    } else {
+        DEFAULT_TODOIST_RETRY_POLICY
+    }
+}
+
+fn retry_policy_for_sync_form(form: &[(&str, &str)]) -> TodoistRetryPolicy {
+    if is_user_plan_limits_sync_form(form) {
+        PLAN_LIMITS_TODOIST_RETRY_POLICY
+    } else {
+        DEFAULT_TODOIST_RETRY_POLICY
+    }
+}
+
+fn is_comment_update_path(path: &str) -> bool {
+    path.strip_prefix("/comments/")
+        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('/'))
+}
+
+fn is_user_plan_limits_sync_form(form: &[(&str, &str)]) -> bool {
+    form.iter()
+        .any(|(key, value)| *key == "resource_types" && value.trim() == "[\"user_plan_limits\"]")
+}
+
+fn retry_after_hint(headers: &HeaderMap, text: &str) -> Option<u64> {
+    let header_hint = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let body_hint = serde_json::from_str::<Value>(text).ok().and_then(|body| {
         body.get("error_extra")
             .and_then(|value| value.get("retry_after"))
             .and_then(Value::as_u64)
     });
+
+    match (header_hint, body_hint) {
+        (Some(header), Some(body)) => Some(header.max(body)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn retry_delay_for_attempt(
+    error: &TrackerError,
+    attempts: usize,
+    waited_secs: u64,
+    policy: TodoistRetryPolicy,
+) -> Option<u64> {
+    match error {
+        TrackerError::TodoistRateLimited { retry_after } if attempts < policy.max_retries => {
+            let delay_secs = retry_after
+                .unwrap_or(policy.default_delay_secs)
+                .clamp(1, policy.max_delay_secs);
+            waited_secs
+                .saturating_add(delay_secs)
+                .le(&policy.max_total_wait_secs)
+                .then_some(delay_secs)
+        }
+        TrackerError::TodoistApiStatus { status, .. }
+            if attempts < policy.max_retries && todoist_status_is_transient(*status) =>
+        {
+            transient_retry_delay_seconds(attempts, waited_secs, policy)
+        }
+        TrackerError::TodoistApiRequest(_) if attempts < policy.max_retries => {
+            transient_retry_delay_seconds(attempts, waited_secs, policy)
+        }
+        _ => None,
+    }
+}
+
+fn transient_retry_delay_seconds(
+    attempts: usize,
+    waited_secs: u64,
+    policy: TodoistRetryPolicy,
+) -> Option<u64> {
+    let power = (attempts as u32).min(6);
+    let delay_secs = policy
+        .default_delay_secs
+        .saturating_mul(2u64.saturating_pow(power))
+        .clamp(1, policy.max_delay_secs);
+    waited_secs
+        .saturating_add(delay_secs)
+        .le(&policy.max_total_wait_secs)
+        .then_some(delay_secs)
+}
+
+fn todoist_status_is_transient(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn comments_plan_probe_is_soft_failure(error: &TrackerError) -> bool {
+    match error {
+        TrackerError::TodoistRateLimited { .. } => true,
+        TrackerError::TodoistApiRequest(_) => true,
+        TrackerError::TodoistApiStatus { status, .. } => todoist_status_is_transient(*status),
+        _ => false,
+    }
+}
+
+fn todoist_retry_reason(error: &TrackerError) -> &'static str {
+    match error {
+        TrackerError::TodoistRateLimited { .. } => "rate_limited",
+        TrackerError::TodoistApiStatus { status, .. } if todoist_status_is_transient(*status) => {
+            "server_error"
+        }
+        TrackerError::TodoistApiRequest(_) => "transport_error",
+        _ => "non_retryable",
+    }
+}
+
+fn map_todoist_status(status: StatusCode, retry_after: Option<u64>, text: &str) -> TrackerError {
     if status == StatusCode::TOO_MANY_REQUESTS {
         TrackerError::TodoistRateLimited { retry_after }
     } else {
@@ -1577,23 +1848,40 @@ fn map_todoist_status(status: StatusCode, text: &str) -> TrackerError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::{
         Json, Router,
         extract::{Path, Query, State},
+        http::{HeaderMap, StatusCode as HttpStatusCode},
+        response::IntoResponse,
         routing::{get, post},
     };
+    use reqwest::Method;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::{
-        TodoistTracker, comment_target_body, create_reminder_body, csv_query_value,
-        enforce_runtime_label_scope, extend_repeated_query_values, move_task_body, normalize_task,
+        DEFAULT_TODOIST_RETRY_POLICY, RETRY_AFTER, TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS,
+        TODOIST_COMMENT_UPDATE_MAX_RETRIES, TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS,
+        TODOIST_PLAN_LIMITS_MAX_DELAY_SECS, TODOIST_PLAN_LIMITS_MAX_RETRIES,
+        TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS, TodoistTracker, comment_target_body,
+        create_reminder_body, csv_query_value, enforce_runtime_label_scope,
+        extend_repeated_query_values, move_task_body, normalize_task, retry_after_hint,
+        retry_delay_for_attempt, retry_policy_for_request, retry_policy_for_sync_form,
         sanitize_comment_arguments, sanitize_write_arguments, task_list_request,
         update_reminder_body,
     };
-    use crate::{config::ServiceConfig, tracker::TrackerClient};
+    use crate::{
+        config::ServiceConfig,
+        tracker::{TrackerClient, TrackerError},
+    };
 
     #[derive(Clone)]
     struct MockTodoistState {
@@ -2082,5 +2370,322 @@ mod tests {
         let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
 
         tracker.validate_startup().await.expect("startup valid");
+    }
+
+    #[tokio::test]
+    async fn list_projects_retries_rate_limited_reads() {
+        async fn list_projects(State(attempts): State<Arc<AtomicUsize>>) -> impl IntoResponse {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                (
+                    HttpStatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error_extra": {"retry_after": 0}})),
+                )
+                    .into_response()
+            } else {
+                (
+                    HttpStatusCode::OK,
+                    Json(json!({"results": [{"id": "proj"}], "next_cursor": null})),
+                )
+                    .into_response()
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/projects", get(list_projects))
+                .with_state(attempts.clone());
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        let projects = tracker
+            .list_projects(json!({}))
+            .await
+            .expect("projects after retry");
+        join.abort();
+
+        assert_eq!(projects["results"][0]["id"], "proj");
+    }
+
+    #[tokio::test]
+    async fn startup_validation_tolerates_rate_limited_comment_plan_probe() {
+        async fn get_project() -> impl IntoResponse {
+            Json(json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }))
+        }
+
+        async fn list_sections() -> impl IntoResponse {
+            Json(json!({
+                "results": [
+                    {"id": "sec-todo", "project_id": "proj", "name": "Todo"},
+                    {"id": "sec-progress", "project_id": "proj", "name": "In Progress"}
+                ],
+                "next_cursor": null
+            }))
+        }
+
+        async fn sync() -> impl IntoResponse {
+            (
+                HttpStatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error_extra": {"retry_after": 0}})),
+            )
+                .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/projects/{project_id}", get(get_project))
+                .route("/sections", get(list_sections))
+                .route("/sync", post(sync));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        tracker
+            .validate_startup()
+            .await
+            .expect("startup should tolerate rate-limited comment plan probe");
+        join.abort();
+    }
+
+    #[tokio::test]
+    async fn list_comments_tolerates_rate_limited_comment_plan_probe() {
+        async fn sync() -> impl IntoResponse {
+            (
+                HttpStatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error_extra": {"retry_after": 0}})),
+            )
+                .into_response()
+        }
+
+        async fn list_comments() -> impl IntoResponse {
+            Json(json!({
+                "results": [
+                    {
+                        "id": "comment-1",
+                        "item_id": "task-1",
+                        "content": "## Codex Workpad\n\n<!-- symphony:workpad -->"
+                    }
+                ],
+                "next_cursor": null
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/sync", post(sync))
+                .route("/comments", get(list_comments));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        let comments = tracker
+            .list_comments(json!({"task_id": "task-1"}))
+            .await
+            .expect("comments after soft plan-probe failure");
+        join.abort();
+
+        assert_eq!(comments["results"][0]["id"], "comment-1");
+    }
+
+    #[tokio::test]
+    async fn create_task_retries_rate_limited_writes_with_stable_request_id() {
+        async fn create_task(
+            State(state): State<(Arc<AtomicUsize>, Arc<Mutex<Vec<Option<String>>>>)>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            let (attempts, request_ids) = state;
+            request_ids.lock().expect("request ids").push(
+                headers
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+            );
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                (
+                    HttpStatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error_extra": {"retry_after": 0}})),
+                )
+                    .into_response()
+            } else {
+                (HttpStatusCode::OK, Json(json!({"id": "task-1"}))).into_response()
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let request_ids = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let state = (attempts.clone(), request_ids.clone());
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/tasks", post(create_task))
+                .with_state(state);
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        let task = tracker
+            .create_task(json!({
+                "content": "Ship retry handling",
+                "project_id": "proj",
+                "section_id": "sec-todo"
+            }))
+            .await
+            .expect("task after retry");
+        join.abort();
+
+        let request_ids = request_ids.lock().expect("request ids");
+        assert_eq!(task["id"], "task-1");
+        assert_eq!(request_ids.len(), 2);
+        assert!(
+            request_ids[0]
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(request_ids[0], request_ids[1]);
+    }
+
+    #[test]
+    fn retry_after_hint_uses_longer_body_hint_when_header_is_shorter() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "35".parse().expect("retry-after header"));
+
+        assert_eq!(
+            retry_after_hint(&headers, r#"{"error_extra":{"retry_after":129}}"#),
+            Some(129)
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_attempt_retries_transient_server_errors() {
+        let error = TrackerError::TodoistApiStatus {
+            status: 502,
+            body: String::new(),
+        };
+
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(2)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 1, 2, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_attempt_retries_transport_errors() {
+        let error = TrackerError::TodoistApiRequest("connection reset".to_string());
+
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_attempt_honors_total_wait_budget() {
+        let error = TrackerError::TodoistRateLimited {
+            retry_after: Some(200),
+        };
+
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(60)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 1, 60, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(60)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 3, 240, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(60)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 4, 240, DEFAULT_TODOIST_RETRY_POLICY),
+            None
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 3, 241, DEFAULT_TODOIST_RETRY_POLICY),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_delay_for_attempt_caps_large_retry_after_values() {
+        let error = TrackerError::TodoistRateLimited {
+            retry_after: Some(1_027),
+        };
+
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn comment_update_retry_policy_fails_fast_on_long_rate_limits() {
+        let error = TrackerError::TodoistRateLimited {
+            retry_after: Some(1_027),
+        };
+        let policy = retry_policy_for_request(&Method::POST, "/comments/comment-1");
+
+        assert_eq!(policy.max_retries, TODOIST_COMMENT_UPDATE_MAX_RETRIES);
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, policy),
+            Some(TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(&error, 1, TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS, policy),
+            Some(TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(
+                &error,
+                TODOIST_COMMENT_UPDATE_MAX_RETRIES,
+                TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS,
+                policy
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn user_plan_limits_probe_retry_policy_fails_fast_on_long_rate_limits() {
+        let error = TrackerError::TodoistRateLimited {
+            retry_after: Some(1_027),
+        };
+        let policy = retry_policy_for_sync_form(&[
+            ("sync_token", "*"),
+            ("resource_types", "[\"user_plan_limits\"]"),
+        ]);
+
+        assert_eq!(policy.max_retries, TODOIST_PLAN_LIMITS_MAX_RETRIES);
+        assert_eq!(
+            retry_delay_for_attempt(&error, 0, 0, policy),
+            Some(TODOIST_PLAN_LIMITS_MAX_DELAY_SECS)
+        );
+        assert_eq!(
+            retry_delay_for_attempt(
+                &error,
+                TODOIST_PLAN_LIMITS_MAX_RETRIES,
+                TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS,
+                policy
+            ),
+            None
+        );
     }
 }

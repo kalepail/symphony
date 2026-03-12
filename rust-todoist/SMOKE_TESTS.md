@@ -36,7 +36,8 @@ For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), th
 
 Smoke parity runs and production workflows should use the canonical names above directly.
 `Human Review` is a human handoff column, not an active dispatch state. Symphony resumes only after a human moves the task to `Rework` or `Merging`.
-For workpad validation, treat task-scoped comments and their `item_id` field as the canonical Todoist comment surface for a task. Full workflow runs should leave exactly one surviving task-scoped workpad comment marked by both `## Codex Workpad` and `<!-- symphony:workpad -->`.
+For automated smoke and live E2E runs, the Rust repo-owned harness simulates that human approval externally after verifying the PR is green and review-ready, then moves the task to `Merging`. Production runs still require a real human to perform that transition.
+For workpad validation, treat task-scoped comments and their `item_id` field as the canonical Todoist comment surface for a task. Full workflow runs should reach `Human Review` with exactly one persistent task-scoped workpad comment marked by both `## Codex Workpad` and `<!-- symphony:workpad -->`.
 
 ## Operator Preflight
 
@@ -53,6 +54,8 @@ This verifies both the `gh` path and the direct GitHub REST fallback against the
 - Minimal live smoke: [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md)
 - Full live smoke: [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md)
 - Repo-owned live E2E harness: [tests/live_e2e.rs](./tests/live_e2e.rs)
+  - Includes the lightweight disposable Todoist handoff smoke plus the full parity smoke that exercises PR creation, automated `Human Review` approval, `Merging`, verified merge, and guarded `todoist.close_task`.
+- Shared-state cleanup helper: [../scripts/reset_smoke_state.py](../scripts/reset_smoke_state.py)
 
 ## Observability Evidence
 
@@ -93,7 +96,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 4. `smoke-merge`
    - Start from a reviewed and approved `smoke-pr`
    - Move the issue to `Merging`
-   - Expected outcome: the `land` flow merges the PR, moves the issue to `Done`, and cleans up the workspace
+   - Expected outcome: the `land` flow merges the PR, guarded `todoist.close_task` completes the task, and the workspace is cleaned up
 
 5. `parity-smoke`
    - Run the same seeded scenario once with Rust and once with Elixir
@@ -103,7 +106,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
    - PR creation and metadata
    - review feedback handling
    - merge outcome
-   - cleanup behavior
+   - cleanup behavior, including workspace removal and disposable smoke-branch pruning
 
 ## Suggested Issue Template For `smoke-pr`
 
@@ -131,6 +134,8 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 ## Operational Notes
 
 - Keep this repo disposable. Branch churn, PR churn, and squash merges are expected.
+- Reset the shared smoke environment before a fresh smoke round with `python3 ../scripts/reset_smoke_state.py`.
+  - This restores the smoke repo baseline, deletes disposable smoke branches, removes shared smoke tasks, and deletes disposable Rust Todoist live-E2E projects left behind by aborted runs while skipping any project IDs currently registered as active smoke runs.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
 - Capture `/api/v1/state` and at least one `/api/v1/stream` event payload during full observability parity runs so API, web, and terminal evidence line up.

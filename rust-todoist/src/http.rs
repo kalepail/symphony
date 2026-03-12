@@ -150,10 +150,15 @@ async fn api_issue(
     AxumPath(identifier): AxumPath<String>,
 ) -> impl IntoResponse {
     match state.orchestrator.issue_detail(identifier).await {
-        Some(detail) => Json(Presenter::present_issue_detail(detail)).into_response(),
-        None => (
+        Ok(Some(detail)) => Json(Presenter::present_issue_detail(detail)).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": { "code": "issue_not_found", "message": "issue not found" } })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": { "code": "issue_unavailable", "message": "issue detail unavailable" } })),
         )
             .into_response(),
     }
@@ -161,8 +166,8 @@ async fn api_issue(
 
 async fn api_refresh(State(state): State<AppState>) -> impl IntoResponse {
     match state.orchestrator.refresh().await {
-        Some(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
-        None => (
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": { "code": "refresh_unavailable", "message": "refresh unavailable" } })),
         )
@@ -187,7 +192,7 @@ async fn api_not_found() -> impl IntoResponse {
 }
 
 async fn present_state(state: &AppState) -> Option<StatePayload> {
-    let snapshot = state.orchestrator.snapshot().await?;
+    let snapshot = state.orchestrator.snapshot().await.ok()?;
     let mut presenter = state
         .presenter
         .lock()

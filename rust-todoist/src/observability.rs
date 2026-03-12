@@ -1,13 +1,13 @@
 use std::{
     collections::VecDeque,
     io::{self, IsTerminal, Write},
+    iter::Peekable,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -795,11 +795,11 @@ impl TerminalDashboard {
                             continue;
                         }
                         let next = match orchestrator.snapshot().await {
-                            Some(snapshot) => {
+                            Ok(snapshot) => {
                                 let payload = presenter.present_state(snapshot, &workflow_store, dashboard_addr);
                                 render_terminal_dashboard(&payload, None)
                             }
-                            None => render_snapshot_unavailable_status(),
+                            Err(_) => render_snapshot_unavailable_status(),
                         };
                         dirty = false;
                         if last_rendered_content.as_deref() != Some(next.as_str())
@@ -911,10 +911,12 @@ fn format_running_row(entry: &RunningEntryPayload, running_event_width: usize) -
         RUNNING_RUNTIME_WIDTH,
     );
     let event = format_cell(
-        entry
-            .last_message
-            .as_deref()
-            .unwrap_or("No Codex message yet."),
+        &sanitize_display_text(
+            entry
+                .last_message
+                .as_deref()
+                .unwrap_or("No Codex message yet."),
+        ),
         running_event_width,
     );
     let tokens = format_cell(&format_int(entry.tokens.total_tokens), RUNNING_TOKENS_WIDTH);
@@ -1682,21 +1684,88 @@ fn humanize_event_name(event: &str) -> String {
 }
 
 fn inline_text(value: &str) -> String {
+    let collapsed = sanitize_display_text(value);
+    truncate_chars(&collapsed, 80)
+}
+
+fn sanitize_display_text(value: &str) -> String {
     let stripped = strip_ansi_sequences(value);
     let cleaned: String = stripped
         .chars()
         .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t' || *ch == '\r')
         .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&collapsed, 80)
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn strip_ansi_sequences(value: &str) -> String {
-    static ANSI_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    ANSI_REGEX
-        .get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ansi regex"))
-        .replace_all(value, "")
-        .into_owned()
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    consume_csi_sequence(&mut chars);
+                }
+                Some(']') => {
+                    chars.next();
+                    consume_osc_sequence(&mut chars);
+                }
+                Some('P' | '^' | '_') => {
+                    chars.next();
+                    consume_st_terminated_sequence(&mut chars);
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\u{9b}' => consume_csi_sequence(&mut chars),
+            _ => output.push(ch),
+        }
+    }
+
+    output
+}
+
+fn consume_csi_sequence<I>(chars: &mut Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(next) = chars.next() {
+        if ('@'..='~').contains(&next) {
+            break;
+        }
+    }
+}
+
+fn consume_osc_sequence<I>(chars: &mut Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(next) = chars.next() {
+        match next {
+            '\u{7}' => break,
+            '\u{1b}' if matches!(chars.peek().copied(), Some('\\')) => {
+                chars.next();
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn consume_st_terminated_sequence<I>(chars: &mut Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(next) = chars.next() {
+        if next == '\u{1b}' && matches!(chars.peek().copied(), Some('\\')) {
+            chars.next();
+            break;
+        }
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -2490,10 +2559,31 @@ mod tests {
 
     #[test]
     fn summarize_codex_message_strips_ansi_and_control_bytes() {
-        let payload = "cmd: \u{1b}[31mRED\u{1b}[0m\u{0} after\nline";
+        let payload = concat!(
+            "cmd: \u{1b}[31mRED\u{1b}[0m ",
+            "\u{1b}]8;;https://example.com\u{1b}\\Open PR\u{1b}]8;;\u{1b}\\",
+            "\u{0} after\nline"
+        );
         assert_eq!(
             summarize_codex_message(Some("notification"), Some(payload)).as_deref(),
-            Some("cmd: RED after line")
+            Some("cmd: RED Open PR after line")
+        );
+    }
+
+    #[test]
+    fn strip_ansi_sequences_removes_csi_osc_and_single_char_escapes() {
+        let payload = concat!(
+            "before ",
+            "\u{1b}[31mRED\u{1b}[0m ",
+            "\u{1b}]0;Symphony Dashboard\u{7}",
+            "\u{1b}]8;;https://example.com\u{1b}\\Open PR\u{1b}]8;;\u{1b}\\ ",
+            "\u{1b}7",
+            "after"
+        );
+
+        assert_eq!(
+            super::strip_ansi_sequences(payload),
+            "before RED Open PR after"
         );
     }
 
@@ -2783,6 +2873,26 @@ mod tests {
 
         assert_eq!(plain.chars().count(), expected_width);
         assert!(plain.contains("tool requires user input"));
+    }
+
+    #[test]
+    fn running_row_sanitizes_escape_sequences_in_last_message() {
+        let mut entry = sample_payload().running.into_iter().next().expect("entry");
+        entry.last_message = Some(
+            concat!(
+                "cmd: \u{1b}[31mRED\u{1b}[0m ",
+                "\u{1b}]8;;https://example.com\u{1b}\\Open PR\u{1b}]8;;\u{1b}\\",
+                "\u{0} after\nline"
+            )
+            .to_string(),
+        );
+
+        let row = super::format_running_row(&entry, 52);
+        let plain = super::strip_ansi_sequences(&row);
+
+        assert!(plain.contains("cmd: RED Open PR after line"));
+        assert!(!plain.contains('\u{1b}'));
+        assert!(!plain.contains('\u{0}'));
     }
 
     #[test]

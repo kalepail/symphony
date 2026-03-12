@@ -24,6 +24,7 @@ use crate::{
 
 const NON_INTERACTIVE_ANSWER: &str =
     "This is a non-interactive session. Operator input is unavailable.";
+const APP_SERVER_STOP_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct CodexEvent {
@@ -248,9 +249,16 @@ impl AppServerSession {
             if remaining.is_zero() {
                 return Err(CodexError::TurnTimeout);
             }
-            let line = timeout(remaining, self.stdout_rx.recv())
-                .await
-                .map_err(|_| CodexError::TurnTimeout)?;
+            let line = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(CodexError::TurnCancelled(
+                        "cancelled by orchestrator".to_string(),
+                    ));
+                }
+                line = timeout(remaining, self.stdout_rx.recv()) => {
+                    line.map_err(|_| CodexError::TurnTimeout)?
+                }
+            };
             match line {
                 Some(RawLine::Stdout(raw)) => match serde_json::from_str::<Value>(&raw) {
                     Ok(message) => {
@@ -308,8 +316,21 @@ impl AppServerSession {
     }
 
     pub async fn stop(&mut self) {
+        let pid = self.child.id().or(self.codex_app_server_pid);
         let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        match timeout(
+            Duration::from_secs(APP_SERVER_STOP_TIMEOUT_SECS),
+            self.child.wait(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => {
+                warn!("app_server_shutdown=status=timeout pid={pid:?}");
+                let _ = self.child.kill().await;
+                let _ = timeout(Duration::from_secs(1), self.child.wait()).await;
+            }
+        }
     }
 
     async fn initialize(&mut self) -> Result<(), CodexError> {
@@ -1372,6 +1393,70 @@ done
 
         session.stop().await;
         assert!(matches!(result, Err(CodexError::ApprovalRequired(_))));
+    }
+
+    #[tokio::test]
+    async fn run_turn_honors_cancellation_while_waiting_for_stream_output() {
+        let dir = tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script = dir.path().join("fake-codex.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  case "$count" in
+    1)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    2)
+      ;;
+    3)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-cancel"}}}'
+      ;;
+    4)
+      printf '%s\n' '{"id":10,"result":{"turn":{"id":"turn-cancel"}}}'
+      sleep 30
+      ;;
+    *)
+      sleep 30
+      ;;
+  esac
+done
+"#,
+        );
+
+        let config = sample_config(&workspace, &script, Some(json!("never")));
+        let app = AppServerClient::new(
+            config,
+            Arc::new(StubTracker {
+                tool_result: Ok(json!({ "data": {} })),
+            }),
+        );
+        let mut session = app.start_session(&workspace).await.expect("session");
+        let cancellation = CancellationToken::new();
+        let cancel_clone = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.run_turn(
+                "Wait for cancellation",
+                &sample_issue(),
+                &cancellation,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("run_turn should cancel promptly");
+
+        session.stop().await;
+        assert!(matches!(result, Err(CodexError::TurnCancelled(_))));
     }
 
     #[tokio::test]

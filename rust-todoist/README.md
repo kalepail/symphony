@@ -67,7 +67,8 @@ Environment files:
 - `rust-todoist/` now loads `.env` and `.env.local` from the workflow directory before parsing `WORKFLOW.md`.
 - Existing shell environment variables still win over file-loaded values.
 - `.env.local` overrides `.env` for keys that are not already exported in the shell.
-- The ignored live E2E harness reads `SYMPHONY_RUN_LIVE_E2E`, `TODOIST_API_TOKEN`, and `SYMPHONY_SMOKE_PROJECT_ID` from the same files, so you do not need separate shell exports.
+- The ignored live E2E harness reads `SYMPHONY_RUN_LIVE_E2E` and `TODOIST_API_TOKEN` from the same files. It now includes a lightweight disposable-project handoff smoke plus a full parity smoke that runs the checked-in `WORKFLOW.smoke.full.md` template against the dedicated smoke repo, simulates the `Human Review` approval externally for automated runs, and only completes after a real PR merge, guarded `close_task`, and workspace cleanup.
+- `SYMPHONY_SMOKE_PROJECT_ID` is still required for the shared smoke matrix workflows in [`SMOKE_TESTS.md`](./SMOKE_TESTS.md).
 - Copy [`.env.example`](./.env.example) to `.env` for local setup.
 
 ## Configuration
@@ -199,4 +200,5 @@ Tracked live-smoke workflow files now live alongside the main workflow:
 - [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
 - [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
 - [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`.
-- [tests/live_e2e.rs](./tests/live_e2e.rs) is the env-gated real Todoist/Codex integration test modeled after Elixir’s live E2E harness.
+- [tests/live_e2e.rs](./tests/live_e2e.rs) is the env-gated real Todoist/Codex integration harness modeled after Elixir’s live E2E tests. It now provides both the lightweight disposable-project handoff smoke and a full clean-slate parity smoke that seeds a disposable Todoist project, drives the checked-in full smoke workflow to `Human Review`, moves the task to `Merging`, verifies the PR merge, and confirms guarded `todoist.close_task` completion.
+- [`../scripts/reset_smoke_state.py`](../scripts/reset_smoke_state.py) resets the shared smoke surfaces by restoring the smoke repo baseline files, deleting disposable smoke branches, deleting open Todoist smoke tasks from `SYMPHONY_SMOKE_PROJECT_ID`, deleting disposable Rust Todoist live-E2E projects, removing the legacy shared active-project registry if present, and deleting disposable Linear live-E2E projects.

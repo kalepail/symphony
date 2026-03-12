@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
+    process::Command as StdCommand,
     time::{Duration, Instant},
 };
 
@@ -10,7 +11,7 @@ use serde_json::Value;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -25,6 +26,11 @@ use crate::{
     workspace::{Workspace, sanitize_identifier, workspace_path_for_identifier},
 };
 
+const RUNNING_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+const ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS: u64 = 15;
+const STARTUP_WORKSPACE_CLEANUP_TIMEOUT_SECS: u64 = 15;
+const HANDLE_COMMAND_TIMEOUT_SECS: u64 = 5;
+
 #[derive(Clone)]
 pub struct OrchestratorHandle {
     tx: mpsc::Sender<Command>,
@@ -35,6 +41,12 @@ pub struct Orchestrator {
     tx: mpsc::Sender<Command>,
     updates: watch::Receiver<u64>,
     join: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrchestratorHandleError {
+    TimedOut,
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -91,6 +103,11 @@ struct CodexTotals {
     output_tokens: u64,
     total_tokens: u64,
     ended_seconds: f64,
+}
+
+enum WorkerDisposition {
+    Continue { issue: Issue },
+    Quiesced { issue: Option<Issue> },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -223,7 +240,7 @@ enum Command {
     },
     WorkerExit {
         issue_id: String,
-        result: Result<(), String>,
+        result: Result<WorkerDisposition, String>,
     },
     RetryIssue {
         issue_id: String,
@@ -275,7 +292,11 @@ impl Orchestrator {
             };
             let mut update_version = 0u64;
 
-            startup_terminal_cleanup(&workflow_store, tracker.as_ref()).await;
+            tokio::spawn(run_startup_terminal_cleanup(
+                workflow_store.clone(),
+                tracker.clone(),
+                Duration::from_secs(STARTUP_WORKSPACE_CLEANUP_TIMEOUT_SECS),
+            ));
             schedule_tick(&join_tx, 0);
 
             while let Some(command) = rx.recv().await {
@@ -349,8 +370,43 @@ impl Orchestrator {
     }
 
     pub async fn shutdown(self) {
-        let _ = self.tx.send(Command::Shutdown).await;
-        let _ = self.join.await;
+        let tx = self.tx;
+        let mut join = self.join;
+
+        match timeout(
+            Duration::from_secs(ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS),
+            tx.send(Command::Shutdown),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                debug!("orchestrator_shutdown=status=channel_closed error={error}");
+            }
+            Err(_) => {
+                warn!(
+                    "orchestrator_shutdown=status=send_timeout timeout_secs={}",
+                    ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS
+                );
+            }
+        }
+
+        match timeout(
+            Duration::from_secs(ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS),
+            &mut join,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => {
+                warn!(
+                    "orchestrator_shutdown=status=join_timeout timeout_secs={}",
+                    ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS
+                );
+                join.abort();
+                let _ = join.await;
+            }
+        }
     }
 }
 
@@ -359,34 +415,55 @@ impl OrchestratorHandle {
         self.updates.clone()
     }
 
-    pub async fn snapshot(&self) -> Option<Snapshot> {
+    pub async fn snapshot(&self) -> Result<Snapshot, OrchestratorHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Snapshot { reply: reply_tx })
+        timeout(
+            Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS),
+            self.tx.send(Command::Snapshot { reply: reply_tx }),
+        )
+        .await
+        .map_err(|_| OrchestratorHandleError::TimedOut)?
+        .map_err(|_| OrchestratorHandleError::Unavailable)?;
+        timeout(Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS), reply_rx)
             .await
-            .ok()?;
-        reply_rx.await.ok()
+            .map_err(|_| OrchestratorHandleError::TimedOut)?
+            .map_err(|_| OrchestratorHandleError::Unavailable)
     }
 
-    pub async fn issue_detail(&self, identifier: String) -> Option<IssueDetail> {
+    pub async fn issue_detail(
+        &self,
+        identifier: String,
+    ) -> Result<Option<IssueDetail>, OrchestratorHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::IssueDetail {
+        timeout(
+            Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS),
+            self.tx.send(Command::IssueDetail {
                 identifier,
                 reply: reply_tx,
-            })
+            }),
+        )
+        .await
+        .map_err(|_| OrchestratorHandleError::TimedOut)?
+        .map_err(|_| OrchestratorHandleError::Unavailable)?;
+        timeout(Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS), reply_rx)
             .await
-            .ok()?;
-        reply_rx.await.ok().flatten()
+            .map_err(|_| OrchestratorHandleError::TimedOut)?
+            .map_err(|_| OrchestratorHandleError::Unavailable)
     }
 
-    pub async fn refresh(&self) -> Option<RefreshResponse> {
+    pub async fn refresh(&self) -> Result<RefreshResponse, OrchestratorHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Refresh { reply: reply_tx })
+        timeout(
+            Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS),
+            self.tx.send(Command::Refresh { reply: reply_tx }),
+        )
+        .await
+        .map_err(|_| OrchestratorHandleError::TimedOut)?
+        .map_err(|_| OrchestratorHandleError::Unavailable)?;
+        timeout(Duration::from_secs(HANDLE_COMMAND_TIMEOUT_SECS), reply_rx)
             .await
-            .ok()?;
-        reply_rx.await.ok()
+            .map_err(|_| OrchestratorHandleError::TimedOut)?
+            .map_err(|_| OrchestratorHandleError::Unavailable)
     }
 }
 
@@ -563,6 +640,38 @@ async fn startup_terminal_cleanup(workflow_store: &WorkflowStore, tracker: &dyn 
     }
 }
 
+async fn run_startup_terminal_cleanup(
+    workflow_store: WorkflowStore,
+    tracker: std::sync::Arc<dyn TrackerClient>,
+    timeout_duration: Duration,
+) {
+    info!(
+        "workspace_cleanup=startup status=started root={}",
+        workflow_store.effective().config.workspace.root.display()
+    );
+
+    match timeout(
+        timeout_duration,
+        startup_terminal_cleanup(&workflow_store, tracker.as_ref()),
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                "workspace_cleanup=startup status=completed root={}",
+                workflow_store.effective().config.workspace.root.display()
+            );
+        }
+        Err(_) => {
+            warn!(
+                "workspace_cleanup=startup status=timeout timeout_secs={} root={}",
+                timeout_duration.as_secs(),
+                workflow_store.effective().config.workspace.root.display()
+            );
+        }
+    }
+}
+
 async fn reconcile_running_issues(
     workflow_store: &WorkflowStore,
     tx: &mpsc::Sender<Command>,
@@ -607,6 +716,7 @@ async fn reconcile_running_issues(
                     .unwrap_or_else(|| missing_id.clone());
                 if let Some((_, previous_issue, permitted)) = maybe_running
                     && !permitted
+                    && !guarded_close_transition_may_be_in_flight(&previous_issue)
                 {
                     warn!(
                         "reconcile=status=missing_unexpected issue_id={} issue_identifier={} reason=not_returned_by_tracker previous_state={}",
@@ -641,10 +751,10 @@ async fn reconcile_running_issues(
 
             for issue in issues {
                 if terminal_states.contains(&issue.state_key()) {
-                    let unexpected_terminal = state
-                        .running
-                        .get(&issue.id)
-                        .is_some_and(|running| !running.terminal_transition_permitted);
+                    let unexpected_terminal = state.running.get(&issue.id).is_some_and(|running| {
+                        !running.terminal_transition_permitted
+                            && !guarded_close_transition_may_be_in_flight(&running.issue)
+                    });
                     if unexpected_terminal {
                         let previous_issue = state
                             .running
@@ -782,9 +892,8 @@ async fn terminate_running_issue(
         let config = workflow_store.effective().config.clone();
         let workspace_path = running.workspace_path.clone();
         let identifier = running.identifier.clone();
-        running.cancel.cancel();
         tokio::spawn(async move {
-            let _ = running.join.await;
+            stop_running_entry(running).await;
             if cleanup_workspace {
                 let _ = Workspace::remove_path(&config, &workspace_path, &identifier).await;
             }
@@ -871,6 +980,9 @@ async fn dispatch_issue(
     issue: Issue,
     attempt: Option<u32>,
 ) {
+    let clear_claim = |state: &mut State| {
+        state.claimed.remove(&issue.id);
+    };
     let effective = workflow_store.effective();
     let tracker = match build_tracker_client(effective.config.clone()) {
         Ok(tracker) => tracker,
@@ -879,6 +991,7 @@ async fn dispatch_issue(
                 "dispatch=status=skipped issue_id={} issue_identifier={} reason={error}",
                 issue.id, issue.identifier
             );
+            clear_claim(state);
             return;
         }
     };
@@ -893,6 +1006,7 @@ async fn dispatch_issue(
                     "dispatch=status=skipped issue_id={} issue_identifier={} reason=missing_after_revalidate",
                     issue.id, issue.identifier
                 );
+                clear_claim(state);
                 return;
             };
             let active_states = effective.config.active_state_set();
@@ -902,6 +1016,7 @@ async fn dispatch_issue(
                     "dispatch=status=skipped issue_id={} issue_identifier={} state={} reason=stale_candidate",
                     issue.id, issue.identifier, issue.state
                 );
+                clear_claim(state);
                 return;
             }
 
@@ -971,6 +1086,7 @@ async fn dispatch_issue(
                 "dispatch=status=skipped issue_id={} issue_identifier={} reason={error}",
                 issue.id, issue.identifier
             );
+            clear_claim(state);
         }
     }
 }
@@ -979,7 +1095,7 @@ fn handle_worker_exit(
     state: &mut State,
     tx: &mpsc::Sender<Command>,
     issue_id: &str,
-    result: Result<(), String>,
+    result: Result<WorkerDisposition, String>,
 ) {
     let Some(running) = state.running.remove(issue_id) else {
         return;
@@ -990,7 +1106,7 @@ fn handle_worker_exit(
         .clone()
         .unwrap_or_else(|| "n/a".to_string());
     match result {
-        Ok(()) => {
+        Ok(WorkerDisposition::Continue { issue }) => {
             state.completed.insert(issue_id.to_string());
             schedule_retry(
                 tx,
@@ -998,13 +1114,27 @@ fn handle_worker_exit(
                 issue_id.to_string(),
                 1,
                 running.identifier.clone(),
-                Some(running.issue.clone()),
+                Some(issue.clone()),
                 None,
                 true,
             );
             info!(
-                "worker=status=completed issue_id={} issue_identifier={} session_id={}",
-                issue_id, running.identifier, session_id
+                "worker=status=completed issue_id={} issue_identifier={} session_id={} continuation=queued next_state={}",
+                issue_id, running.identifier, session_id, issue.state
+            );
+        }
+        Ok(WorkerDisposition::Quiesced { issue }) => {
+            state.claimed.remove(issue_id);
+            state.retry_attempts.remove(issue_id);
+            info!(
+                "worker=status=quiesced issue_id={} issue_identifier={} session_id={} final_state={}",
+                issue_id,
+                running.identifier,
+                session_id,
+                issue
+                    .as_ref()
+                    .map(|issue| issue.state.as_str())
+                    .unwrap_or("missing")
             );
         }
         Err(error) => {
@@ -1126,6 +1256,18 @@ async fn cleanup_issue_workspace(config: &ServiceConfig, issue: &Issue) {
             issue.id, issue.identifier
         );
     }
+}
+
+fn should_cleanup_terminal_workspace_after_guarded_close(
+    guarded_close_observed: bool,
+    issue: Option<&Issue>,
+    terminal_states: &std::collections::BTreeSet<String>,
+) -> bool {
+    guarded_close_observed && issue.is_none_or(|issue| terminal_states.contains(&issue.state_key()))
+}
+
+fn guarded_close_transition_may_be_in_flight(issue: &Issue) -> bool {
+    issue.state_key() == "merging"
 }
 
 fn schedule_retry(
@@ -1479,10 +1621,46 @@ fn build_issue_detail(
 
 async fn shutdown_running(entries: Vec<RunningEntry>) {
     for running in entries {
-        running.cancel.cancel();
-        let _ = running.join.await;
+        stop_running_entry(running).await;
     }
 }
+
+async fn stop_running_entry(mut running: RunningEntry) {
+    running.cancel.cancel();
+    let issue_id = running.issue.id.clone();
+    let identifier = running.identifier.clone();
+    let pid = running.codex_app_server_pid;
+
+    match timeout(
+        Duration::from_secs(RUNNING_SHUTDOWN_TIMEOUT_SECS),
+        &mut running.join,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(_) => {
+            warn!(
+                "worker_shutdown=status=timeout issue_id={} issue_identifier={} pid={:?}",
+                issue_id, identifier, pid
+            );
+            force_kill_process(pid);
+            running.join.abort();
+            let _ = running.join.await;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn force_kill_process(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = StdCommand::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+fn force_kill_process(_pid: Option<u32>) {}
 
 fn shutdown_retries(entries: Vec<RetryEntry>) {
     for retry in entries {
@@ -1496,7 +1674,7 @@ async fn run_worker(
     attempt: Option<u32>,
     cancellation: CancellationToken,
     tx: mpsc::Sender<Command>,
-) -> Result<(), String> {
+) -> Result<WorkerDisposition, String> {
     let effective = workflow_store.effective();
     let workspace = Workspace::create_for_issue(&effective.config, &issue)
         .await
@@ -1520,6 +1698,8 @@ async fn run_worker(
     let worker_result = async {
         let mut current_issue = issue.clone();
         let max_turns = workflow_store.effective().config.agent.max_turns;
+        let terminal_states = workflow_store.effective().config.terminal_state_set();
+        let mut guarded_close_observed = false;
         for turn_number in 1..=max_turns {
             if cancellation.is_cancelled() {
                 return Err("cancelled by orchestrator".to_string());
@@ -1531,9 +1711,16 @@ async fn run_worker(
             } else {
                 prompt::continuation_guidance(turn_number, max_turns)
             };
+            let guarded_close_for_turn =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let guarded_close_events = std::sync::Arc::clone(&guarded_close_for_turn);
+            let issue_id_for_events = current_issue.id.clone();
 
             session
                 .run_turn(&prompt, &current_issue, &cancellation, |event| {
+                    if todoist_close_task_succeeded(event.payload.as_ref(), &issue_id_for_events) {
+                        guarded_close_events.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let issue_id = current_issue.id.clone();
                     let tx = tx.clone();
                     tokio::spawn(async move {
@@ -1547,6 +1734,8 @@ async fn run_worker(
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+            guarded_close_observed |=
+                guarded_close_for_turn.load(std::sync::atomic::Ordering::Relaxed);
 
             let tracker = build_tracker_client(workflow_store.effective().config.clone())
                 .map_err(|error| error.to_string())?;
@@ -1556,6 +1745,12 @@ async fn run_worker(
                 .map_err(|error| error.to_string())?;
             if let Some(next_issue) = refreshed.into_iter().next() {
                 current_issue = next_issue;
+            } else if should_cleanup_terminal_workspace_after_guarded_close(
+                guarded_close_observed,
+                None,
+                &terminal_states,
+            ) {
+                return Ok((WorkerDisposition::Quiesced { issue: None }, true));
             }
 
             let active = workflow_store
@@ -1564,37 +1759,75 @@ async fn run_worker(
                 .active_state_set()
                 .contains(&current_issue.state_key());
             if !active {
-                break;
+                let cleanup_terminal_workspace =
+                    should_cleanup_terminal_workspace_after_guarded_close(
+                        guarded_close_observed,
+                        Some(&current_issue),
+                        &terminal_states,
+                    );
+                return Ok((
+                    WorkerDisposition::Quiesced {
+                        issue: Some(current_issue),
+                    },
+                    cleanup_terminal_workspace,
+                ));
             }
             if turn_number >= max_turns {
                 break;
             }
         }
-        Ok(())
+        Ok((
+            WorkerDisposition::Continue {
+                issue: current_issue,
+            },
+            false,
+        ))
     }
     .await;
 
+    let cleanup_terminal_workspace = matches!(worker_result.as_ref(), Ok((_, true)));
     session.stop().await;
     workspace
         .run_after_run(&workflow_store.effective().config, &issue)
         .await;
-    worker_result
+    if cleanup_terminal_workspace {
+        Workspace::remove_path(
+            &workflow_store.effective().config,
+            &workspace.path,
+            &issue.identifier,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    worker_result.map(|(result, _)| result)
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
-    use std::{fs, path::PathBuf, sync::Arc, time::Instant};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
     use tempfile::tempdir;
-    use tokio::{sync::oneshot, task::JoinHandle};
+    use tokio::{
+        sync::{oneshot, watch},
+        task::JoinHandle,
+    };
     use tokio_util::sync::CancellationToken;
 
     use crate::issue::Issue;
 
     use super::{
-        Orchestrator, RetryEntry, RunningEntry, State, build_snapshot, candidate_issue,
-        handle_retry_issue_with_tracker, sort_issues_for_dispatch, todoist_close_task_succeeded,
+        Orchestrator, OrchestratorHandle, OrchestratorHandleError, RetryEntry, RunningEntry, State,
+        WorkerDisposition, build_snapshot, candidate_issue, dispatch_issue,
+        guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
+        handle_worker_exit, run_startup_terminal_cleanup,
+        should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
+        todoist_close_task_succeeded,
     };
     use crate::{orchestrator::build_issue_detail, workflow::WorkflowStore};
 
@@ -1666,6 +1899,56 @@ mod tests {
 
         assert!(todoist_close_task_succeeded(Some(&payload), "task-1"));
         assert!(!todoist_close_task_succeeded(Some(&payload), "task-2"));
+    }
+
+    #[test]
+    fn guarded_close_cleanup_only_triggers_for_terminal_or_missing_issue_state() {
+        let terminal_states: std::collections::BTreeSet<String> =
+            ["done".to_string()].into_iter().collect();
+        let done_issue = Issue {
+            state: "Done".to_string(),
+            ..Issue::default()
+        };
+        let merging_issue = Issue {
+            state: "Merging".to_string(),
+            ..Issue::default()
+        };
+
+        assert!(should_cleanup_terminal_workspace_after_guarded_close(
+            true,
+            Some(&done_issue),
+            &terminal_states,
+        ));
+        assert!(should_cleanup_terminal_workspace_after_guarded_close(
+            true,
+            None,
+            &terminal_states,
+        ));
+        assert!(!should_cleanup_terminal_workspace_after_guarded_close(
+            true,
+            Some(&merging_issue),
+            &terminal_states,
+        ));
+        assert!(!should_cleanup_terminal_workspace_after_guarded_close(
+            false,
+            Some(&done_issue),
+            &terminal_states,
+        ));
+    }
+
+    #[test]
+    fn merging_state_is_treated_as_a_possible_guarded_close_in_flight() {
+        let merging_issue = Issue {
+            state: "Merging".to_string(),
+            ..Issue::default()
+        };
+        let review_issue = Issue {
+            state: "Human Review".to_string(),
+            ..Issue::default()
+        };
+
+        assert!(guarded_close_transition_may_be_in_flight(&merging_issue));
+        assert!(!guarded_close_transition_may_be_in_flight(&review_issue));
     }
 
     #[tokio::test]
@@ -1817,6 +2100,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_issue_detail_times_out_when_command_loop_is_unresponsive() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_updates_tx, updates_rx) = watch::channel(0u64);
+        let handle = OrchestratorHandle {
+            tx,
+            updates: updates_rx,
+        };
+
+        assert!(matches!(
+            handle.issue_detail("ABC-1".to_string()).await,
+            Err(OrchestratorHandleError::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn quiesced_worker_exit_clears_claim_without_retry() {
+        let issue = Issue {
+            id: "issue-1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Review ready".to_string(),
+            state: "In Progress".to_string(),
+            assigned_to_worker: true,
+            ..Issue::default()
+        };
+        let mut state = State::default();
+        state.running.insert(
+            issue.id.clone(),
+            RunningEntry {
+                issue: issue.clone(),
+                identifier: issue.identifier.clone(),
+                workspace_path: PathBuf::from("/tmp/workspace"),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: Some("session-1".to_string()),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 1,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+        state.claimed.insert(issue.id.clone());
+
+        let quiesced_issue = Issue {
+            state: "Human Review".to_string(),
+            ..issue.clone()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        handle_worker_exit(
+            &mut state,
+            &tx,
+            &issue.id,
+            Ok(WorkerDisposition::Quiesced {
+                issue: Some(quiesced_issue),
+            }),
+        );
+
+        assert!(!state.claimed.contains(&issue.id));
+        assert!(!state.retry_attempts.contains_key(&issue.id));
+        assert!(state.running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_retry_tracks_latest_issue_state() {
+        let issue = Issue {
+            id: "issue-1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Merge ready".to_string(),
+            state: "In Progress".to_string(),
+            assigned_to_worker: true,
+            ..Issue::default()
+        };
+        let mut state = State::default();
+        state.max_retry_backoff_ms = 60_000;
+        state.running.insert(
+            issue.id.clone(),
+            RunningEntry {
+                issue: issue.clone(),
+                identifier: issue.identifier.clone(),
+                workspace_path: PathBuf::from("/tmp/workspace"),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: Some("session-1".to_string()),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 1,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+        state.claimed.insert(issue.id.clone());
+
+        let continued_issue = Issue {
+            state: "Merging".to_string(),
+            ..issue.clone()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        handle_worker_exit(
+            &mut state,
+            &tx,
+            &issue.id,
+            Ok(WorkerDisposition::Continue {
+                issue: continued_issue,
+            }),
+        );
+
+        let retry = state
+            .retry_attempts
+            .get(&issue.id)
+            .expect("continuation retry should be queued");
+        assert_eq!(
+            retry
+                .tracked_issue
+                .as_ref()
+                .map(|issue| issue.state.as_str()),
+            Some("Merging")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_issue_clears_claim_when_revalidate_fails_before_start() {
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &workflow_path,
+            format!(
+                r#"---
+tracker:
+  kind: todoist
+workspace:
+  root: {}
+---
+
+test
+"#,
+                dir.path().join("workspaces").display()
+            ),
+        )
+        .expect("workflow");
+
+        let workflow_store = WorkflowStore::new(workflow_path).expect("workflow store");
+        let issue = Issue {
+            id: "issue-1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Retry me".to_string(),
+            state: "Merging".to_string(),
+            assigned_to_worker: true,
+            ..Issue::default()
+        };
+        let mut state = State::default();
+        state.claimed.insert(issue.id.clone());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        dispatch_issue(&workflow_store, &tx, &mut state, issue.clone(), Some(1)).await;
+
+        assert!(
+            !state.claimed.contains(&issue.id),
+            "dispatch should release the claim when it cannot start a worker"
+        );
+        assert!(!state.running.contains_key(&issue.id));
+    }
+
+    #[tokio::test]
     async fn orchestrator_start_fails_when_todoist_comments_are_unavailable() {
         let dir = tempdir().expect("tempdir");
         let fixture_path = dir.path().join("memory.json");
@@ -1859,9 +2327,34 @@ test
         assert!(error.contains("todoist_comments_unavailable"));
     }
 
+    #[tokio::test]
+    async fn startup_cleanup_timeout_returns_when_fetch_open_issues_hangs() {
+        let workflow_store = sample_workflow_store();
+        let (started_tx, started_rx) = oneshot::channel();
+        let tracker = Arc::new(HangingOpenIssuesTracker {
+            started: Mutex::new(Some(started_tx)),
+        });
+
+        let cleanup = tokio::spawn(run_startup_terminal_cleanup(
+            workflow_store,
+            tracker,
+            Duration::from_millis(20),
+        ));
+
+        started_rx.await.expect("cleanup should start");
+        tokio::time::timeout(Duration::from_secs(1), cleanup)
+            .await
+            .expect("cleanup task should finish after timeout")
+            .expect("cleanup task should not panic");
+    }
+
     struct StaticTracker {
         candidates: Vec<Issue>,
         by_id: Vec<Issue>,
+    }
+
+    struct HangingOpenIssuesTracker {
+        started: Mutex<Option<oneshot::Sender<()>>>,
     }
 
     #[async_trait::async_trait]
@@ -1882,6 +2375,34 @@ test
             _issue_ids: &[String],
         ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
             Ok(self.by_id.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tracker::TrackerClient for HangingOpenIssuesTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_issues_by_states(
+            &self,
+            _states: &[String],
+        ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            _issue_ids: &[String],
+        ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_open_issues(&self) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
+            if let Some(tx) = self.started.lock().expect("mutex poisoned").take() {
+                let _ = tx.send(());
+            }
+            std::future::pending::<Result<Vec<Issue>, crate::tracker::TrackerError>>().await
         }
     }
 

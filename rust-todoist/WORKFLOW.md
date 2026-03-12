@@ -93,7 +93,7 @@ The agent should be able to talk to Todoist through the injected `todoist` tool.
 When the session includes `todoist`, prefer these exact narrow operations instead of exploratory searches:
 
 - Fetch the current task directly with `{"action":"get_task","task_id":"<task-id>"}`.
-- Manage the persistent task workpad with `get_workpad`, `upsert_workpad`, and `delete_workpad`.
+- Manage the persistent task workpad with `get_workpad`, `upsert_workpad`, and `delete_workpad`. When `get_workpad` returns a `comment_id`, pass that hint back into later `upsert_workpad` calls.
 - Use `create_project_comment` only for true project-level comments. Agent-owned task comments must use the single workpad via `upsert_workpad`.
 - Todoist comment responses identify task comments with `item_id`.
 - Resolve workflow state by listing sections for the configured project and matching by section name.
@@ -107,14 +107,16 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
-- Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
-- Spend extra effort up front on planning and verification design before implementation.
-- Reproduce first: always confirm the current behavior/problem signal before changing code so the fix target is explicit.
+- For `Todo`, `In Progress`, and `Rework`, start by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
+- For `Todo`, `In Progress`, and `Rework`, spend extra effort up front on planning and verification design before implementation.
+- For `Todo`, `In Progress`, and `Rework`, reproduce first: always confirm the current behavior/problem signal before changing code so the fix target is explicit.
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
 - Treat a single persistent Todoist comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - After the workpad exists, keep it current with `upsert_workpad`; do not use `create_project_comment` or raw `update_comment` for workpad writes.
+- Persist the workpad `comment_id` returned by `get_workpad`/`upsert_workpad` and pass it back into later `upsert_workpad` calls so Todoist rewrites stay single-request.
 - Keep the workpad on the task itself. Do not fall back to project comments for task execution state.
+- For `Merging`, skip the generic execution bootstrap. Do not start with repo-wide planning, reproduction, pull-sync, or routine workpad reconciliation. Treat `Merging` as a fast path: identify the surviving PR, verify it is merge-ready, run the `land` flow, then guarded `close_task`.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
   create a separate Todoist task instead of expanding scope. The follow-up task
@@ -156,27 +158,31 @@ When the session includes `todoist`, prefer these exact narrow operations instea
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Human Review` -> human handoff state. Do not make changes, and expect Symphony to stay idle until a human moves the task to `Rework` or `Merging`.
-   - `Merging` -> on entry, run the `land` skill flow; do not call `gh pr merge` directly.
+   - `Merging` -> skip Steps 1 and 2. On entry, go directly to the merge fast path in Step 3; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
+   - Skip this branch-reset logic while in `Merging`; the merge fast path must operate on the surviving review PR instead of creating new implementation work.
 5. For `Todo` tickets, do startup sequencing in this exact order:
    - resolve the `In Progress` section id with `list_sections`
    - `move_task(..., section_id: "<in-progress-section-id>")`
    - find/create the bootstrap workpad with `get_workpad` and `upsert_workpad`
    - only then begin analysis/planning/implementation work.
-6. Add a short comment if state and task content are inconsistent, then proceed with the safest flow.
+6. For `Merging`, do not create or rewrite the workpad before the merge decision unless the surviving PR is ambiguous or a blocker must be recorded.
+7. Add a short comment if state and task content are inconsistent, then proceed with the safest flow.
 
-## Step 1: Start/continue execution (Todo or In Progress)
+## Step 1: Start/continue execution (Todo, In Progress, or Rework only)
+
+Do not run this step while the task is in `Merging`.
 
 1.  Find or create a single persistent scratchpad comment for the current task:
     - Use `{"action":"get_workpad","task_id":"<task-id>"}` to discover the active workpad.
     - The workpad is identified by the visible header `## Codex Workpad` and the hidden marker `<!-- symphony:workpad -->`.
     - If found, reuse that comment; do not create a new workpad comment.
     - If not found, create one with `{"action":"upsert_workpad","task_id":"<task-id>","content":"..."}` and use it for all updates.
-    - Persist the workpad comment ID and only write progress updates to that ID.
+    - Persist the workpad comment ID and pass it back as `comment_id` on later `upsert_workpad` calls.
 2.  If arriving from `Todo`, do not delay on additional status transitions: the task should already be `In Progress` before this step begins.
 3.  Immediately reconcile the workpad before new edits:
     - Check off items that are already done.
@@ -238,7 +244,9 @@ Use this only when completion is blocked by missing required tools or missing au
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+## Step 2: Execution phase (Todo/In Progress/Rework -> Human Review)
+
+Do not run this step while the task is in `Merging`.
 
 1.  Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
 2.  If current task state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
@@ -248,7 +256,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Check off completed items.
     - Add newly discovered items in the appropriate section.
     - Keep parent/child structure intact as scope evolves.
-    - Update the workpad immediately after each meaningful milestone (for example: reproduction complete, code change landed, validation run, review feedback addressed).
+    - Update the workpad at milestone boundaries (for example: reproduction complete, code change landed, validation run, review feedback addressed), batching nearby checklist-only edits into the next reviewer-facing rewrite.
     - Never leave completed work unchecked in the plan.
     - For tickets that started as `Todo` with an attached PR, run the full PR feedback sweep protocol immediately after kickoff and before new feature work.
 5.  Run validation/tests required for the scope.
@@ -261,6 +269,7 @@ Use this only when completion is blocked by missing required tools or missing au
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
 8.  Record the surviving PR URL in the task-scoped workpad comment. If the runtime later exposes native task-link metadata, keep that metadata aligned as supplemental evidence.
+    - As soon as the surviving PR exists, do one workpad rewrite that records the PR URL and remember the returned `comment_id` for the remaining handoff steps.
     - If `gh pr create` fails with transient transport noise after the branch is already pushed, create the PR through Symphony's `github_api` tool when available; otherwise use direct GitHub REST before falling back to GitHub MCP.
     - `github_api` publish fallback:
       - create the PR with `POST /repos/<owner>/<repo>/pulls` and JSON body fields `title`, `head`, `base`, and `body`.
@@ -281,6 +290,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Mark completed plan/acceptance/validation checklist items as checked.
     - Add final handoff notes (commit + validation summary) in the same workpad comment.
     - Keep the current surviving PR URL in the workpad comment handoff notes so the task retains a canonical PR reference inside Todoist.
+    - If the current workpad already contains the surviving PR URL and latest reviewer-facing validation evidence, do not rewrite it again just to restate passing checks.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
 11. Before moving to `Human Review`, poll PR feedback and checks:
@@ -289,7 +299,10 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
-    - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
+    - Only perform a final `upsert_workpad` before state transition if `Plan`, `Acceptance Criteria`, or `Validation` changed materially since the last rewrite. If they are already current, move directly to `Human Review`.
+    - A pure "all checks are green and there were no actionable review comments" delta is not material by itself when the existing workpad already includes the surviving PR URL, the required validation command results, and the current acceptance checklist context. Do not rewrite the workpad only to flip those last handoff boxes.
+    - If the only remaining delta is a non-essential handoff polish and the current workpad already contains the surviving PR URL plus materially current validation evidence, do not stay active just to rewrite the workpad again.
+    - If Todoist rate-limits that non-essential final rewrite, do not burn the turn waiting on repeated retries. Keep the existing PR-linked workpad, then move directly to `Human Review`.
     - Verify there is exactly one surviving open PR for the current rerun branch before handoff. If no open PR exists, or only closed PRs are attached, stay active and recreate/reopen the correct PR instead of handing off.
 12. Only then move the task to `Human Review`.
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
@@ -305,8 +318,15 @@ Use this only when completion is blocked by missing required tools or missing au
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the task to `Rework` and follow the rework flow.
 4. If approved, human moves the task to `Merging`.
-5. When the task is in `Merging`, run the `land` skill in a loop until the PR is merged. If the checkout does not contain the skill file, use the runtime-provided `land` skill guidance instead of a repo-local path. Do not call `gh pr merge` directly.
-6. After merge is complete, move the task to `Done`.
+5. When the task is in `Merging`, use this fast path:
+   - identify the single surviving PR from the current workpad, branch, or task-linked metadata without doing a full execution bootstrap.
+   - confirm the PR is still open, checks are green, and there are no unresolved actionable human or bot comments.
+   - if any of those checks fail, record only the minimum blocker evidence needed in the workpad and keep the task active.
+6. Once the surviving PR is confirmed merge-ready, run the `land` skill in a loop until the PR is merged. If the checkout does not contain the skill file, use the runtime-provided `land` skill guidance instead of a repo-local path. Do not call `gh pr merge` directly.
+7. After merge is complete, do at most one final workpad refresh if the merged PR URL or blocker resolution evidence is missing, then immediately call `{"action":"close_task","task_id":"<task-id>"}` for the current task while it is still in `Merging`.
+   - If the pre-merge workpad already linked the surviving PR and the merge outcome is otherwise clear from the current turn, do not block completion on a cosmetic post-merge workpad rewrite.
+   - If Todoist rate-limits that optional final rewrite, skip it and proceed with guarded `close_task`.
+8. Do not end the turn after merge until guarded `close_task` succeeds or a durable blocker is recorded in the workpad.
 
 ## Step 4: Rework handling
 
@@ -345,6 +365,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - If the branch PR is already closed/merged, do not reuse that branch or prior implementation state for continuation.
 - For closed/merged branch PRs, create a new branch from `origin/main` and restart from reproduction/planning as if starting fresh.
 - Never leave a task in `Human Review` or `Merging` without an open PR that matches the current rerun branch. If the only linked PRs are closed, reopen the correct PR or create a fresh replacement before handoff.
+- In `Merging`, default to the surviving review PR. Do not create a fresh branch, rerun pull sync, or restart implementation unless merge readiness is genuinely impossible to recover.
 - If task state is `Backlog`, do not modify it; wait for human to move to `Todo`.
 - Do not edit the task description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad` + `<!-- symphony:workpad -->`) per task, and keep it as a task comment on the active Todoist task.
