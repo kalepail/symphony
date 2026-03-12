@@ -23,9 +23,9 @@ pub struct ServiceConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackerConfig {
     pub kind: Option<String>,
-    pub endpoint: String,
+    pub base_url: String,
     pub api_key: Option<String>,
-    pub project_slug: Option<String>,
+    pub project_id: Option<String>,
     pub fixture_path: Option<PathBuf>,
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
@@ -93,8 +93,8 @@ pub enum ConfigError {
     UnsupportedTrackerKind(String),
     #[error("missing_tracker_api_key")]
     MissingTrackerApiKey,
-    #[error("missing_tracker_project_slug")]
-    MissingTrackerProjectSlug,
+    #[error("missing_tracker_project_id")]
+    MissingTrackerProjectId,
     #[error("missing_tracker_fixture_path")]
     MissingTrackerFixturePath,
     #[error("missing_codex_command")]
@@ -132,12 +132,12 @@ impl ServiceConfig {
             .ok_or(ConfigError::MissingTrackerKind)?;
 
         match kind {
-            "linear" => {
+            "todoist" => {
                 if self.tracker.api_key.is_none() {
                     return Err(ConfigError::MissingTrackerApiKey);
                 }
-                if self.tracker.project_slug.is_none() {
-                    return Err(ConfigError::MissingTrackerProjectSlug);
+                if self.tracker.project_id.is_none() {
+                    return Err(ConfigError::MissingTrackerProjectId);
                 }
             }
             "memory" => {
@@ -183,15 +183,15 @@ impl ServiceConfig {
 
 fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigError> {
     let map = as_object(value, "tracker")?;
-    let api_key = resolve_secret(map.get("api_key"), "LINEAR_API_KEY")?;
-    let assignee = resolve_secret(map.get("assignee"), "LINEAR_ASSIGNEE")?;
+    let api_key = resolve_secret(map.get("api_key"), "TODOIST_API_TOKEN")?;
+    let assignee = resolve_secret(map.get("assignee"), "TODOIST_ASSIGNEE")?;
 
     Ok(TrackerConfig {
         kind: optional_string(map.get("kind"), "tracker.kind")?,
-        endpoint: optional_string(map.get("endpoint"), "tracker.endpoint")?
-            .unwrap_or_else(|| "https://api.linear.app/graphql".to_string()),
+        base_url: optional_string(map.get("base_url"), "tracker.base_url")?
+            .unwrap_or_else(|| "https://api.todoist.com/api/v1".to_string()),
         api_key,
-        project_slug: resolve_env_string(map.get("project_slug"), "tracker.project_slug")?,
+        project_id: resolve_env_string(map.get("project_id"), "tracker.project_id")?,
         fixture_path: optional_string(map.get("fixture_path"), "tracker.fixture_path")?.map(
             |path| resolve_path_value(Some(path.as_str()), PathBuf::from("memory_issues.json")),
         ),
@@ -204,7 +204,7 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
         terminal_states: parse_string_list(
             map.get("terminal_states"),
             "tracker.terminal_states",
-            &["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+            &["Cancelled", "Canceled", "Duplicate", "Done"],
         )?,
     })
 }
@@ -587,9 +587,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "agent": {
                     "max_concurrent_agents_by_state": {
@@ -613,9 +613,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj",
+                    "project_id": "proj",
                     "active_states": "Todo, In Progress, Review"
                 }
             })
@@ -635,9 +635,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 }
             })
             .as_object()
@@ -656,9 +656,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 }
             })
             .as_object()
@@ -690,9 +690,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "observability": {
                     "terminal_enabled": false,
@@ -715,9 +715,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "codex": {
                     "approval_policy": "future-policy",
@@ -790,9 +790,9 @@ mod tests {
         let error = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "agent": {
                     "max_concurrent_agents_by_state": {
@@ -813,9 +813,9 @@ mod tests {
         let error = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "hooks": {
                     "timeout_ms": 0
@@ -830,9 +830,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_project_slug_from_env_reference() {
+    fn resolves_project_id_from_env_reference() {
         let _guard = env_lock().lock().expect("env lock");
-        let env_name = "SYMPHONY_TEST_PROJECT_SLUG";
+        let env_name = "SYMPHONY_TEST_PROJECT_ID";
         unsafe {
             std::env::set_var(env_name, "proj-from-env");
         }
@@ -840,9 +840,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": format!("${env_name}")
+                    "project_id": format!("${env_name}")
                 }
             })
             .as_object()
@@ -850,10 +850,7 @@ mod tests {
         )
         .expect("config");
 
-        assert_eq!(
-            config.tracker.project_slug.as_deref(),
-            Some("proj-from-env")
-        );
+        assert_eq!(config.tracker.project_id.as_deref(), Some("proj-from-env"));
 
         unsafe {
             std::env::remove_var(env_name);
@@ -872,9 +869,9 @@ mod tests {
         let config = ServiceConfig::from_map(
             json!({
                 "tracker": {
-                    "kind": "linear",
+                    "kind": "todoist",
                     "api_key": "token",
-                    "project_slug": "proj"
+                    "project_id": "proj"
                 },
                 "workspace": {
                     "root": format!("${env_name}")

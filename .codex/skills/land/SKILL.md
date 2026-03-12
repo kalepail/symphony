@@ -31,7 +31,8 @@ description:
    and push with the `push` skill before proceeding.
 4. Check mergeability and conflicts against main.
 5. If conflicts exist, use the `pull` skill to fetch/merge `origin/main` and
-   resolve conflicts, then use the `push` skill to publish the updated branch.
+   resolve conflicts in the actual replay, then use the `push` skill to publish
+   the updated branch.
 6. Ensure Codex review comments (if present) are acknowledged and any required
    fixes are handled before merging.
 7. Watch checks until complete.
@@ -70,18 +71,24 @@ mergeable=$(gh pr view --json mergeable -q .mergeable)
 if [ "$mergeable" = "CONFLICTING" ]; then
   # Run the `pull` skill to handle fetch + merge + conflict resolution.
   # Then run the `push` skill to publish the updated branch.
+  # Important: GitHub only clears CONFLICTING once the branch history actually
+  # incorporates origin/main via merge or rebase replay. Do not "resolve" by
+  # editing files on top of the old branch tip without merging/rebasing main;
+  # the PR will remain dirty even if the final file contents look correct.
 fi
 
 # Preferred: use the Async Watch Helper below. The manual loop is a fallback
 # when Python cannot run or the helper script is unavailable.
-# Wait for review feedback: Codex reviews arrive as issue comments that start
-# with "## Codex Review — <persona>". Treat them like reviewer feedback: reply
-# with a `[codex]` issue comment acknowledging the findings and whether you're
-# addressing or deferring them.
-while true; do
-  gh api repos/{owner}/{repo}/issues/"$pr_number"/comments \
-    --jq '.[] | select(.body | startswith("## Codex Review")) | .id' | rg -q '.' \
-    && break
+# Codex review issue comments are optional. If the repo normally emits them,
+# wait briefly for one; otherwise continue after the normal review sweep.
+codex_review_seen=false
+for _ in 1 2 3; do
+  if gh api repos/{owner}/{repo}/issues/"$pr_number"/comments \
+    --jq '.[] | select(.body | startswith("## Codex Review")) | .id' | rg -q '.'
+  then
+    codex_review_seen=true
+    break
+  fi
   sleep 10
 done
 
@@ -118,6 +125,10 @@ Exit codes:
 - If checks fail, pull details with `gh pr checks` and `gh run view --log`, then
   fix locally, commit with the `commit` skill, push with the `push` skill, and
   re-run the watch.
+- If a rebase/cherry-pick replay fails only because the sandbox cannot reach
+  the host GPG agent, temporarily disable local signing for the replay
+  (`git config --local commit.gpgsign false` or remove
+  `.git/rebase-merge/gpg_sign_opt`), finish the replay, and continue.
 - Use judgment to identify flaky failures. If a failure is a flake (e.g., a
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not
@@ -127,10 +138,16 @@ Exit codes:
 - If all jobs fail with corrupted pnpm lockfile errors on the merge commit, the
   remediation is to fetch latest `origin/main`, merge, force-push, and rerun CI.
 - If mergeability is `UNKNOWN`, wait and re-check.
+- If mergeability is `CONFLICTING`, you must incorporate `origin/main` into the
+  branch history with a real merge or rebase replay before rechecking. A
+  content-only fix on the old branch tip does not clear GitHub's conflict state.
 - Do not merge while review comments (human or Codex review) are outstanding.
 - Codex review jobs retry on failure and are non-blocking; use the presence of
   `## Codex Review — <persona>` issue comments (not job status) as the signal
   that review feedback is available.
+- Do not block indefinitely waiting for a Codex review issue comment. If none
+  appears after a bounded wait and there are no outstanding human or inline
+  review comments, continue with the normal checks-and-merge flow.
 - Do not enable auto-merge; this repo has no required checks so auto-merge can
   skip tests.
 - If the remote PR branch advanced due to your own prior force-push or merge,

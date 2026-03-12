@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(payload["workflow"]["using_last_good"], false);
         assert_eq!(
             payload["links"]["project_url"],
-            "https://linear.app/project/proj/issues"
+            "https://app.todoist.com/app/project/proj"
         );
         assert_eq!(payload["links"]["dashboard_url"], "http://127.0.0.1:4000/");
         assert!(payload["throughput"]["graph_10m"].is_string());
@@ -411,10 +411,10 @@ mod tests {
             &workflow_path,
             r#"---
 tracker:
-  kind: linear
-  endpoint: "http://127.0.0.1:9/graphql"
+  kind: todoist
+  base_url: "http://127.0.0.1:9/api/v1"
   api_key: token
-  project_slug: proj
+  project_id: proj
   active_states:
     - Todo
     - In Progress

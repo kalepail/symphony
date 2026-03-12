@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn parses_unterminated_front_matter() {
-        let parsed = parse_workflow("---\ntracker:\n  kind: linear\n")
+        let parsed = parse_workflow("---\ntracker:\n  kind: todoist\n")
             .expect("unterminated front matter should parse");
         assert_eq!(parsed.prompt_template, "");
         assert_eq!(
@@ -304,7 +304,7 @@ mod tests {
                 .get("tracker")
                 .and_then(|value| value.get("kind"))
                 .and_then(Value::as_str),
-            Some("linear")
+            Some("todoist")
         );
     }
 
@@ -320,7 +320,7 @@ mod tests {
         let workflow_path = dir.path().join("WORKFLOW.md");
         fs::write(
             &workflow_path,
-            "---\ntracker:\n  kind: linear\n  api_key: token\n  project_slug: proj\n---\nhi",
+            "---\ntracker:\n  kind: todoist\n  api_key: token\n  project_id: proj\n---\nhi",
         )
         .expect("write workflow");
 
@@ -375,9 +375,9 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
 
         unsafe {
-            env::set_var("LINEAR_API_KEY", "token");
+            env::set_var("TODOIST_API_TOKEN", "token");
             env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
-            env::set_var("SYMPHONY_SMOKE_PROJECT_SLUG", "smoke-proj");
+            env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
         }
 
         for relative_path in [
@@ -401,9 +401,9 @@ mod tests {
         }
 
         unsafe {
-            env::remove_var("LINEAR_API_KEY");
+            env::remove_var("TODOIST_API_TOKEN");
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
-            env::remove_var("SYMPHONY_SMOKE_PROJECT_SLUG");
+            env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
         }
     }
 }

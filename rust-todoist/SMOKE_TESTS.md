@@ -15,18 +15,18 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 
 ## Required Environment
 
-- `LINEAR_API_KEY`
+- `TODOIST_API_TOKEN`
 - `SYMPHONY_WORKSPACE_ROOT`
-- `SYMPHONY_SMOKE_PROJECT_SLUG`
+- `SYMPHONY_SMOKE_PROJECT_ID`
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
 - For the direct GitHub REST fallback, either `GH_TOKEN` / `GITHUB_TOKEN` is exported or `gh auth token` succeeds on the host
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
-`SYMPHONY_SMOKE_PROJECT_SLUG` should point at a dedicated Linear project reserved for Symphony smoke runs.
+`SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
 
-## Canonical Linear Columns
+## Canonical Todoist Sections
 
-For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), the dedicated smoke Linear setup now uses this board organization:
+For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), the dedicated smoke Todoist setup now uses this section organization:
 
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
 - Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
@@ -66,13 +66,13 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 
 1. `smoke-minimal`
    - Workflow: `WORKFLOW.smoke.minimal.md`
-   - Proves: live Linear polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, `linear_graphql` comment, `Done` transition, workspace cleanup, terminal/web observability during a live run
+   - Proves: live Todoist polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, `todoist` comment, `Done` transition, workspace cleanup, terminal/web observability during a live run
    - Expected repo effect: one appended bullet in `SMOKE_TARGET.md`
 
 2. `smoke-pr`
    - Workflow: `WORKFLOW.smoke.full.md`
    - Seed the issue in `Todo`
-   - Issue body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR to the Linear issue
+   - Task body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR details to the Todoist task
    - Expected outcome: issue reaches `Human Review` with a green PR
    - Expected observability: SSE dashboard stays live during publish; terminal dashboard shows live activity and any retry pressure without flooding
 
@@ -90,7 +90,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 5. `parity-smoke`
    - Run the same seeded scenario once with Rust and once with Elixir
    - Compare external artifacts only:
-   - Linear state transitions
+   - Todoist section and completion transitions
    - workpad comment behavior
    - PR creation and metadata
    - review feedback handling
@@ -99,7 +99,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 
 ## Suggested Issue Template For `smoke-pr`
 
-Use this structure in the Linear issue body:
+Use this structure in the Todoist task description:
 
 ```md
 ## Goal

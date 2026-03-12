@@ -22,7 +22,7 @@ use crate::{
     prompt,
     tracker::{TrackerClient, build_tracker_client},
     workflow::WorkflowStore,
-    workspace::{Workspace, workspace_path_for_identifier},
+    workspace::{Workspace, sanitize_identifier, workspace_path_for_identifier},
 };
 
 #[derive(Clone)]
@@ -79,6 +79,7 @@ struct RetryEntry {
     attempt: u32,
     due_at: Instant,
     identifier: String,
+    tracked_issue: Option<Issue>,
     error: Option<String>,
     cancel: CancellationToken,
 }
@@ -112,7 +113,13 @@ pub struct SnapshotCounts {
 pub struct RunningSnapshot {
     pub issue_id: String,
     pub issue_identifier: String,
+    pub title: String,
     pub state: String,
+    pub url: Option<String>,
+    pub project_id: Option<String>,
+    pub labels: Vec<String>,
+    pub due: Option<Value>,
+    pub deadline: Option<Value>,
     pub session_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
     pub turn_count: u32,
@@ -160,6 +167,7 @@ pub struct IssueDetail {
     pub issue_identifier: String,
     pub issue_id: Option<String>,
     pub status: String,
+    pub tracked_issue: Option<Issue>,
     pub workspace: WorkspaceDetail,
     pub attempts: AttemptDetail,
     pub running: Option<RunningDetail>,
@@ -476,19 +484,64 @@ fn refresh_runtime_config(workflow_store: &WorkflowStore, state: &mut State) {
 
 async fn startup_terminal_cleanup(workflow_store: &WorkflowStore, tracker: &dyn TrackerClient) {
     let effective = workflow_store.effective();
-    match tracker
-        .fetch_issues_by_states(&effective.config.tracker.terminal_states)
-        .await
-    {
+    match tracker.fetch_open_issues().await {
         Ok(issues) => {
-            for issue in issues {
-                if let Err(error) =
-                    Workspace::remove_for_identifier(&effective.config, &issue.identifier).await
-                {
-                    warn!(
-                        "workspace_cleanup=startup status=failed issue_id={} issue_identifier={} error={error}",
-                        issue.id, issue.identifier
-                    );
+            let live_workspaces: BTreeSet<String> = issues
+                .iter()
+                .map(|issue| sanitize_identifier(&issue.identifier))
+                .collect();
+            let mut entries = match tokio::fs::read_dir(&effective.config.workspace.root).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!("workspace_cleanup=startup status=skipped reason={error}");
+                    return;
+                }
+            };
+
+            loop {
+                match entries.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let path = entry.path();
+                        let file_type = match entry.file_type().await {
+                            Ok(file_type) => file_type,
+                            Err(error) => {
+                                warn!(
+                                    "workspace_cleanup=startup status=skipped path={} reason={error}",
+                                    path.display()
+                                );
+                                continue;
+                            }
+                        };
+                        if !file_type.is_dir() {
+                            continue;
+                        }
+
+                        let identifier = entry.file_name().to_string_lossy().to_string();
+                        if live_workspaces.contains(&identifier) {
+                            continue;
+                        }
+
+                        if let Err(error) =
+                            Workspace::remove_path(&effective.config, &path, &identifier).await
+                        {
+                            warn!(
+                                "workspace_cleanup=startup status=failed issue_identifier={} path={} error={error}",
+                                identifier,
+                                path.display()
+                            );
+                        } else {
+                            info!(
+                                "workspace_cleanup=startup status=removed issue_identifier={} path={}",
+                                identifier,
+                                path.display()
+                            );
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        warn!("workspace_cleanup=startup status=skipped reason={error}");
+                        break;
+                    }
                 }
             }
         }
@@ -519,8 +572,28 @@ async fn reconcile_running_issues(
     let running_ids: Vec<String> = state.running.keys().cloned().collect();
     match tracker.fetch_issue_states_by_ids(&running_ids).await {
         Ok(issues) => {
+            let returned_ids: BTreeSet<String> =
+                issues.iter().map(|issue| issue.id.clone()).collect();
             let active_states = effective.config.active_state_set();
             let terminal_states = effective.config.terminal_state_set();
+            for missing_id in running_ids
+                .iter()
+                .filter(|issue_id| !returned_ids.contains(*issue_id))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let identifier = state
+                    .running
+                    .get(&missing_id)
+                    .map(|running| running.identifier.clone())
+                    .unwrap_or_else(|| missing_id.clone());
+                info!(
+                    "reconcile=status=missing issue_id={} issue_identifier={} reason=not_returned_by_tracker",
+                    missing_id, identifier
+                );
+                terminate_running_issue(state, missing_id, true, workflow_store).await;
+            }
+
             for issue in issues {
                 if terminal_states.contains(&issue.state_key()) {
                     info!(
@@ -600,6 +673,7 @@ async fn reconcile_stalled_runs(
                 1
             };
             let identifier = running.identifier.clone();
+            let tracked_issue = running.issue.clone();
             terminate_running_issue(state, issue_id.clone(), false, workflow_store).await;
             schedule_retry(
                 tx,
@@ -607,6 +681,7 @@ async fn reconcile_stalled_runs(
                 issue_id.clone(),
                 next_attempt,
                 identifier,
+                Some(tracked_issue),
                 Some(format!("stalled for {elapsed_ms}ms without codex activity")),
                 false,
             );
@@ -647,7 +722,6 @@ fn should_dispatch_issue(
     terminal_states: &std::collections::BTreeSet<String>,
 ) -> bool {
     candidate_issue(issue, active_states, terminal_states)
-        && !todo_issue_blocked_by_non_terminal(issue, terminal_states)
         && issue.assigned_to_worker
         && !state.claimed.contains(&issue.id)
         && !state.running.contains_key(&issue.id)
@@ -660,9 +734,7 @@ fn retry_candidate_issue(
     active_states: &std::collections::BTreeSet<String>,
     terminal_states: &std::collections::BTreeSet<String>,
 ) -> bool {
-    candidate_issue(issue, active_states, terminal_states)
-        && !todo_issue_blocked_by_non_terminal(issue, terminal_states)
-        && issue.assigned_to_worker
+    candidate_issue(issue, active_states, terminal_states) && issue.assigned_to_worker
 }
 
 fn candidate_issue(
@@ -676,21 +748,6 @@ fn candidate_issue(
         && !issue.state.is_empty()
         && active_states.contains(&issue.state_key())
         && !terminal_states.contains(&issue.state_key())
-}
-
-fn todo_issue_blocked_by_non_terminal(
-    issue: &Issue,
-    terminal_states: &std::collections::BTreeSet<String>,
-) -> bool {
-    issue.state_key() == "todo"
-        && issue.blocked_by.iter().any(|blocker| {
-            blocker
-                .state
-                .as_deref()
-                .map(normalize_state_name)
-                .map(|state| !terminal_states.contains(&state))
-                .unwrap_or(true)
-        })
 }
 
 fn state_slots_available(state: &State, config: &ServiceConfig, issue: &Issue) -> bool {
@@ -860,6 +917,7 @@ fn handle_worker_exit(
                 issue_id.to_string(),
                 1,
                 running.identifier.clone(),
+                Some(running.issue.clone()),
                 None,
                 true,
             );
@@ -880,6 +938,7 @@ fn handle_worker_exit(
                 issue_id.to_string(),
                 attempt,
                 running.identifier.clone(),
+                Some(running.issue.clone()),
                 Some(error.clone()),
                 false,
             );
@@ -952,6 +1011,7 @@ async fn handle_retry_issue_with_tracker(
                             issue.id.clone(),
                             retry_entry.attempt + 1,
                             issue.identifier.clone(),
+                            Some(issue.clone()),
                             Some("no available orchestrator slots".to_string()),
                             false,
                         );
@@ -970,6 +1030,7 @@ async fn handle_retry_issue_with_tracker(
                 issue_id.to_string(),
                 retry_entry.attempt + 1,
                 retry_entry.identifier,
+                retry_entry.tracked_issue.clone(),
                 Some(format!("retry poll failed: {error}")),
                 false,
             );
@@ -992,6 +1053,7 @@ fn schedule_retry(
     issue_id: String,
     attempt: u32,
     identifier: String,
+    tracked_issue: Option<Issue>,
     error: Option<String>,
     continuation: bool,
 ) {
@@ -1029,6 +1091,7 @@ fn schedule_retry(
             attempt,
             due_at: Instant::now() + Duration::from_millis(delay_ms),
             identifier: identifier.clone(),
+            tracked_issue,
             error: error.clone(),
             cancel,
         },
@@ -1147,7 +1210,13 @@ fn build_snapshot(state: &State) -> Snapshot {
             .map(|(issue_id, running)| RunningSnapshot {
                 issue_id: issue_id.clone(),
                 issue_identifier: running.identifier.clone(),
+                title: running.issue.title.clone(),
                 state: running.issue.state.clone(),
+                url: running.issue.url.clone(),
+                project_id: running.issue.project_id.clone(),
+                labels: running.issue.labels.clone(),
+                due: running.issue.due.clone(),
+                deadline: running.issue.deadline.clone(),
                 session_id: running.session_id.clone(),
                 codex_app_server_pid: running.codex_app_server_pid,
                 turn_count: running.turn_count,
@@ -1228,6 +1297,9 @@ fn build_issue_detail(
     let issue_id = running
         .map(|running| running.issue.id.clone())
         .or_else(|| retry_entry.map(|(issue_id, _)| issue_id.clone()));
+    let tracked_issue = running
+        .map(|running| running.issue.clone())
+        .or_else(|| retry.map(|retry| retry.tracked_issue.clone()).flatten());
     let status = if running.is_some() {
         "running"
     } else {
@@ -1239,6 +1311,7 @@ fn build_issue_detail(
         issue_identifier: identifier.to_string(),
         issue_id,
         status,
+        tracked_issue,
         workspace: WorkspaceDetail {
             path: workspace.display().to_string(),
         },
@@ -1398,7 +1471,6 @@ mod tests {
     use super::{
         RetryEntry, RunningEntry, State, build_snapshot, candidate_issue,
         handle_retry_issue_with_tracker, sort_issues_for_dispatch,
-        todo_issue_blocked_by_non_terminal,
     };
     use crate::{orchestrator::build_issue_detail, workflow::WorkflowStore};
 
@@ -1431,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_blocked_issue_is_not_candidate() {
+    fn todo_issue_with_dependencies_is_still_a_candidate() {
         let issue = Issue {
             id: "1".to_string(),
             identifier: "A".to_string(),
@@ -1449,7 +1521,6 @@ mod tests {
             ["done".to_string()].into_iter().collect();
 
         assert!(candidate_issue(&issue, &active, &terminal));
-        assert!(todo_issue_blocked_by_non_terminal(&issue, &terminal));
     }
 
     #[test]
@@ -1543,6 +1614,7 @@ mod tests {
                 attempt: 1,
                 due_at: Instant::now(),
                 identifier: issue.identifier.clone(),
+                tracked_issue: Some(issue.clone()),
                 error: None,
                 cancel: CancellationToken::new(),
             },
@@ -1579,6 +1651,16 @@ mod tests {
                 attempt: 2,
                 due_at: Instant::now(),
                 identifier: "ABC-1".to_string(),
+                tracked_issue: Some(Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "Retry me".to_string(),
+                    state: "Rework".to_string(),
+                    labels: vec!["backend".to_string()],
+                    url: Some("https://app.todoist.com/app/task/issue-1".to_string()),
+                    project_id: Some("proj-1".to_string()),
+                    ..Issue::default()
+                }),
                 error: Some("boom".to_string()),
                 cancel: CancellationToken::new(),
             },
@@ -1586,6 +1668,13 @@ mod tests {
 
         let detail = build_issue_detail(&workflow_store, &state, "ABC-1").expect("detail");
         assert_eq!(detail.issue_id.as_deref(), Some("issue-1"));
+        assert_eq!(
+            detail
+                .tracked_issue
+                .as_ref()
+                .and_then(|issue| issue.project_id.as_deref()),
+            Some("proj-1")
+        );
     }
 
     struct StaticTracker {
@@ -1611,14 +1700,6 @@ mod tests {
             _issue_ids: &[String],
         ) -> Result<Vec<Issue>, crate::tracker::TrackerError> {
             Ok(self.by_id.clone())
-        }
-
-        async fn raw_graphql(
-            &self,
-            _query: &str,
-            _variables: serde_json::Value,
-        ) -> Result<serde_json::Value, crate::tracker::TrackerError> {
-            unreachable!()
         }
     }
 
@@ -1668,9 +1749,9 @@ mod tests {
             format!(
                 r#"---
 tracker:
-  kind: linear
+  kind: todoist
   api_key: token
-  project_slug: proj
+  project_id: proj
   active_states:
     - Todo
     - In Progress

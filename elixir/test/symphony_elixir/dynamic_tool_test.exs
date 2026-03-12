@@ -4,6 +4,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   alias SymphonyElixir.Codex.DynamicTool
 
   test "tool_specs advertises the linear_graphql input contract" do
+    specs = DynamicTool.tool_specs(github_api_available?: false)
+
     assert [
              %{
                "description" => description,
@@ -17,13 +19,34 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                },
                "name" => "linear_graphql"
              }
-           ] = DynamicTool.tool_specs()
+           ] = specs
 
     assert description =~ "Linear"
   end
 
+  test "tool_specs advertises github_api when host-side GitHub auth is available" do
+    assert [
+             %{"name" => "linear_graphql"},
+             %{
+               "description" => description,
+               "inputSchema" => %{
+                 "properties" => %{
+                   "body" => _,
+                   "method" => _,
+                   "path" => _
+                 },
+                 "required" => ["method", "path"],
+                 "type" => "object"
+               },
+               "name" => "github_api"
+             }
+           ] = DynamicTool.tool_specs(github_api_available?: true)
+
+    assert description =~ "GitHub REST API"
+  end
+
   test "unsupported tools return a failure payload with the supported tool list" do
-    response = DynamicTool.execute("not_a_real_tool", %{})
+    response = DynamicTool.execute("not_a_real_tool", %{}, github_api_available?: false)
 
     assert response["success"] == false
 
@@ -374,5 +397,131 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => ":ok"
              }
            ] = response["contentItems"]
+  end
+
+  test "github_api normalizes arguments and returns successful responses as tool text" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "github_api",
+        %{
+          "method" => "post",
+          "path" => "repos/owner/repo/issues/14/labels",
+          "body" => ~s({"labels":["symphony"]})
+        },
+        github_token_provider: fn -> {:ok, "github-token"} end,
+        github_requester: fn method, path, body, token, base_url ->
+          send(test_pid, {:github_request, method, path, body, token, base_url})
+          {:ok, %{"ok" => true, "labels" => ["symphony"]}}
+        end
+      )
+
+    assert_received {:github_request, "POST", "/repos/owner/repo/issues/14/labels", %{"labels" => ["symphony"]}, "github-token", "https://api.github.com"}
+
+    assert response["success"] == true
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert Jason.decode!(text) == %{"ok" => true, "labels" => ["symphony"]}
+  end
+
+  test "github_api validates required arguments before calling GitHub" do
+    response =
+      DynamicTool.execute(
+        "github_api",
+        %{"path" => "/repos/owner/repo/pulls"},
+        github_token_provider: fn ->
+          flunk("github token provider should not be called when arguments are invalid")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert Jason.decode!(text) == %{
+             "error" => %{
+               "message" => "`github_api.method` is required."
+             }
+           }
+
+    invalid_method =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "NOT_REAL", "path" => "/repos/owner/repo/pulls"},
+        github_token_provider: fn ->
+          flunk("github token provider should not be called when the method is invalid")
+        end
+      )
+
+    assert [
+             %{
+               "text" => invalid_method_text
+             }
+           ] = invalid_method["contentItems"]
+
+    assert Jason.decode!(invalid_method_text) == %{
+             "error" => %{
+               "message" => "`github_api.method` must be a valid HTTP method."
+             }
+           }
+  end
+
+  test "github_api formats auth and HTTP failures" do
+    auth_error =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/owner/repo/pulls/14"},
+        github_token_provider: fn -> {:error, :github_auth_unavailable} end
+      )
+
+    assert auth_error["success"] == false
+
+    assert [
+             %{
+               "text" => auth_error_text
+             }
+           ] = auth_error["contentItems"]
+
+    assert Jason.decode!(auth_error_text) == %{
+             "error" => %{
+               "message" => "GitHub API tool is unavailable because no auth token could be found."
+             }
+           }
+
+    status_error =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/owner/repo/pulls/14"},
+        github_token_provider: fn -> {:ok, "github-token"} end,
+        github_requester: fn _method, _path, _body, _token, _base_url ->
+          {:error, {:github_api_status, 422, "GET", "/repos/owner/repo/pulls/14", %{"message" => "unprocessable"}}}
+        end
+      )
+
+    assert [
+             %{
+               "text" => status_error_text
+             }
+           ] = status_error["contentItems"]
+
+    assert Jason.decode!(status_error_text) == %{
+             "error" => %{
+               "message" => "GitHub API request failed with HTTP 422.",
+               "method" => "GET",
+               "path" => "/repos/owner/repo/pulls/14",
+               "response" => %{"message" => "unprocessable"},
+               "status" => 422
+             }
+           }
   end
 end
