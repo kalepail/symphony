@@ -35,9 +35,3 @@ When sources disagree:
 1. trust the live official Todoist API v1 docs first
 2. trust the local Rust Todoist runtime contract second for Symphony behavior
 3. treat search summaries as hints, not authority
-
-## Legacy note
-
-Todoist still hosts older REST v2 and Sync v9 documentation, but this skill
-does not treat them as primary references. Only consult them when you are
-explicitly debugging migration or historical naming differences.

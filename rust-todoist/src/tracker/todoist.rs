@@ -930,10 +930,8 @@ impl TodoistTracker {
 
     async fn hydrate_issue_comments(&self, issue: &mut Issue) -> Result<(), TrackerError> {
         let comments = self.fetch_all_task_comments(&issue.id).await?;
-        let (todoist_comments, todoist_comments_truncated) = todoist_review_comments_from_values(
-            &comments,
-            &self.config.tracker.todoist_prompt_comment_limits,
-        );
+        let (todoist_comments, todoist_comments_truncated) =
+            todoist_review_comments_from_values(&comments);
         issue.todoist_comments = todoist_comments;
         issue.todoist_comments_truncated = todoist_comments_truncated;
         Ok(())
@@ -2825,6 +2823,7 @@ mod tests {
     struct CountingMockTodoistState {
         inner: MockTodoistState,
         tasks: Vec<Value>,
+        comments: Vec<Value>,
         counts: Arc<MetadataRequestCounts>,
     }
 
@@ -2997,17 +2996,25 @@ mod tests {
 
         async fn list_comments(
             State(state): State<Arc<CountingMockTodoistState>>,
-            Query(_query): Query<HashMap<String, String>>,
+            Query(query): Query<HashMap<String, String>>,
         ) -> Json<Value> {
             state.counts.comments.fetch_add(1, Ordering::SeqCst);
+            let results = state
+                .comments
+                .iter()
+                .filter(|comment| {
+                    query.get("task_id").is_none_or(|task_id| {
+                        comment
+                            .get("task_id")
+                            .or_else(|| comment.get("item_id"))
+                            .and_then(Value::as_str)
+                            == Some(task_id.as_str())
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             Json(json!({
-                "results": [
-                    {
-                        "id": "comment-1",
-                        "item_id": "task-1",
-                        "content": "cached"
-                    }
-                ],
+                "results": results,
                 "next_cursor": null
             }))
         }
@@ -3528,6 +3535,7 @@ mod tests {
                 "section_id": "sec-todo",
                 "assignee_id": "user-1"
             })],
+            comments: Vec::new(),
             counts: counts.clone(),
         })
         .await;
@@ -3579,6 +3587,7 @@ mod tests {
                 "section_id": "sec-todo",
                 "assignee_id": "user-1"
             })],
+            comments: Vec::new(),
             counts: counts.clone(),
         })
         .await;
@@ -3636,6 +3645,7 @@ mod tests {
                     "assignee_id": "user-1"
                 }),
             ],
+            comments: Vec::new(),
             counts: counts.clone(),
         })
         .await;
@@ -3703,6 +3713,11 @@ mod tests {
                 "project_id": "proj",
                 "section_id": "sec-todo"
             })],
+            comments: vec![json!({
+                "id": "comment-1",
+                "item_id": "task-1",
+                "content": "cached"
+            })],
             counts: counts.clone(),
         })
         .await;
@@ -3754,6 +3769,7 @@ mod tests {
                 plan_limits: json!({"comments": true}),
             },
             tasks,
+            comments: Vec::new(),
             counts: counts.clone(),
         })
         .await;
@@ -3775,6 +3791,146 @@ mod tests {
         assert_eq!(counts.tasks.load(Ordering::SeqCst), 3);
         assert_eq!(counts.task_details.load(Ordering::SeqCst), 0);
         assert_eq!(counts.current_user.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_state_by_id_preloads_real_review_comments_and_applies_limits() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let mut comments = (0..55)
+            .map(|index| {
+                let content = if index == 54 {
+                    format!(
+                        "prefix-{index}\n{}{}\nsuffix-{index}",
+                        "x".repeat(crate::tracker::TODOIST_COMMENT_SIZE_LIMIT),
+                        "y"
+                    )
+                } else {
+                    format!("Please keep update {index} intact.")
+                };
+                json!({
+                    "id": format!("comment-{index:02}"),
+                    "item_id": "task-1",
+                    "posted_uid": format!("user-{index:02}"),
+                    "posted_at": format!("2026-03-13T12:00:{index:02}Z"),
+                    "content": content
+                })
+            })
+            .collect::<Vec<_>>();
+        comments.push(json!({
+            "id": "comment-workpad",
+            "item_id": "task-1",
+            "posted_at": "2026-03-13T11:59:59Z",
+            "content": "## Codex Workpad\n\n<!-- symphony:workpad -->\n\ntracked state"
+        }));
+
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": false,
+                    "can_assign_tasks": false
+                }),
+                sections: vec![json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"})],
+                collaborators: Vec::new(),
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks: vec![json!({
+                "id": "task-1",
+                "content": "Ship cache",
+                "project_id": "proj",
+                "section_id": "sec-todo"
+            })],
+            comments,
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, None));
+        let issues = tracker
+            .fetch_issue_states_by_ids(&["task-1".to_string()])
+            .await
+            .expect("state refresh");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(counts.comments.load(Ordering::SeqCst), 1);
+        assert!(issues[0].todoist_comments_truncated);
+        assert_eq!(issues[0].todoist_comments.len(), 50);
+        assert_eq!(
+            issues[0]
+                .todoist_comments
+                .first()
+                .map(|comment| comment.id.as_str()),
+            Some("comment-05")
+        );
+        assert_eq!(
+            issues[0]
+                .todoist_comments
+                .last()
+                .map(|comment| comment.id.as_str()),
+            Some("comment-54")
+        );
+        assert!(
+            issues[0]
+                .todoist_comments
+                .iter()
+                .all(|comment| comment.id != "comment-workpad")
+        );
+        let newest = issues[0].todoist_comments.last().expect("latest comment");
+        assert!(newest.content.chars().count() <= crate::tracker::TODOIST_COMMENT_SIZE_LIMIT);
+        assert!(newest.content.starts_with("prefix-54"));
+        assert!(newest.content.ends_with("suffix-54"));
+        assert!(newest.content.contains("\n...\n"));
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_skips_comment_hydration_for_multi_issue_refreshes() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": false,
+                    "can_assign_tasks": false
+                }),
+                sections: vec![json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"})],
+                collaborators: Vec::new(),
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks: vec![
+                json!({
+                    "id": "task-1",
+                    "content": "Ship cache",
+                    "project_id": "proj",
+                    "section_id": "sec-todo"
+                }),
+                json!({
+                    "id": "task-2",
+                    "content": "Review cache",
+                    "project_id": "proj",
+                    "section_id": "sec-todo"
+                }),
+            ],
+            comments: vec![json!({
+                "id": "comment-1",
+                "item_id": "task-1",
+                "content": "should stay unloaded"
+            })],
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, None));
+        let issues = tracker
+            .fetch_issue_states_by_ids(&["task-1".to_string(), "task-2".to_string()])
+            .await
+            .expect("multi issue refresh");
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(counts.comments.load(Ordering::SeqCst), 0);
+        assert!(issues.iter().all(|issue| issue.todoist_comments.is_empty()));
+        assert!(issues.iter().all(|issue| !issue.todoist_comments_truncated));
     }
 
     #[tokio::test]

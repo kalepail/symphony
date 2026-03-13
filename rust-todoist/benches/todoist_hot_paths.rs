@@ -118,11 +118,19 @@ async fn spawn_todoist_bench_server(tasks: BenchTaskSet) -> TodoistBenchServer {
         }))
     }
 
+    async fn list_comments(Query(_query): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "results": [],
+            "next_cursor": null
+        }))
+    }
+
     let app = Router::new()
         .route("/projects/{project_id}", get(get_project))
         .route("/sections", get(list_sections))
         .route("/sync", post(sync))
         .route("/tasks", get(list_tasks))
+        .route("/comments", get(list_comments))
         .with_state(tasks);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local addr");
@@ -209,7 +217,9 @@ fn bench_fetch_issue_states_by_ids_warm(c: &mut Criterion) {
     let mut group = c.benchmark_group("todoist/fetch_issue_states_by_ids");
     group.sampling_mode(SamplingMode::Flat);
 
-    for size in [1usize, 10, 100] {
+    // Keep the benchmark focused on the warm multi-issue refresh path that drives steady-state
+    // orchestration throughput. Single-issue refreshes are covered by tests instead.
+    for size in [10usize, 100] {
         let issue_ids = (0..size)
             .map(|index| format!("task-{index}"))
             .collect::<Vec<_>>();

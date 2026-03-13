@@ -217,10 +217,7 @@ impl MemoryTracker {
                     .cloned()
                     .collect::<Vec<_>>();
                 let (todoist_comments, todoist_comments_truncated) =
-                    todoist_review_comments_from_values(
-                        &comments,
-                        &self.config.tracker.todoist_prompt_comment_limits,
-                    );
+                    todoist_review_comments_from_values(&comments);
                 issue.todoist_comments = todoist_comments;
                 issue.todoist_comments_truncated = todoist_comments_truncated;
                 issue
@@ -2255,6 +2252,7 @@ mod tests {
 
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].todoist_comments.len(), 1);
+        assert!(!issues[0].todoist_comments_truncated);
         assert_eq!(
             issues[0].todoist_comments[0].content,
             "Please keep the original diff and attach the benchmark."
@@ -2262,6 +2260,76 @@ mod tests {
         assert_eq!(
             issues[0].todoist_comments[0].attachment_name.as_deref(),
             Some("bench.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_by_ids_marks_truncated_todoist_comments_when_fixture_exceeds_limit()
+    {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        let comments = (0..55)
+            .map(|index| {
+                json!({
+                    "id": format!("comment-{index:02}"),
+                    "item_id": "task-1",
+                    "posted_uid": format!("user-{index:02}"),
+                    "posted_at": format!("2026-03-13T12:00:{index:02}Z"),
+                    "content": format!("keep update {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &fixture,
+            serde_json::to_string(&json!({
+                "tasks": [
+                    {"id":"task-1","content":"Parent","project_id":"proj","section_id":"sec-review","labels":[]}
+                ],
+                "sections": [
+                    {"id":"sec-review","project_id":"proj","name":"Rework"}
+                ],
+                "comments": comments,
+                "user_plan_limits": {"comments": true}
+            }))
+            .expect("fixture json"),
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let issues = tracker
+            .fetch_issue_states_by_ids(&["task-1".to_string()])
+            .await
+            .expect("issues");
+
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].todoist_comments_truncated);
+        assert_eq!(issues[0].todoist_comments.len(), 50);
+        assert_eq!(
+            issues[0]
+                .todoist_comments
+                .first()
+                .map(|comment| comment.id.as_str()),
+            Some("comment-05")
+        );
+        assert_eq!(
+            issues[0]
+                .todoist_comments
+                .last()
+                .map(|comment| comment.id.as_str()),
+            Some("comment-54")
         );
     }
 

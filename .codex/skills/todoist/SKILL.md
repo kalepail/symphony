@@ -45,8 +45,8 @@ Prefer these sources in order:
 3. `../../../rust-todoist/WORKFLOW.md`
 4. `references/api-sources.md`
 
-Use `references/api-sources.md` first when the Todoist version story looks
-confusing. It records the forward-looking source hierarchy for this skill.
+Use `references/api-sources.md` first when you need the current official
+Todoist source hierarchy for this skill.
 
 When you need more examples than this file includes, read
 `references/action-recipes.md`.
