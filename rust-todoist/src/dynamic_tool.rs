@@ -73,12 +73,6 @@ const TODOIST_CORE_ACTIONS: &[&str] = &[
     "reopen_task",
     "create_task",
 ];
-const TODOIST_REMINDER_ACTIONS: &[&str] = &[
-    "list_reminders",
-    "create_reminder",
-    "update_reminder",
-    "delete_reminder",
-];
 const TODOIST_ACTIVITY_ACTIONS: &[&str] = &["list_activities"];
 
 pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
@@ -147,9 +141,6 @@ fn todoist_tool_description(capabilities: TrackerCapabilities) -> String {
 
 fn todoist_supported_actions(capabilities: TrackerCapabilities) -> Vec<&'static str> {
     let mut actions = TODOIST_CORE_ACTIONS.to_vec();
-    if capabilities.reminders {
-        actions.extend_from_slice(TODOIST_REMINDER_ACTIONS);
-    }
     if capabilities.activity_log {
         actions.extend_from_slice(TODOIST_ACTIVITY_ACTIONS);
     }
@@ -172,7 +163,7 @@ fn todoist_input_schema() -> Value {
                         "labels": { "description": "Todoist label names for create_task or update_task." },
                         "assignee_id": { "type": ["string", "number", "null"], "description": "Todoist assignee id for create_task or update_task." },
                         "priority": { "type": ["integer", "null"], "description": "Todoist task priority from 1 (normal) to 4 (urgent)." },
-                        "due": { "description": "Todoist due object for create_task, update_task, create_reminder, or update_reminder." },
+                        "due": { "description": "Todoist due object for create_task or update_task." },
                         "deadline": { "description": "Todoist deadline object for create_task or update_task." },
                         "cursor": { "type": ["string", "null"], "description": "Cursor for paginated list actions." },
                         "limit": { "type": ["integer", "null"], "description": "Requested page size for paginated list actions." },
@@ -188,15 +179,6 @@ fn todoist_input_schema() -> Value {
                         "project_id": { "type": ["string", "number", "null"], "description": "Optional project identifier; defaults to tracker.project_id where applicable. Do not send this for task comment actions." },
                         "attachment": { "description": "Optional Todoist comment attachment object." },
                         "uids_to_notify": { "description": "Optional list of Todoist user ids to notify for comment creation." },
-                        "type": { "type": ["string", "null"], "description": "Reminder type for create_reminder or update_reminder." },
-                        "minute_offset": { "type": ["integer", "null"], "description": "Relative reminder offset in minutes." },
-                        "service": { "type": ["string", "null"], "description": "Reminder delivery service such as `push`." },
-                        "name": { "type": ["string", "null"], "description": "Reminder location name when using location reminders." },
-                        "loc_lat": { "type": ["number", "string", "null"], "description": "Location reminder latitude." },
-                        "loc_long": { "type": ["number", "string", "null"], "description": "Location reminder longitude." },
-                        "loc_trigger": { "type": ["string", "null"], "description": "Location reminder trigger such as `on_enter` or `on_leave`." },
-                        "radius": { "type": ["number", "integer", "null"], "description": "Location reminder radius." },
-                        "reminder_id": { "type": ["string", "number", "null"], "description": "Reminder identifier for update_reminder and delete_reminder." },
                         "object_type": { "type": ["string", "null"], "description": "Activity-log object type such as `project`, `item`, or `note`." },
                         "object_id": { "type": ["string", "number", "null"], "description": "Activity-log object identifier, used with object_type." },
                         "event_type": { "type": ["string", "null"], "description": "Todoist activity event type such as `added`, `updated`, `completed`, or `moved`." },
@@ -336,20 +318,7 @@ async fn execute_todoist(
         "close_task" => close_task_guarded(config, tracker, &required_id(&args, "task_id")?).await,
         "reopen_task" => tracker.reopen_task(&required_id(&args, "task_id")?).await,
         "create_task" => tracker.create_task(Value::Object(args)).await,
-        "list_reminders" => tracker.list_reminders(Value::Object(args)).await,
         "list_activities" => tracker.list_activities(Value::Object(args)).await,
-        "create_reminder" => tracker.create_reminder(Value::Object(args)).await,
-        "update_reminder" => {
-            let reminder_id = required_id(&args, "reminder_id")?;
-            tracker
-                .update_reminder(&reminder_id, Value::Object(args))
-                .await
-        }
-        "delete_reminder" => {
-            tracker
-                .delete_reminder(&required_id(&args, "reminder_id")?)
-                .await
-        }
         other => Err(TrackerError::TrackerOperationUnsupported(format!(
             "unsupported todoist action `{other}`"
         ))),
@@ -372,7 +341,6 @@ fn todoist_log_scope(args: &serde_json::Map<String, Value>) -> String {
         "project_id",
         "section_id",
         "comment_id",
-        "reminder_id",
         "object_id",
         "origin_task_id",
     ];
@@ -540,7 +508,6 @@ fn todoist_action_contract(
             ],
             &["content"],
         )),
-        "list_reminders" => Ok((&["action", "task_id", "cursor", "limit"], &[])),
         "list_activities" => Ok((
             &[
                 "action",
@@ -564,39 +531,6 @@ fn todoist_action_contract(
             ],
             &[],
         )),
-        "create_reminder" => Ok((
-            &[
-                "action",
-                "task_id",
-                "type",
-                "minute_offset",
-                "due",
-                "service",
-                "name",
-                "loc_lat",
-                "loc_long",
-                "loc_trigger",
-                "radius",
-            ],
-            &["task_id"],
-        )),
-        "update_reminder" => Ok((
-            &[
-                "action",
-                "reminder_id",
-                "type",
-                "minute_offset",
-                "due",
-                "service",
-                "name",
-                "loc_lat",
-                "loc_long",
-                "loc_trigger",
-                "radius",
-            ],
-            &["reminder_id"],
-        )),
-        "delete_reminder" => Ok((&["action", "reminder_id"], &["reminder_id"])),
         other => Err(TrackerError::TrackerOperationUnsupported(format!(
             "unsupported todoist action `{other}`"
         ))),
@@ -654,11 +588,6 @@ fn ensure_action_capability(
             if !capabilities.comments =>
         {
             Err(TrackerError::TodoistCommentsUnavailable)
-        }
-        "list_reminders" | "create_reminder" | "update_reminder" | "delete_reminder"
-            if !capabilities.reminders =>
-        {
-            Err(TrackerError::TodoistRemindersUnavailable)
         }
         "list_activities" if !capabilities.activity_log => {
             Err(TrackerError::TodoistActivityLogUnavailable)
@@ -1895,33 +1824,13 @@ mod tests {
             }))
         }
 
-        async fn create_reminder(&self, arguments: Value) -> Result<Value, TrackerError> {
-            Ok(json!({ "created": true, "task_id": arguments["task_id"] }))
-        }
-
         async fn list_activities(&self, _arguments: Value) -> Result<Value, TrackerError> {
             Ok(json!({
                 "events": [{"id": 1, "object_type": "item", "event_type": "updated"}],
                 "next_cursor": null
             }))
         }
-
-        async fn update_reminder(
-            &self,
-            reminder_id: &str,
-            arguments: Value,
-        ) -> Result<Value, TrackerError> {
-            Ok(
-                json!({ "updated": true, "id": reminder_id, "minute_offset": arguments["minute_offset"] }),
-            )
-        }
-
-        async fn delete_reminder(&self, reminder_id: &str) -> Result<Value, TrackerError> {
-            Ok(json!({ "deleted": true, "id": reminder_id }))
-        }
     }
-
-    struct ReminderErrorTracker;
 
     struct CapabilityTracker {
         capabilities: TrackerCapabilities,
@@ -2005,35 +1914,6 @@ mod tests {
         });
 
         (format!("http://{address}"), join)
-    }
-
-    #[async_trait]
-    impl TrackerClient for ReminderErrorTracker {
-        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
-            unreachable!()
-        }
-
-        async fn fetch_issues_by_states(
-            &self,
-            _states: &[String],
-        ) -> Result<Vec<Issue>, TrackerError> {
-            unreachable!()
-        }
-
-        async fn fetch_issue_states_by_ids(
-            &self,
-            _issue_ids: &[String],
-        ) -> Result<Vec<Issue>, TrackerError> {
-            unreachable!()
-        }
-
-        async fn create_reminder(&self, _arguments: Value) -> Result<Value, TrackerError> {
-            Err(TrackerError::TodoistRemindersUnavailable)
-        }
-
-        async fn list_activities(&self, _arguments: Value) -> Result<Value, TrackerError> {
-            Err(TrackerError::TodoistActivityLogUnavailable)
-        }
     }
 
     #[async_trait]
@@ -2205,7 +2085,6 @@ mod tests {
         assert!(description.contains("delete_comment"));
         assert!(description.contains("upsert_workpad"));
         assert!(description.contains("create_project_comment"));
-        assert!(description.contains("create_reminder"));
         assert!(description.contains("list_activities"));
     }
 
@@ -2228,7 +2107,6 @@ mod tests {
 
         assert!(description.contains("list_projects"));
         assert!(description.contains("get_workpad"));
-        assert!(!description.contains("create_reminder"));
         assert!(!description.contains("list_activities"));
     }
 
@@ -2278,7 +2156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_todoist_routes_project_and_reminder_actions() {
+    async fn execute_todoist_routes_project_and_activity_actions() {
         let config = test_config();
         let tracker = StubTodoistTracker::default();
 
@@ -2319,15 +2197,6 @@ mod tests {
         .await;
         assert_eq!(payload_body(&project_comment)["content"], "Project note");
 
-        let reminder = execute(
-            &config,
-            &tracker,
-            TODOIST_TOOL,
-            json!({"action": "update_reminder", "reminder_id": "rem-1", "minute_offset": 15}),
-        )
-        .await;
-        assert_eq!(payload_body(&reminder)["id"], "rem-1");
-
         let activities = execute(
             &config,
             &tracker,
@@ -2339,15 +2208,6 @@ mod tests {
             payload_body(&activities)["events"][0]["event_type"],
             "updated"
         );
-
-        let deleted = execute(
-            &config,
-            &tracker,
-            TODOIST_TOOL,
-            json!({"action": "delete_reminder", "reminder_id": "rem-2"}),
-        )
-        .await;
-        assert_eq!(payload_body(&deleted)["deleted"], true);
     }
 
     #[tokio::test]
@@ -2795,29 +2655,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_todoist_maps_reminder_availability_errors() {
-        let config = test_config();
-        let tracker = ReminderErrorTracker;
-
-        let result = execute(
-            &config,
-            &tracker,
-            TODOIST_TOOL,
-            json!({"action": "create_reminder", "task_id": "task-1"}),
-        )
-        .await;
-
-        assert!(!result["success"].as_bool().expect("success"));
-        assert_eq!(
-            payload_body(&result)["error"]["message"],
-            "Todoist reminders are unavailable for this account or plan."
-        );
-    }
-
-    #[tokio::test]
     async fn execute_todoist_maps_activity_log_availability_errors() {
         let config = test_config();
-        let tracker = ReminderErrorTracker;
+        let tracker = CapabilityTracker {
+            capabilities: TrackerCapabilities {
+                comments: true,
+                reminders: false,
+                activity_log: false,
+            },
+        };
 
         let result = execute(
             &config,
@@ -2831,26 +2677,6 @@ mod tests {
         assert_eq!(
             payload_body(&result)["error"]["message"],
             "Todoist activity log is unavailable for this account or plan."
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_todoist_requires_reminder_id_for_update() {
-        let config = test_config();
-        let tracker = StubTodoistTracker::default();
-
-        let result = execute(
-            &config,
-            &tracker,
-            TODOIST_TOOL,
-            json!({"action": "update_reminder", "minute_offset": 10}),
-        )
-        .await;
-
-        assert!(!result["success"].as_bool().expect("success"));
-        assert_eq!(
-            payload_body(&result)["error"]["message"],
-            "`todoist.reminder_id` is required"
         );
     }
 }

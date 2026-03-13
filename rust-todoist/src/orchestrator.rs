@@ -554,8 +554,12 @@ impl Orchestrator {
                         notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::Shutdown => {
-                        shutdown_running(state.running.into_values().collect()).await;
-                        shutdown_retries(state.retry_attempts.into_values().collect());
+                        let running = std::mem::take(&mut state.running).into_values().collect();
+                        let retries = std::mem::take(&mut state.retry_attempts)
+                            .into_values()
+                            .collect();
+                        shutdown_running(running).await;
+                        shutdown_retries(retries);
                         notify_observers(&updates_tx, &mut update_version);
                         break;
                     }
