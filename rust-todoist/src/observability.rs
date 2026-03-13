@@ -235,9 +235,9 @@ impl Presenter {
         );
         let now_ms = snapshot.generated_at.timestamp_millis();
         let total_tokens = snapshot.codex_totals.total_tokens;
-        self.capture_token_sample(now_ms, total_tokens);
         let tps_5s = self.throttled_tps(now_ms, total_tokens);
         let graph_10m = self.tps_graph(now_ms, total_tokens);
+        self.capture_token_sample(now_ms, total_tokens);
 
         StatePayload {
             generated_at: snapshot.generated_at,
@@ -3132,7 +3132,10 @@ mod tests {
     use crate::{
         config::ObservabilityConfig,
         issue::Issue,
-        orchestrator::{IssueDetail, Orchestrator, PollingSnapshot, SnapshotCounts, TokenSnapshot},
+        orchestrator::{
+            IssueDetail, Orchestrator, PollingSnapshot, Snapshot, SnapshotCounts, SnapshotTotals,
+            TokenSnapshot,
+        },
         tracker::TrackerRateBudget,
         workflow::WorkflowStore,
     };
@@ -3693,6 +3696,43 @@ mod tests {
             first.chars().take(23).collect::<String>(),
             second.chars().take(23).collect::<String>()
         );
+    }
+
+    #[tokio::test]
+    async fn present_state_uses_prior_snapshot_for_tps() {
+        let (orchestrator, workflow_store) = test_runtime().await;
+        let mut presenter = super::Presenter::default();
+
+        let payload = |generated_at_ms, total_tokens| Snapshot {
+            generated_at: Utc.timestamp_millis_opt(generated_at_ms).single().unwrap(),
+            counts: SnapshotCounts {
+                running: 0,
+                retrying: 0,
+            },
+            running: Vec::new(),
+            retrying: Vec::new(),
+            codex_totals: SnapshotTotals {
+                input_tokens: total_tokens,
+                output_tokens: 0,
+                total_tokens,
+                seconds_running: generated_at_ms as f64 / 1_000.0,
+            },
+            rate_limits: None,
+            todoist_rate_budget: None,
+            polling: PollingSnapshot {
+                checking: false,
+                next_poll_in_ms: Some(5_000),
+                poll_interval_ms: 5_000,
+            },
+        };
+
+        let first = presenter.present_state(payload(10_000, 100), &workflow_store, None);
+        assert_eq!(first.throughput.tps_5s, 0.0);
+
+        let second = presenter.present_state(payload(11_000, 160), &workflow_store, None);
+        assert_eq!(second.throughput.tps_5s, 60.0);
+
+        orchestrator.shutdown().await;
     }
 
     #[test]
