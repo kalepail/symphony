@@ -88,6 +88,7 @@ pub struct AppServerSession {
     stdin: ChildStdin,
     stdout_rx: mpsc::UnboundedReceiver<RawLine>,
     thread_id: String,
+    dynamic_tool_payloads: Vec<dynamic_tool::ToolPayloadMetric>,
     next_request_id: u64,
     codex_app_server_pid: Option<u32>,
 }
@@ -197,6 +198,7 @@ impl AppServerClient {
             stdin,
             stdout_rx,
             thread_id: String::new(),
+            dynamic_tool_payloads: Vec::new(),
             next_request_id: 10,
             codex_app_server_pid,
         };
@@ -428,6 +430,7 @@ impl AppServerSession {
         let request_id = 2;
         let dynamic_tools =
             dynamic_tool::tool_specs_with_tracker(&self.config, self.tracker.as_ref()).await;
+        let dynamic_tool_payloads = dynamic_tool::tool_payload_metrics(&dynamic_tools);
         let payload = json!({
             "id": request_id,
             "method": "thread/start",
@@ -440,6 +443,7 @@ impl AppServerSession {
         });
         self.send_json(&payload).await?;
         let response = self.await_response(request_id, None).await?;
+        self.dynamic_tool_payloads = dynamic_tool_payloads;
         self.thread_id = response
             .get("thread")
             .and_then(|thread| thread.get("id"))
@@ -447,7 +451,7 @@ impl AppServerSession {
             .ok_or_else(|| CodexError::ResponseError(response.to_string()))?
             .to_string();
         info!(
-            "codex_thread=status=started thread_id={} worker_host={} workspace={} pid={} dynamic_tools={}",
+            "codex_thread=status=started thread_id={} worker_host={} workspace={} pid={} dynamic_tools={} dynamic_tool_bytes={}",
             self.thread_id,
             logging::worker_host_for_log(self.worker_host.as_deref()),
             self.workspace.display(),
@@ -455,8 +459,13 @@ impl AppServerSession {
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "n/a".to_string()),
             dynamic_tools.len(),
+            dynamic_tool::total_tool_payload_bytes(&self.dynamic_tool_payloads),
         );
         Ok(())
+    }
+
+    pub fn dynamic_tool_payloads(&self) -> &[dynamic_tool::ToolPayloadMetric] {
+        &self.dynamic_tool_payloads
     }
 
     async fn handle_turn_message<F>(

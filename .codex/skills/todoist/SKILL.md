@@ -2,8 +2,8 @@
 name: todoist
 description: |
   Use Symphony's `todoist` dynamic tool for Todoist task, comment, workpad,
-  reminder, activity-log, and state-transition operations during Rust Todoist
-  runtime sessions.
+  activity-log, and state-transition operations during Rust Todoist runtime
+  sessions.
 ---
 
 # Todoist Dynamic Tool
@@ -71,6 +71,11 @@ Start with these narrow reads rather than exploratory calls:
 - `get_workpad`
 - `list_activities`
 
+The default Rust Todoist workflow intentionally exposes a curated action surface.
+Project metadata, project-comment CRUD, labels, and collaborators may be hidden
+unless the runtime is configured with an extended surface. Treat those as opt-in
+paths rather than default assumptions.
+
 ## Core runtime rules
 
 Treat these as hard constraints, not style:
@@ -88,7 +93,7 @@ Treat these as hard constraints, not style:
   `section_id` is provided.
 - Use `parent_id` only for true subtasks.
 - If `tracker.label` is configured, `create_task` inherits it automatically.
-- Comments, reminders, and activity logs are plan-dependent capabilities.
+- Comments and activity logs are plan-dependent capabilities.
 
 ## High-value workflows
 
@@ -246,7 +251,6 @@ Load `references/action-recipes.md` when you need:
 
 - project comment actions
 - activity log recipes
-- reminder actions
 - expanded task move and create examples
 - a fuller action catalog than this core skill includes
 

@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use crate::{
-    observability::{Presenter, StatePayload, render_dashboard_html},
+    observability::{Presenter, SnapshotStatus, StatePayload, render_dashboard_html},
     orchestrator::{OrchestratorHandle, OrchestratorHandleError},
     workflow::WorkflowStore,
 };
@@ -208,15 +208,16 @@ async fn api_not_found() -> impl IntoResponse {
 }
 
 async fn present_state(state: &AppState) -> StatePayload {
-    let snapshot = state.orchestrator.snapshot().await;
     let mut presenter = state
         .presenter
         .lock()
         .expect("observability presenter poisoned");
-    match snapshot {
-        Ok(snapshot) => {
-            presenter.present_state(snapshot, &state.workflow_store, Some(state.dashboard_addr))
-        }
+    match state.orchestrator.cached_snapshot() {
+        Ok(cached) => presenter.present_cached_state(
+            cached,
+            &state.workflow_store,
+            Some(state.dashboard_addr),
+        ),
         Err(error) => present_snapshot_failure(
             &mut presenter,
             &state.workflow_store,
@@ -236,7 +237,7 @@ fn present_snapshot_failure(
 }
 
 fn state_payload_status(payload: &StatePayload) -> StatusCode {
-    if payload.error.is_some() {
+    if payload.snapshot_status == SnapshotStatus::Unavailable {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -256,7 +257,11 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::{observability::Presenter, orchestrator::Orchestrator, workflow::WorkflowStore};
+    use crate::{
+        observability::{Presenter, SnapshotStatus},
+        orchestrator::Orchestrator,
+        workflow::WorkflowStore,
+    };
 
     use super::{AppState, ISSUE_ROUTE, app_router};
 
@@ -378,6 +383,57 @@ mod tests {
         assert!(html.contains("id=\"error-card\""));
         assert!(html.contains("snapshot_unavailable"));
         assert!(html.contains("Todoist Operations Dashboard"));
+    }
+
+    #[test]
+    fn state_payload_status_keeps_stale_snapshots_on_http_200() {
+        let payload = crate::observability::StatePayload {
+            generated_at: chrono::Utc::now(),
+            snapshot_status: SnapshotStatus::Stale,
+            snapshot_age_ms: Some(8_000),
+            error: Some(crate::observability::ErrorPayload {
+                code: "snapshot_stale",
+                message: "Using stale orchestrator snapshot",
+            }),
+            counts: crate::orchestrator::SnapshotCounts {
+                running: 0,
+                retrying: 0,
+            },
+            agent_limits: crate::observability::AgentLimitsPayload {
+                max_concurrent_agents: 1,
+            },
+            running: Vec::new(),
+            retrying: Vec::new(),
+            codex_totals: crate::observability::CodexTotalsPayload {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                seconds_running: 0.0,
+            },
+            rate_limits: None,
+            todoist_rate_budget: None,
+            polling: crate::orchestrator::PollingSnapshot {
+                checking: true,
+                next_poll_in_ms: None,
+                poll_interval_ms: 5_000,
+            },
+            workflow: crate::observability::WorkflowPayload {
+                path: "WORKFLOW.md".to_string(),
+                dispatch_status: "ready",
+                blocking_reason: None,
+                using_last_good: false,
+            },
+            links: crate::observability::LinksPayload {
+                project_url: None,
+                dashboard_url: None,
+            },
+            throughput: crate::observability::ThroughputPayload {
+                tps_5s: 0.0,
+                graph_10m: String::new(),
+            },
+        };
+
+        assert_eq!(super::state_payload_status(&payload), StatusCode::OK);
     }
 
     #[tokio::test]

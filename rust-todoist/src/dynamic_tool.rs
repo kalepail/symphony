@@ -3,14 +3,15 @@ use reqwest::{
     Method, StatusCode,
     header::{HeaderMap, RETRY_AFTER},
 };
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::{process::Command as StdCommand, sync::OnceLock, time::Duration};
+use std::{collections::BTreeSet, process::Command as StdCommand, sync::OnceLock, time::Duration};
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::{
-    config::ServiceConfig,
+    config::{ServiceConfig, TodoistToolSurface},
     issue::normalize_state_name,
     runtime_env,
     tracker::{TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError},
@@ -33,37 +34,11 @@ const GITHUB_API_TOOL_DESCRIPTION: &str = concat!(
     "Read pull requests with GET `/repos/{owner}/{repo}/pulls/{number}`.\n",
     "Read CI checks with GET `/repos/{owner}/{repo}/commits/{sha}/check-runs`."
 );
-const TODOIST_TOOL_DESCRIPTION_SUFFIX: &str = concat!(
-    "Use this tool instead of raw HTTP. Keep each call narrow and specific.\n",
-    "Task comments require `task_id` only; project comments require `project_id` only. ",
-    "Todoist comment responses identify task comments with `item_id`.\n",
-    "Use `create_project_comment` for project comments and `upsert_workpad` for the single persistent task workpad.\n",
-    "Raw `update_comment` and `delete_comment` only support project comments. ",
-    "Use `get_workpad`, `upsert_workpad`, and `delete_workpad` for task-scoped Symphony workpad comments.\n",
-    "When `tracker.label` is configured, `create_task` automatically inherits that label. ",
-    "Top-level `create_task` calls also default into the project's `Todo` section when no section is supplied. ",
-    "Provide `origin_task_id` when creating follow-up tasks so Symphony can record the originating `TD-<task_id>` back-reference.\n",
-    "`close_task` is guarded: the task must already be in `Merging`, the workpad must contain a linked GitHub PR URL, ",
-    "and Symphony verifies that the PR is actually merged before completing the task.\n",
-    "When `get_workpad` returns a `comment_id`, pass that optional hint back into `upsert_workpad` ",
-    "so Symphony can update the workpad directly without re-listing comments."
-);
-
-const TODOIST_CORE_ACTIONS: &[&str] = &[
-    "list_projects",
-    "get_project",
-    "get_current_user",
-    "list_collaborators",
+const TODOIST_CURATED_ACTIONS: &[&str] = &[
     "list_tasks",
     "get_task",
     "list_sections",
-    "get_section",
-    "list_labels",
-    "get_comment",
     "list_comments",
-    "create_project_comment",
-    "update_comment",
-    "delete_comment",
     "get_workpad",
     "upsert_workpad",
     "delete_workpad",
@@ -73,7 +48,25 @@ const TODOIST_CORE_ACTIONS: &[&str] = &[
     "reopen_task",
     "create_task",
 ];
+const TODOIST_EXTENDED_ACTIONS: &[&str] = &[
+    "list_projects",
+    "get_project",
+    "get_current_user",
+    "list_collaborators",
+    "get_section",
+    "list_labels",
+    "get_comment",
+    "create_project_comment",
+    "update_comment",
+    "delete_comment",
+];
 const TODOIST_ACTIVITY_ACTIONS: &[&str] = &["list_activities"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolPayloadMetric {
+    pub name: String,
+    pub bytes: usize,
+}
 
 pub fn tool_specs(config: &ServiceConfig) -> Vec<Value> {
     tool_specs_with_capabilities(config, TrackerCapabilities::full())
@@ -99,8 +92,8 @@ fn tool_specs_with_capabilities(
     if matches!(config.tracker.kind.as_deref(), Some("todoist" | "memory")) {
         specs.push(json!({
             "name": TODOIST_TOOL,
-            "description": todoist_tool_description(capabilities),
-            "inputSchema": todoist_input_schema()
+            "description": todoist_tool_description(config, capabilities),
+            "inputSchema": todoist_input_schema(config, capabilities)
         }));
     }
 
@@ -132,24 +125,55 @@ fn tool_specs_with_capabilities(
     specs
 }
 
-fn todoist_tool_description(capabilities: TrackerCapabilities) -> String {
-    let actions = todoist_supported_actions(capabilities).join(", ");
+pub fn tool_payload_metrics(specs: &[Value]) -> Vec<ToolPayloadMetric> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            Some(ToolPayloadMetric {
+                name: spec.get("name")?.as_str()?.to_string(),
+                bytes: serde_json::to_vec(spec).ok()?.len(),
+            })
+        })
+        .collect()
+}
+
+pub fn total_tool_payload_bytes(metrics: &[ToolPayloadMetric]) -> usize {
+    metrics.iter().map(|metric| metric.bytes).sum()
+}
+
+fn todoist_tool_description(config: &ServiceConfig, capabilities: TrackerCapabilities) -> String {
+    let actions = todoist_supported_actions(config, capabilities).join(", ");
     format!(
-        "Execute a structured Todoist API action using Symphony's configured tracker auth.\nSupported actions: {actions}.\n{TODOIST_TOOL_DESCRIPTION_SUFFIX}"
+        concat!(
+            "Run one structured Todoist API v1 action using Symphony's configured tracker auth.\n",
+            "Supported actions for this session: {}.\n",
+            "Guardrails:\n",
+            "- Use `get_workpad`, `upsert_workpad`, and `delete_workpad` for the single task workpad.\n",
+            "- Do not use generic task-comment creation for Symphony notes. Project comments, when exposed, are for true project-level notes only.\n",
+            "- `close_task` is guarded and normally only succeeds from `Merging` after the linked GitHub PR is confirmed merged.\n",
+            "- Keep calls narrow: one Todoist action per tool call."
+        ),
+        actions,
     )
 }
 
-fn todoist_supported_actions(capabilities: TrackerCapabilities) -> Vec<&'static str> {
-    let mut actions = TODOIST_CORE_ACTIONS.to_vec();
+fn todoist_supported_actions(
+    config: &ServiceConfig,
+    capabilities: TrackerCapabilities,
+) -> Vec<&'static str> {
+    let mut actions = TODOIST_CURATED_ACTIONS.to_vec();
+    if config.tracker.todoist_tool_surface == TodoistToolSurface::Extended {
+        actions.extend_from_slice(TODOIST_EXTENDED_ACTIONS);
+    }
     if capabilities.activity_log {
         actions.extend_from_slice(TODOIST_ACTIVITY_ACTIONS);
     }
     actions
 }
 
-fn todoist_input_schema() -> Value {
+fn todoist_input_schema(config: &ServiceConfig, capabilities: TrackerCapabilities) -> Value {
     static SCHEMA: OnceLock<Value> = OnceLock::new();
-    SCHEMA
+    let mut schema = SCHEMA
         .get_or_init(|| {
             serde_json::from_str(
                 r#"{
@@ -199,7 +223,31 @@ fn todoist_input_schema() -> Value {
             )
             .expect("valid todoist input schema")
         })
-        .clone()
+        .clone();
+
+    let supported_actions = todoist_supported_actions(config, capabilities);
+    let supported_action_set = supported_actions.iter().copied().collect::<BTreeSet<_>>();
+    let mut allowed_fields = BTreeSet::new();
+    allowed_fields.insert("action");
+    for action in &supported_actions {
+        let (allowed, _) = todoist_action_contract(action).expect("supported action contract");
+        allowed_fields.extend(allowed.iter().copied());
+    }
+
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("todoist schema properties");
+    properties.retain(|key, _| allowed_fields.contains(key.as_str()));
+    if let Some(action_property) = properties.get_mut("action").and_then(Value::as_object_mut) {
+        action_property.insert("enum".to_string(), json!(supported_action_set));
+        action_property.insert(
+            "description".to_string(),
+            Value::String("Todoist action to execute for this session.".to_string()),
+        );
+    }
+
+    schema
 }
 
 pub async fn execute(
@@ -1706,14 +1754,14 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use crate::{
-        config::ServiceConfig,
+        config::{ServiceConfig, TodoistToolSurface},
         issue::Issue,
         tracker::{TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError},
     };
 
     use super::{
         GITHUB_API_TOOL, TODOIST_TOOL, compact_workpad_content, execute, extract_github_pr_url,
-        tool_specs, tool_specs_with_tracker,
+        tool_payload_metrics, tool_specs, tool_specs_with_tracker,
     };
 
     #[derive(Clone, Default)]
@@ -2064,32 +2112,65 @@ mod tests {
         .expect("config")
     }
 
+    fn extended_test_config() -> ServiceConfig {
+        let mut config = test_config();
+        config.tracker.todoist_tool_surface = TodoistToolSurface::Extended;
+        config
+    }
+
     fn payload_body(result: &Value) -> Value {
         let text = result["contentItems"][0]["text"].as_str().expect("text");
         serde_json::from_str(text).expect("json body")
     }
 
     #[tokio::test]
-    async fn tool_specs_describe_expanded_todoist_surface() {
+    async fn tool_specs_default_to_curated_todoist_surface() {
         let specs = tool_specs(&test_config());
         let todoist = specs
             .into_iter()
             .find(|spec| spec["name"] == TODOIST_TOOL)
             .expect("todoist tool");
         let description = todoist["description"].as_str().expect("description");
+        let schema = todoist["inputSchema"].as_object().expect("schema");
+        let properties = schema["properties"].as_object().expect("properties");
+        let action_enum = properties["action"]["enum"]
+            .as_array()
+            .expect("action enum");
 
-        assert!(description.contains("list_projects"));
-        assert!(description.contains("list_collaborators"));
-        assert!(description.contains("list_labels"));
-        assert!(description.contains("get_comment"));
-        assert!(description.contains("delete_comment"));
         assert!(description.contains("upsert_workpad"));
-        assert!(description.contains("create_project_comment"));
         assert!(description.contains("list_activities"));
+        assert!(!description.contains("list_projects"));
+        assert!(!description.contains("create_project_comment"));
+        assert!(!description.contains("create_reminder"));
+        assert!(!properties.contains_key("reminder_id"));
+        assert!(!properties.contains_key("uids_to_notify"));
+        assert!(action_enum.iter().all(|value| value != "list_projects"));
+        assert!(action_enum.iter().any(|value| value == "get_workpad"));
     }
 
     #[tokio::test]
-    async fn tool_specs_hide_optional_actions_when_tracker_capabilities_disable_them() {
+    async fn tool_specs_extended_surface_restores_non_default_actions() {
+        let specs = tool_specs(&extended_test_config());
+        let todoist = specs
+            .into_iter()
+            .find(|spec| spec["name"] == TODOIST_TOOL)
+            .expect("todoist tool");
+        let description = todoist["description"].as_str().expect("description");
+        let properties = todoist["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties");
+
+        assert!(description.contains("list_projects"));
+        assert!(description.contains("create_project_comment"));
+        assert!(description.contains("list_activities"));
+        assert!(properties.contains_key("uids_to_notify"));
+        assert!(description.contains("list_activities"));
+        assert!(!description.contains("create_reminder"));
+        assert!(!properties.contains_key("reminder_id"));
+    }
+
+    #[tokio::test]
+    async fn tool_specs_hide_optional_capability_actions_when_tracker_capabilities_disable_them() {
         let tracker = CapabilityTracker {
             capabilities: TrackerCapabilities {
                 comments: true,
@@ -2098,16 +2179,33 @@ mod tests {
             },
         };
 
-        let specs = tool_specs_with_tracker(&test_config(), &tracker).await;
+        let specs = tool_specs_with_tracker(&extended_test_config(), &tracker).await;
         let todoist = specs
             .into_iter()
             .find(|spec| spec["name"] == TODOIST_TOOL)
             .expect("todoist tool");
         let description = todoist["description"].as_str().expect("description");
+        let properties = todoist["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties");
 
         assert!(description.contains("list_projects"));
         assert!(description.contains("get_workpad"));
         assert!(!description.contains("list_activities"));
+        assert!(!properties.contains_key("reminder_id"));
+        assert!(!properties.contains_key("date_from"));
+    }
+
+    #[test]
+    fn tool_payload_metrics_report_serialized_tool_sizes() {
+        let specs = tool_specs(&test_config());
+        let metrics = tool_payload_metrics(&specs);
+        let todoist = metrics
+            .iter()
+            .find(|metric| metric.name == TODOIST_TOOL)
+            .expect("todoist metrics");
+
+        assert!(todoist.bytes > 0);
     }
 
     #[test]

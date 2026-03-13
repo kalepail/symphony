@@ -217,7 +217,10 @@ impl MemoryTracker {
                     .cloned()
                     .collect::<Vec<_>>();
                 let (todoist_comments, todoist_comments_truncated) =
-                    todoist_review_comments_from_values(&comments);
+                    todoist_review_comments_from_values(
+                        &comments,
+                        &self.config.tracker.todoist_prompt_comment_limits,
+                    );
                 issue.todoist_comments = todoist_comments;
                 issue.todoist_comments_truncated = todoist_comments_truncated;
                 issue

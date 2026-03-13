@@ -21,8 +21,9 @@ use crate::{
     config::ObservabilityConfig,
     issue::Issue,
     orchestrator::{
-        IssueDetail, OrchestratorHandle, OrchestratorHandleError, PollingSnapshot, RecentEvent,
-        RetrySnapshot, Snapshot, SnapshotCounts, TokenSnapshot,
+        CachedSnapshot, IssueDetail, OrchestratorHandle, OrchestratorHandleError, PollingSnapshot,
+        RecentEvent, RetrySnapshot, RunningContextSnapshot, Snapshot, SnapshotCounts,
+        SnapshotFreshness, TokenSnapshot,
     },
     tracker::TrackerRateBudget,
     workflow::WorkflowStore,
@@ -53,6 +54,9 @@ struct TerminalViewport {
 #[derive(Clone, Debug, Serialize)]
 pub struct StatePayload {
     pub generated_at: DateTime<Utc>,
+    pub snapshot_status: SnapshotStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorPayload>,
     pub counts: SnapshotCounts,
@@ -66,6 +70,14 @@ pub struct StatePayload {
     pub workflow: WorkflowPayload,
     pub links: LinksPayload,
     pub throughput: ThroughputPayload,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStatus {
+    Fresh,
+    Stale,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,6 +113,8 @@ pub struct RunningEntryPayload {
     pub runtime_seconds: f64,
     pub workspace: String,
     pub tokens: TokenSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<RunningContextSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,6 +185,8 @@ pub struct IssueRunningPayload {
     pub last_event_at: Option<DateTime<Utc>>,
     pub runtime_seconds: f64,
     pub tokens: TokenSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<RunningContextSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -202,9 +218,41 @@ pub struct Presenter {
 }
 
 impl Presenter {
+    pub fn present_cached_state(
+        &mut self,
+        cached: CachedSnapshot,
+        workflow_store: &WorkflowStore,
+        dashboard_addr: Option<SocketAddr>,
+    ) -> StatePayload {
+        self.present_state_with_freshness(
+            cached.snapshot,
+            cached.freshness,
+            Some(cached.age_ms),
+            workflow_store,
+            dashboard_addr,
+        )
+    }
+
     pub fn present_state(
         &mut self,
         snapshot: Snapshot,
+        workflow_store: &WorkflowStore,
+        dashboard_addr: Option<SocketAddr>,
+    ) -> StatePayload {
+        self.present_state_with_freshness(
+            snapshot,
+            SnapshotFreshness::Fresh,
+            Some(0),
+            workflow_store,
+            dashboard_addr,
+        )
+    }
+
+    fn present_state_with_freshness(
+        &mut self,
+        snapshot: Snapshot,
+        freshness: SnapshotFreshness,
+        snapshot_age_ms: Option<u64>,
         workflow_store: &WorkflowStore,
         dashboard_addr: Option<SocketAddr>,
     ) -> StatePayload {
@@ -241,7 +289,12 @@ impl Presenter {
 
         StatePayload {
             generated_at: snapshot.generated_at,
-            error: None,
+            snapshot_status: match freshness {
+                SnapshotFreshness::Fresh => SnapshotStatus::Fresh,
+                SnapshotFreshness::Stale => SnapshotStatus::Stale,
+            },
+            snapshot_age_ms,
+            error: stale_snapshot_error(freshness),
             counts: snapshot.counts,
             agent_limits: AgentLimitsPayload {
                 max_concurrent_agents: effective.config.agent.max_concurrent_agents,
@@ -275,6 +328,7 @@ impl Presenter {
                         runtime_seconds: runtime_seconds(snapshot.generated_at, entry.started_at),
                         workspace: entry.workspace,
                         tokens: entry.tokens,
+                        context: entry.context,
                     }
                 })
                 .collect(),
@@ -340,6 +394,8 @@ impl Presenter {
 
         StatePayload {
             generated_at: Utc::now(),
+            snapshot_status: SnapshotStatus::Unavailable,
+            snapshot_age_ms: None,
             error: Some(snapshot_error_payload(error)),
             counts: SnapshotCounts {
                 running: 0,
@@ -414,6 +470,7 @@ impl Presenter {
                     last_event_at: running.last_event_at,
                     runtime_seconds: runtime_seconds(Utc::now(), running.started_at),
                     tokens: running.tokens,
+                    context: running.context,
                 }
             }),
             retry: detail.retry.map(|retry| IssueRetryPayload {
@@ -810,6 +867,13 @@ fn render_terminal_dashboard(
             colorize(dashboard_url, ANSI_CYAN)
         ));
     }
+    if payload.snapshot_status == SnapshotStatus::Stale {
+        lines.push(format!(
+            "{}{}",
+            colorize("│ Snapshot: ", ANSI_BOLD),
+            colorize(&format_snapshot_health(payload), ANSI_YELLOW)
+        ));
+    }
     lines.push(format!(
         "{}{}",
         colorize("│ Next refresh: ", ANSI_BOLD),
@@ -1119,9 +1183,9 @@ async fn refresh_terminal_dashboard(
     render_interval_ms: u64,
     task_renderer: &Arc<dyn Fn(String) + Send + Sync>,
 ) {
-    let next = match orchestrator.snapshot().await {
-        Ok(snapshot) => {
-            let payload = presenter.present_state(snapshot, workflow_store, dashboard_addr);
+    let next = match orchestrator.cached_snapshot() {
+        Ok(cached) => {
+            let payload = presenter.present_cached_state(cached, workflow_store, dashboard_addr);
             render_state.last_polling = Some(payload.polling.clone());
             render_terminal_dashboard(&payload, Some(current_terminal_viewport()))
         }
@@ -2209,6 +2273,16 @@ fn snapshot_error_payload(error: OrchestratorHandleError) -> ErrorPayload {
     }
 }
 
+fn stale_snapshot_error(freshness: SnapshotFreshness) -> Option<ErrorPayload> {
+    match freshness {
+        SnapshotFreshness::Fresh => None,
+        SnapshotFreshness::Stale => Some(ErrorPayload {
+            code: "snapshot_stale",
+            message: "Using stale orchestrator snapshot",
+        }),
+    }
+}
+
 fn inline_text(value: &str) -> String {
     let collapsed = sanitize_display_text(value);
     truncate_chars(&collapsed, 80)
@@ -2548,6 +2622,25 @@ fn format_polling_status(polling: &PollingSnapshot) -> String {
         format!("{}s", next_poll_in_ms.div_ceil(1_000))
     } else {
         "n/a".to_string()
+    }
+}
+
+fn format_snapshot_health(payload: &StatePayload) -> String {
+    match payload.snapshot_status {
+        SnapshotStatus::Fresh => "fresh".to_string(),
+        SnapshotStatus::Stale => payload
+            .snapshot_age_ms
+            .map(|age_ms| format!("stale (age {})", format_age_ms(age_ms)))
+            .unwrap_or_else(|| "stale".to_string()),
+        SnapshotStatus::Unavailable => "unavailable".to_string(),
+    }
+}
+
+fn format_age_ms(age_ms: u64) -> String {
+    if age_ms < 1_000 {
+        format!("{age_ms}ms")
+    } else {
+        format!("{:.1}s", age_ms as f64 / 1_000.0)
     }
 }
 
@@ -2995,7 +3088,8 @@ const DASHBOARD_JS: &str = r#"
       if (payload.error) {
         errorCard.hidden = false;
         errorTitle.textContent = payload.error.message || 'Observability degraded';
-        errorCopy.textContent = payload.error.code || 'unknown_error';
+        const ageText = payload.snapshot_age_ms != null ? ` (${payload.snapshot_age_ms}ms old)` : '';
+        errorCopy.textContent = `${payload.error.code || 'unknown_error'}${ageText}`;
       } else {
         errorCard.hidden = true;
         errorTitle.textContent = 'Observability degraded';
@@ -3735,6 +3829,52 @@ mod tests {
         orchestrator.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn present_cached_state_marks_stale_snapshots_as_degraded() {
+        let (orchestrator, workflow_store) = test_runtime().await;
+        let mut presenter = super::Presenter::default();
+
+        let payload = presenter.present_cached_state(
+            crate::orchestrator::CachedSnapshot {
+                snapshot: Snapshot {
+                    generated_at: Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap(),
+                    counts: SnapshotCounts {
+                        running: 0,
+                        retrying: 0,
+                    },
+                    running: Vec::new(),
+                    retrying: Vec::new(),
+                    codex_totals: SnapshotTotals {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        total_tokens: 120,
+                        seconds_running: 12.0,
+                    },
+                    rate_limits: None,
+                    todoist_rate_budget: None,
+                    polling: PollingSnapshot {
+                        checking: true,
+                        next_poll_in_ms: None,
+                        poll_interval_ms: 5_000,
+                    },
+                },
+                freshness: crate::orchestrator::SnapshotFreshness::Stale,
+                age_ms: 8_000,
+            },
+            &workflow_store,
+            None,
+        );
+
+        orchestrator.shutdown().await;
+
+        assert_eq!(payload.snapshot_status, super::SnapshotStatus::Stale);
+        assert_eq!(payload.snapshot_age_ms, Some(8_000));
+        assert_eq!(
+            payload.error.as_ref().map(|error| error.code),
+            Some("snapshot_stale")
+        );
+    }
+
     #[test]
     fn humanizes_known_blocking_reasons() {
         assert_eq!(
@@ -4019,6 +4159,8 @@ mod tests {
     fn sample_payload() -> StatePayload {
         StatePayload {
             generated_at: Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap(),
+            snapshot_status: super::SnapshotStatus::Fresh,
+            snapshot_age_ms: Some(0),
             error: None,
             counts: SnapshotCounts {
                 running: 1,
@@ -4052,6 +4194,7 @@ mod tests {
                     output_tokens: 7,
                     total_tokens: 18,
                 },
+                context: None,
             }],
             retrying: vec![crate::orchestrator::RetrySnapshot {
                 issue_id: "issue-456".to_string(),

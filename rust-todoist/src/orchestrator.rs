@@ -3,6 +3,7 @@ use std::{
     future::Future,
     path::PathBuf,
     process::Command as StdCommand,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -39,11 +40,13 @@ const HANDLE_COMMAND_TIMEOUT_SECS: u64 = 5;
 pub struct OrchestratorHandle {
     tx: mpsc::Sender<Command>,
     updates: watch::Receiver<u64>,
+    snapshot_cache: Arc<Mutex<SnapshotCache>>,
 }
 
 pub struct Orchestrator {
     tx: mpsc::Sender<Command>,
     updates: watch::Receiver<u64>,
+    snapshot_cache: Arc<Mutex<SnapshotCache>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -51,6 +54,19 @@ pub struct Orchestrator {
 pub enum OrchestratorHandleError {
     TimedOut,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotFreshness {
+    Fresh,
+    Stale,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedSnapshot {
+    pub snapshot: Snapshot,
+    pub freshness: SnapshotFreshness,
+    pub age_ms: u64,
 }
 
 #[derive(Default)]
@@ -69,6 +85,19 @@ struct State {
     codex_totals: CodexTotals,
     codex_rate_limits: Option<Value>,
     todoist_rate_budget: Option<TrackerRateBudget>,
+    context_metrics: BTreeMap<String, RunningContextSnapshot>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SnapshotCache {
+    latest: Option<PublishedSnapshot>,
+    available: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedSnapshot {
+    snapshot: Snapshot,
+    published_at: Instant,
 }
 
 struct RunningEntry {
@@ -319,6 +348,8 @@ pub struct RunningSnapshot {
     pub last_event_at: Option<DateTime<Utc>>,
     pub workspace: String,
     pub tokens: TokenSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<RunningContextSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -354,6 +385,41 @@ pub struct PollingSnapshot {
     pub checking: bool,
     pub next_poll_in_ms: Option<u64>,
     pub poll_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RunningContextSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_start: Option<ThreadStartContextSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_start: Option<TurnStartContextSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ThreadStartContextSnapshot {
+    pub total_dynamic_tool_bytes: usize,
+    pub dynamic_tools: Vec<DynamicToolContextSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DynamicToolContextSnapshot {
+    pub name: String,
+    pub bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TurnStartContextSnapshot {
+    pub turn_number: u32,
+    pub kind: String,
+    pub prompt_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_template_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_issue_context_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preloaded_comment_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preloaded_comment_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -396,6 +462,8 @@ pub struct RunningDetail {
     pub last_message: Option<String>,
     pub last_event_at: Option<DateTime<Utc>>,
     pub tokens: TokenSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<RunningContextSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -423,6 +491,11 @@ enum Command {
         worker_host: Option<String>,
         workspace_path: PathBuf,
         workspace_location: String,
+        thread_context: ThreadStartContextSnapshot,
+    },
+    WorkerTurnContext {
+        issue_id: String,
+        turn_context: TurnStartContextSnapshot,
     },
     WorkerUpdate {
         issue_id: String,
@@ -473,16 +546,23 @@ impl Orchestrator {
         let initial_todoist_rate_budget = tracker.rate_budget().await;
         let (tx, mut rx) = mpsc::channel(256);
         let (updates_tx, updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(SnapshotCache {
+            latest: None,
+            available: true,
+        }));
+        let initial_state = State {
+            poll_interval_ms: effective.config.polling.interval_ms,
+            max_concurrent_agents: effective.config.agent.max_concurrent_agents,
+            max_retry_backoff_ms: effective.config.agent.max_retry_backoff_ms,
+            todoist_rate_budget: initial_todoist_rate_budget,
+            validated_startup_config: Some(effective.config.clone()),
+            ..State::default()
+        };
+        publish_snapshot_cache(&snapshot_cache, build_snapshot(&initial_state));
         let join_tx = tx.clone();
+        let task_snapshot_cache = Arc::clone(&snapshot_cache);
         let join = tokio::spawn(async move {
-            let mut state = State {
-                poll_interval_ms: effective.config.polling.interval_ms,
-                max_concurrent_agents: effective.config.agent.max_concurrent_agents,
-                max_retry_backoff_ms: effective.config.agent.max_retry_backoff_ms,
-                todoist_rate_budget: initial_todoist_rate_budget,
-                validated_startup_config: Some(effective.config.clone()),
-                ..State::default()
-            };
+            let mut state = initial_state;
             let mut update_version = 0u64;
 
             tokio::spawn(run_startup_terminal_cleanup(
@@ -501,6 +581,7 @@ impl Orchestrator {
                             &mut state,
                             &updates_tx,
                             &mut update_version,
+                            &task_snapshot_cache,
                         )
                         .await;
                     }
@@ -509,6 +590,7 @@ impl Orchestrator {
                         worker_host,
                         workspace_path,
                         workspace_location,
+                        thread_context,
                     } => {
                         integrate_worker_runtime_info(
                             &mut state,
@@ -516,20 +598,53 @@ impl Orchestrator {
                             worker_host,
                             workspace_path,
                             workspace_location,
+                            thread_context,
                         );
-                        notify_observers(&updates_tx, &mut update_version);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
+                    }
+                    Command::WorkerTurnContext {
+                        issue_id,
+                        turn_context,
+                    } => {
+                        integrate_worker_turn_context(&mut state, &issue_id, turn_context);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                     }
                     Command::WorkerUpdate { issue_id, event } => {
                         integrate_worker_update(&mut state, &issue_id, *event);
-                        notify_observers(&updates_tx, &mut update_version);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                     }
                     Command::WorkerExit { issue_id, result } => {
                         handle_worker_exit(&mut state, &join_tx, &issue_id, *result);
-                        notify_observers(&updates_tx, &mut update_version);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                     }
                     Command::RetryIssue { issue_id } => {
                         handle_retry_issue(&workflow_store, &join_tx, &mut state, &issue_id).await;
-                        notify_observers(&updates_tx, &mut update_version);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                     }
                     Command::Snapshot { reply } => {
                         let _ = reply.send(build_snapshot(&state));
@@ -551,25 +666,37 @@ impl Orchestrator {
                             requested_at: Utc::now(),
                             operations: vec!["poll", "reconcile"],
                         });
-                        notify_observers(&updates_tx, &mut update_version);
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                     }
                     Command::Shutdown => {
                         let running = std::mem::take(&mut state.running).into_values().collect();
                         let retries = std::mem::take(&mut state.retry_attempts)
                             .into_values()
                             .collect();
+                        notify_observers(
+                            &updates_tx,
+                            &mut update_version,
+                            &task_snapshot_cache,
+                            &state,
+                        );
                         shutdown_running(running).await;
                         shutdown_retries(retries);
-                        notify_observers(&updates_tx, &mut update_version);
                         break;
                     }
                 }
             }
+            mark_snapshot_cache_unavailable(&task_snapshot_cache);
         });
 
         Ok(Self {
             tx,
             updates: updates_rx,
+            snapshot_cache,
             join: Some(join),
         })
     }
@@ -578,6 +705,7 @@ impl Orchestrator {
         OrchestratorHandle {
             tx: self.tx.clone(),
             updates: self.updates.clone(),
+            snapshot_cache: Arc::clone(&self.snapshot_cache),
         }
     }
 
@@ -645,6 +773,26 @@ impl OrchestratorHandle {
         self.updates.clone()
     }
 
+    pub fn cached_snapshot(&self) -> Result<CachedSnapshot, OrchestratorHandleError> {
+        let cache = self
+            .snapshot_cache
+            .lock()
+            .expect("orchestrator snapshot cache poisoned");
+        if !cache.available {
+            return Err(OrchestratorHandleError::Unavailable);
+        }
+        let published = cache
+            .latest
+            .as_ref()
+            .ok_or(OrchestratorHandleError::Unavailable)?;
+        let age = published.published_at.elapsed();
+        Ok(CachedSnapshot {
+            snapshot: published.snapshot.clone(),
+            freshness: snapshot_freshness_for_age(&published.snapshot, age),
+            age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
+        })
+    }
+
     pub async fn snapshot(&self) -> Result<Snapshot, OrchestratorHandleError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         timeout(
@@ -703,12 +851,13 @@ async fn run_tick(
     state: &mut State,
     updates: &watch::Sender<u64>,
     update_version: &mut u64,
+    snapshot_cache: &Arc<Mutex<SnapshotCache>>,
 ) {
     workflow_store.refresh_if_changed();
     refresh_runtime_config(workflow_store, state);
     state.poll_check_in_progress = true;
     state.next_poll_due_at = None;
-    notify_observers(updates, update_version);
+    notify_observers(updates, update_version, snapshot_cache, state);
 
     reconcile_running_issues(workflow_store, tx, state).await;
 
@@ -726,7 +875,7 @@ async fn run_tick(
                             error!("dispatch=status=blocked reason={error}");
                             schedule_next_tick(tx, state);
                             state.poll_check_in_progress = false;
-                            notify_observers(updates, update_version);
+                            notify_observers(updates, update_version, snapshot_cache, state);
                             return;
                         }
                     };
@@ -737,7 +886,7 @@ async fn run_tick(
                             error!("dispatch=status=blocked reason={error}");
                             schedule_next_tick(tx, state);
                             state.poll_check_in_progress = false;
-                            notify_observers(updates, update_version);
+                            notify_observers(updates, update_version, snapshot_cache, state);
                             return;
                         }
                         mark_startup_validated(state, &effective.config);
@@ -780,10 +929,16 @@ async fn run_tick(
 
     state.poll_check_in_progress = false;
     schedule_next_tick(tx, state);
-    notify_observers(updates, update_version);
+    notify_observers(updates, update_version, snapshot_cache, state);
 }
 
-fn notify_observers(updates: &watch::Sender<u64>, update_version: &mut u64) {
+fn notify_observers(
+    updates: &watch::Sender<u64>,
+    update_version: &mut u64,
+    snapshot_cache: &Arc<Mutex<SnapshotCache>>,
+    state: &State,
+) {
+    publish_snapshot_cache(snapshot_cache, build_snapshot(state));
     *update_version = update_version.wrapping_add(1);
     let _ = updates.send(*update_version);
 }
@@ -792,6 +947,51 @@ fn schedule_next_tick(tx: &mpsc::Sender<Command>, state: &mut State) {
     let delay = next_poll_delay(state);
     state.next_poll_due_at = Some(Instant::now() + delay);
     schedule_tick(tx, delay.as_millis() as u64);
+}
+
+fn publish_snapshot_cache(snapshot_cache: &Arc<Mutex<SnapshotCache>>, snapshot: Snapshot) {
+    let mut cache = snapshot_cache
+        .lock()
+        .expect("orchestrator snapshot cache poisoned");
+    cache.available = true;
+    cache.latest = Some(PublishedSnapshot {
+        snapshot,
+        published_at: Instant::now(),
+    });
+}
+
+fn mark_snapshot_cache_unavailable(snapshot_cache: &Arc<Mutex<SnapshotCache>>) {
+    let mut cache = snapshot_cache
+        .lock()
+        .expect("orchestrator snapshot cache poisoned");
+    cache.available = false;
+    cache.latest = None;
+}
+
+fn snapshot_freshness_for_age(snapshot: &Snapshot, age: Duration) -> SnapshotFreshness {
+    if age <= snapshot_stale_after(snapshot) {
+        SnapshotFreshness::Fresh
+    } else {
+        SnapshotFreshness::Stale
+    }
+}
+
+fn snapshot_stale_after(snapshot: &Snapshot) -> Duration {
+    const STALE_GRACE_MS: u64 = 5_000;
+    const MAX_CHECKING_STALE_AFTER_MS: u64 = 15_000;
+
+    let poll_interval_ms = snapshot.polling.poll_interval_ms.max(1);
+    let stale_after_ms = if snapshot.polling.checking {
+        poll_interval_ms
+            .min(MAX_CHECKING_STALE_AFTER_MS)
+            .max(STALE_GRACE_MS)
+    } else if let Some(next_poll_in_ms) = snapshot.polling.next_poll_in_ms {
+        next_poll_in_ms.saturating_add(STALE_GRACE_MS)
+    } else {
+        poll_interval_ms.max(STALE_GRACE_MS)
+    };
+
+    Duration::from_millis(stale_after_ms)
 }
 
 fn next_poll_delay(state: &State) -> Duration {
@@ -1432,6 +1632,7 @@ async fn dispatch_issue(
                     recent_events: Vec::new(),
                 },
             );
+            state.context_metrics.remove(&issue_id);
             state.claimed.insert(issue_id.clone());
             state.retry_attempts.remove(&issue_id);
             info!(
@@ -1461,6 +1662,7 @@ fn handle_worker_exit(
     let Some(running) = state.running.remove(issue_id) else {
         return;
     };
+    state.context_metrics.remove(issue_id);
     add_runtime_seconds(state, &running);
     let session_id = running
         .session_id
@@ -1776,6 +1978,7 @@ fn integrate_worker_runtime_info(
     worker_host: Option<String>,
     workspace_path: PathBuf,
     workspace_location: String,
+    thread_context: ThreadStartContextSnapshot,
 ) {
     let Some(running) = state.running.get_mut(issue_id) else {
         return;
@@ -1783,6 +1986,23 @@ fn integrate_worker_runtime_info(
     running.worker_host = worker_host;
     running.workspace_path = workspace_path;
     running.workspace_location = workspace_location;
+    state
+        .context_metrics
+        .entry(issue_id.to_string())
+        .or_default()
+        .thread_start = Some(thread_context);
+}
+
+fn integrate_worker_turn_context(
+    state: &mut State,
+    issue_id: &str,
+    turn_context: TurnStartContextSnapshot,
+) {
+    state
+        .context_metrics
+        .entry(issue_id.to_string())
+        .or_default()
+        .last_turn_start = Some(turn_context);
 }
 
 fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent) {
@@ -1955,6 +2175,7 @@ fn build_snapshot(state: &State) -> Snapshot {
                     output_tokens: running.codex_output_tokens,
                     total_tokens: running.codex_total_tokens,
                 },
+                context: state.context_metrics.get(issue_id).cloned(),
             })
             .collect(),
         retrying: state
@@ -2033,6 +2254,9 @@ fn build_issue_detail(
     let issue_id = running
         .map(|running| running.issue.id.clone())
         .or_else(|| retry_entry.map(|(issue_id, _)| issue_id.clone()));
+    let running_context = issue_id
+        .as_ref()
+        .and_then(|issue_id| state.context_metrics.get(issue_id).cloned());
     let tracked_issue = running
         .map(|running| running.issue.clone())
         .or_else(|| retry.and_then(|retry| retry.tracked_issue.clone()));
@@ -2075,6 +2299,7 @@ fn build_issue_detail(
                 output_tokens: running.codex_output_tokens,
                 total_tokens: running.codex_total_tokens,
             },
+            context: running_context.clone(),
         }),
         retry: retry.map(|retry| RetryDetail {
             attempt: retry.attempt,
@@ -2098,6 +2323,48 @@ fn build_issue_detail(
         last_error_stage: retry.and_then(|retry| retry.error_stage.clone()),
         last_error_kind: retry.and_then(|retry| retry.error_kind.clone()),
     })
+}
+
+fn thread_start_context_snapshot(
+    metrics: &[crate::dynamic_tool::ToolPayloadMetric],
+) -> ThreadStartContextSnapshot {
+    ThreadStartContextSnapshot {
+        total_dynamic_tool_bytes: metrics.iter().map(|metric| metric.bytes).sum(),
+        dynamic_tools: metrics
+            .iter()
+            .map(|metric| DynamicToolContextSnapshot {
+                name: metric.name.clone(),
+                bytes: metric.bytes,
+            })
+            .collect(),
+    }
+}
+
+fn log_turn_context(issue: &Issue, worker_host: Option<&str>, context: &TurnStartContextSnapshot) {
+    info!(
+        "codex_context=status=turn_start {} worker_host={} kind={} turn={} prompt_bytes={} workflow_template_bytes={} issue_context_bytes={} preloaded_comment_bytes={} preloaded_comment_count={}",
+        crate::logging::issue_context(issue),
+        crate::logging::worker_host_for_log(worker_host),
+        context.kind,
+        context.turn_number,
+        context.prompt_bytes,
+        context
+            .workflow_template_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .rendered_issue_context_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .preloaded_comment_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .preloaded_comment_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
 }
 
 async fn shutdown_running(entries: Vec<RunningEntry>) {
@@ -2350,6 +2617,7 @@ async fn run_worker(
             worker_host: worker_host.clone(),
             workspace_path: workspace.path.clone(),
             workspace_location: workspace.path.display().to_string(),
+            thread_context: thread_start_context_snapshot(session.dynamic_tool_payloads()),
         })
         .await;
 
@@ -2381,20 +2649,56 @@ async fn run_worker(
                 ));
             }
             let workflow = workflow_store.effective();
-            let prompt = if turn_number == 1 {
-                prompt::build_issue_prompt(&workflow.definition, &current_issue, attempt).map_err(
-                    |error| {
-                        WorkerError::new(
-                            WorkerErrorStage::TurnRun,
-                            WorkerErrorKind::TurnFailure,
-                            worker_host.clone(),
-                            error.to_string(),
-                        )
+            let (prompt, turn_context) = if turn_number == 1 {
+                let built = prompt::build_issue_prompt_with_metrics(
+                    &workflow.definition,
+                    &current_issue,
+                    attempt,
+                )
+                .map_err(|error| {
+                    WorkerError::new(
+                        WorkerErrorStage::TurnRun,
+                        WorkerErrorKind::TurnFailure,
+                        worker_host.clone(),
+                        error.to_string(),
+                    )
+                })?;
+                (
+                    built.prompt,
+                    TurnStartContextSnapshot {
+                        turn_number: turn_number as u32,
+                        kind: "initial".to_string(),
+                        prompt_bytes: built.metrics.prompt_bytes,
+                        workflow_template_bytes: Some(built.metrics.workflow_template_bytes),
+                        rendered_issue_context_bytes: Some(
+                            built.metrics.rendered_issue_context_bytes,
+                        ),
+                        preloaded_comment_bytes: Some(built.metrics.preloaded_comment_bytes),
+                        preloaded_comment_count: Some(built.metrics.preloaded_comment_count),
                     },
-                )?
+                )
             } else {
-                prompt::continuation_guidance(turn_number, max_turns)
+                let prompt = prompt::continuation_guidance(turn_number, max_turns);
+                (
+                    prompt.clone(),
+                    TurnStartContextSnapshot {
+                        turn_number: turn_number as u32,
+                        kind: "continuation".to_string(),
+                        prompt_bytes: prompt.len(),
+                        workflow_template_bytes: None,
+                        rendered_issue_context_bytes: None,
+                        preloaded_comment_bytes: None,
+                        preloaded_comment_count: None,
+                    },
+                )
             };
+            log_turn_context(&current_issue, worker_host.as_deref(), &turn_context);
+            let _ = tx
+                .send(Command::WorkerTurnContext {
+                    issue_id: current_issue.id.clone(),
+                    turn_context: turn_context.clone(),
+                })
+                .await;
             let guarded_close_for_turn =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let guarded_close_events = std::sync::Arc::clone(&guarded_close_for_turn);
@@ -2538,11 +2842,13 @@ mod tests {
     use crate::tracker::TrackerRateBudget;
 
     use super::{
-        Orchestrator, OrchestratorHandle, OrchestratorHandleError, RetryEntry, RunningEntry, State,
-        WorkerDisposition, WorkerError, WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig,
-        WorkerSelection, build_snapshot, candidate_issue, dispatch_issue,
-        guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
-        handle_worker_exit, next_poll_delay, run_startup_terminal_cleanup, select_worker_host,
+        DynamicToolContextSnapshot, Orchestrator, OrchestratorHandle, OrchestratorHandleError,
+        PollingSnapshot, RetryEntry, RunningEntry, Snapshot, SnapshotCounts, SnapshotFreshness,
+        SnapshotTotals, State, ThreadStartContextSnapshot, WorkerDisposition, WorkerError,
+        WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig, WorkerSelection, build_snapshot,
+        candidate_issue, dispatch_issue, guarded_close_transition_may_be_in_flight,
+        handle_retry_issue_with_tracker, handle_worker_exit, next_poll_delay,
+        run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
     };
@@ -2816,12 +3122,27 @@ mod tests {
             Some("ssh-b".to_string()),
             PathBuf::from("/srv/symphony/ABC-1"),
             "/srv/symphony/ABC-1".to_string(),
+            ThreadStartContextSnapshot {
+                total_dynamic_tool_bytes: 123,
+                dynamic_tools: vec![DynamicToolContextSnapshot {
+                    name: "todoist".to_string(),
+                    bytes: 123,
+                }],
+            },
         );
 
         let running = state.running.get("issue-1").expect("running entry");
         assert_eq!(running.worker_host.as_deref(), Some("ssh-b"));
         assert_eq!(running.workspace_path, PathBuf::from("/srv/symphony/ABC-1"));
         assert_eq!(running.workspace_location, "/srv/symphony/ABC-1");
+        assert_eq!(
+            state
+                .context_metrics
+                .get("issue-1")
+                .and_then(|context| context.thread_start.as_ref())
+                .map(|context| context.total_dynamic_tool_bytes),
+            Some(123)
+        );
     }
 
     #[tokio::test]
@@ -3125,12 +3446,102 @@ mod tests {
         let handle = OrchestratorHandle {
             tx,
             updates: updates_rx,
+            snapshot_cache: Arc::new(Mutex::new(super::SnapshotCache {
+                latest: None,
+                available: true,
+            })),
         };
 
         assert!(matches!(
             handle.issue_detail("ABC-1".to_string()).await,
             Err(OrchestratorHandleError::TimedOut)
         ));
+    }
+
+    #[test]
+    fn cached_snapshot_remains_readable_when_command_loop_is_unresponsive() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_updates_tx, updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(super::SnapshotCache {
+            latest: Some(super::PublishedSnapshot {
+                snapshot: Snapshot {
+                    generated_at: Utc::now(),
+                    counts: SnapshotCounts {
+                        running: 1,
+                        retrying: 0,
+                    },
+                    running: Vec::new(),
+                    retrying: Vec::new(),
+                    codex_totals: SnapshotTotals {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        seconds_running: 0.0,
+                    },
+                    rate_limits: None,
+                    todoist_rate_budget: None,
+                    polling: PollingSnapshot {
+                        checking: false,
+                        next_poll_in_ms: Some(30_000),
+                        poll_interval_ms: 30_000,
+                    },
+                },
+                published_at: Instant::now(),
+            }),
+            available: true,
+        }));
+        let handle = OrchestratorHandle {
+            tx,
+            updates: updates_rx,
+            snapshot_cache,
+        };
+
+        let cached = handle.cached_snapshot().expect("cached snapshot");
+        assert_eq!(cached.snapshot.counts.running, 1);
+        assert_eq!(cached.freshness, SnapshotFreshness::Fresh);
+    }
+
+    #[test]
+    fn cached_snapshot_reports_stale_when_poll_deadline_is_missed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_updates_tx, updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(super::SnapshotCache {
+            latest: Some(super::PublishedSnapshot {
+                snapshot: Snapshot {
+                    generated_at: Utc::now(),
+                    counts: SnapshotCounts {
+                        running: 0,
+                        retrying: 0,
+                    },
+                    running: Vec::new(),
+                    retrying: Vec::new(),
+                    codex_totals: SnapshotTotals {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        seconds_running: 0.0,
+                    },
+                    rate_limits: None,
+                    todoist_rate_budget: None,
+                    polling: PollingSnapshot {
+                        checking: true,
+                        next_poll_in_ms: None,
+                        poll_interval_ms: 5_000,
+                    },
+                },
+                published_at: Instant::now() - Duration::from_secs(8),
+            }),
+            available: true,
+        }));
+        let handle = OrchestratorHandle {
+            tx,
+            updates: updates_rx,
+            snapshot_cache,
+        };
+
+        let cached = handle.cached_snapshot().expect("cached snapshot");
+        assert_eq!(cached.freshness, SnapshotFreshness::Stale);
+        assert!(cached.age_ms >= 8_000);
     }
 
     #[tokio::test]
@@ -3585,11 +3996,31 @@ test
         let workflow_store = todoist_workflow_store_with_base_url(dir.path(), &server.base_url);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(super::SnapshotCache {
+            latest: None,
+            available: true,
+        }));
         let mut state = State::default();
         let mut version = 0u64;
 
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
 
         assert_eq!(counts.project.load(Ordering::SeqCst), 1);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
@@ -3617,11 +4048,31 @@ test
         let workflow_store = WorkflowStore::new(workflow_path.clone()).expect("workflow store");
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(super::SnapshotCache {
+            latest: None,
+            available: true,
+        }));
         let mut state = State::default();
         let mut version = 0u64;
 
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
         assert_eq!(counts.project.load(Ordering::SeqCst), 1);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
         assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
@@ -3636,7 +4087,15 @@ test
         );
         workflow_store.reload();
 
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
 
         assert_eq!(counts.project.load(Ordering::SeqCst), 1);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
@@ -3668,11 +4127,31 @@ test
         let workflow_store = WorkflowStore::new(workflow_path.clone()).expect("workflow store");
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let snapshot_cache = Arc::new(Mutex::new(super::SnapshotCache {
+            latest: None,
+            available: true,
+        }));
         let mut state = State::default();
         let mut version = 0u64;
 
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
         assert_eq!(counts.project.load(Ordering::SeqCst), 1);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
         assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
@@ -3687,7 +4166,15 @@ test
         );
         workflow_store.reload();
 
-        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(
+            &workflow_store,
+            &tx,
+            &mut state,
+            &updates_tx,
+            &mut version,
+            &snapshot_cache,
+        )
+        .await;
 
         assert_eq!(counts.project.load(Ordering::SeqCst), 2);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 2);

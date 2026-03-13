@@ -4,6 +4,14 @@ tracker:
   api_key: $TODOIST_API_TOKEN
   # Set to a real Todoist project id before running.
   project_id: $SYMPHONY_TODOIST_PROJECT_ID
+  # Default is `curated`; use `extended` only when a workflow truly needs the
+  # broader Todoist action surface.
+  # tool_surface: curated
+  # Optional prompt-side preload budget for human Todoist task comments.
+  # prompt_comment_limits:
+  #   max_comments: 25
+  #   max_comment_chars: 2000
+  #   max_total_chars: 12000
   # Optional: set `label` when one runtime should own only part of a shared project.
   # label: symphony-runtime
   # Optional: leave unset for the common personal-project case.
@@ -114,22 +122,15 @@ Work only in the provided repository copy. Do not touch any other path.
 
 The agent should be able to talk to Todoist through the injected `todoist` tool. If it is unavailable, stop and ask the user to configure the Todoist-backed runtime correctly.
 
-## Todoist tool quick recipes
+## Todoist tool posture
 
-When the session includes `todoist`, prefer these exact narrow operations instead of exploratory searches:
+When the session includes `todoist`, prefer narrow direct operations over exploratory browsing:
 
-- Fetch the current task directly with `{"action":"get_task","task_id":"<task-id>"}`.
-- Use `list_comments` to read human-authored task comments and attached resources on the Todoist task itself. Treat the `## Codex Workpad` comment as agent-owned and exclude it from human review intake.
-- Manage the persistent task workpad with `get_workpad`, `upsert_workpad`, and `delete_workpad`. When `get_workpad` returns a `comment_id`, pass that hint back into later `upsert_workpad` calls.
-- Use `create_project_comment` only for true project-level comments. Agent-owned task comments must use the single workpad via `upsert_workpad`.
-- Todoist comment responses identify task comments with `item_id`.
-- Resolve workflow state by listing sections for the configured project and matching by section name.
-- Move the task between active states with `move_task` and `section_id`, then use `close_task` only after the task is in `Merging` and the workpad links a PR that is actually merged.
-- `create_task` automatically inherits `tracker.label` when runtime label scoping is configured.
-- Top-level `create_task` calls default into the project's `Todo` section when no `section_id` is provided. Use `parent_id` only for true subtasks.
-- Use `list_tasks` with `parent_id` when the current task already has subtasks or you need to inspect child work.
-- Use `list_activities` when task history, reviewer timing, or comment provenance is unclear.
-- Keep each tool call to a single operation and avoid broad listing calls unless these direct recipes fail.
+- Start from `get_task`, `list_sections`, `list_tasks`, `list_comments`, `get_workpad`, and `list_activities` when provenance or timing is unclear.
+- Treat non-workpad task comments as human review input. The single `## Codex Workpad` comment is agent-owned and must be managed only through `get_workpad`, `upsert_workpad`, and `delete_workpad`.
+- Use project-comment actions only when the runtime explicitly exposes them and only for true project-level notes. Symphony progress and handoff notes belong in the task workpad.
+- `close_task` remains guarded: only call it from `Merging` after the workpad links a PR that is actually merged.
+- Keep one Todoist action per tool call. If you need more operational examples, use the repo's `todoist` skill instead of restating the recipes in-thread.
 
 ## Default posture
 

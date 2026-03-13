@@ -2,11 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::TodoistPromptCommentLimits;
+
 const TODOIST_WORKPAD_HEADER: &str = "## Codex Workpad";
 const TODOIST_WORKPAD_MARKER: &str = "<!-- symphony:workpad -->";
-const MAX_PROMPT_TODOIST_COMMENTS: usize = 25;
-const MAX_PROMPT_TODOIST_COMMENT_CHARS: usize = 2_000;
-const MAX_PROMPT_TODOIST_COMMENT_TOTAL_CHARS: usize = 12_000;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssueComment {
@@ -77,7 +76,10 @@ pub fn normalize_state_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-pub fn todoist_review_comments_from_values(values: &[Value]) -> (Vec<IssueComment>, bool) {
+pub fn todoist_review_comments_from_values(
+    values: &[Value],
+    limits: &TodoistPromptCommentLimits,
+) -> (Vec<IssueComment>, bool) {
     let mut comments = values
         .iter()
         .filter_map(todoist_review_comment_from_value)
@@ -91,8 +93,8 @@ pub fn todoist_review_comments_from_values(values: &[Value]) -> (Vec<IssueCommen
     });
 
     let mut truncated = false;
-    if comments.len() > MAX_PROMPT_TODOIST_COMMENTS {
-        let split_at = comments.len() - MAX_PROMPT_TODOIST_COMMENTS;
+    if comments.len() > limits.max_comments {
+        let split_at = comments.len() - limits.max_comments;
         comments = comments.split_off(split_at);
         truncated = true;
     }
@@ -100,8 +102,8 @@ pub fn todoist_review_comments_from_values(values: &[Value]) -> (Vec<IssueCommen
     let mut total_chars = 0usize;
     let mut selected = Vec::new();
     for mut comment in comments.into_iter().rev() {
-        if comment.content.chars().count() > MAX_PROMPT_TODOIST_COMMENT_CHARS {
-            comment.content = truncate_text(&comment.content, MAX_PROMPT_TODOIST_COMMENT_CHARS);
+        if comment.content.chars().count() > limits.max_comment_chars {
+            comment.content = truncate_text(&comment.content, limits.max_comment_chars);
             truncated = true;
         }
 
@@ -118,7 +120,7 @@ pub fn todoist_review_comments_from_values(values: &[Value]) -> (Vec<IssueCommen
                 .unwrap_or(0);
 
         if !selected.is_empty()
-            && total_chars.saturating_add(comment_chars) > MAX_PROMPT_TODOIST_COMMENT_TOTAL_CHARS
+            && total_chars.saturating_add(comment_chars) > limits.max_total_chars
         {
             truncated = true;
             continue;
@@ -201,6 +203,8 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 mod tests {
     use serde_json::json;
 
+    use crate::config::TodoistPromptCommentLimits;
+
     use super::todoist_review_comments_from_values;
 
     #[test]
@@ -219,7 +223,8 @@ mod tests {
             }),
         ];
 
-        let (comments, truncated) = todoist_review_comments_from_values(&values);
+        let (comments, truncated) =
+            todoist_review_comments_from_values(&values, &TodoistPromptCommentLimits::default());
         assert!(!truncated);
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].id, "comment-human");
@@ -238,7 +243,8 @@ mod tests {
             }
         })];
 
-        let (comments, truncated) = todoist_review_comments_from_values(&values);
+        let (comments, truncated) =
+            todoist_review_comments_from_values(&values, &TodoistPromptCommentLimits::default());
         assert!(!truncated);
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].attachment_name.as_deref(), Some("spec.md"));
@@ -246,5 +252,37 @@ mod tests {
             comments[0].attachment_url.as_deref(),
             Some("https://files.example/spec.md")
         );
+    }
+
+    #[test]
+    fn todoist_review_comments_respect_configured_limits() {
+        let values = vec![
+            json!({
+                "id": "comment-1",
+                "posted_uid": "user-1",
+                "posted_at": "2026-03-13T12:00:00Z",
+                "content": "abcdef"
+            }),
+            json!({
+                "id": "comment-2",
+                "posted_uid": "user-2",
+                "posted_at": "2026-03-13T13:00:00Z",
+                "content": "ghijkl"
+            }),
+        ];
+
+        let (comments, truncated) = todoist_review_comments_from_values(
+            &values,
+            &TodoistPromptCommentLimits {
+                max_comments: 1,
+                max_comment_chars: 4,
+                max_total_chars: 4,
+            },
+        );
+
+        assert!(truncated);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "comment-2");
+        assert_eq!(comments[0].content, "ghij...");
     }
 }

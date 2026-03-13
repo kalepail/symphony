@@ -34,8 +34,35 @@ pub struct TrackerConfig {
     pub assignee: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    pub todoist_tool_surface: TodoistToolSurface,
+    pub todoist_prompt_comment_limits: TodoistPromptCommentLimits,
     #[serde(skip)]
     pub terminal_states_explicit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoistToolSurface {
+    #[default]
+    Curated,
+    Extended,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoistPromptCommentLimits {
+    pub max_comments: usize,
+    pub max_comment_chars: usize,
+    pub max_total_chars: usize,
+}
+
+impl Default for TodoistPromptCommentLimits {
+    fn default() -> Self {
+        Self {
+            max_comments: 25,
+            max_comment_chars: 2_000,
+            max_total_chars: 12_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,6 +283,10 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
             "tracker.terminal_states",
             &["Cancelled", "Canceled", "Duplicate"],
         )?,
+        todoist_tool_surface: parse_todoist_tool_surface(map.get("tool_surface"))?,
+        todoist_prompt_comment_limits: parse_todoist_prompt_comment_limits(
+            map.get("prompt_comment_limits"),
+        )?,
         terminal_states_explicit: map.contains_key("terminal_states"),
     })
 }
@@ -423,6 +454,48 @@ fn parse_state_limits(value: Option<&Value>) -> Result<BTreeMap<String, usize>, 
     }
 
     Ok(parsed)
+}
+
+fn parse_todoist_tool_surface(value: Option<&Value>) -> Result<TodoistToolSurface, ConfigError> {
+    let Some(value) = value else {
+        return Ok(TodoistToolSurface::Curated);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(ConfigError::Invalid(
+            "tracker.tool_surface must be `curated` or `extended`".to_string(),
+        ));
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "curated" => Ok(TodoistToolSurface::Curated),
+        "extended" => Ok(TodoistToolSurface::Extended),
+        _ => Err(ConfigError::Invalid(
+            "tracker.tool_surface must be `curated` or `extended`".to_string(),
+        )),
+    }
+}
+
+fn parse_todoist_prompt_comment_limits(
+    value: Option<&Value>,
+) -> Result<TodoistPromptCommentLimits, ConfigError> {
+    let map = as_object(value, "tracker.prompt_comment_limits")?;
+    Ok(TodoistPromptCommentLimits {
+        max_comments: parse_positive_u64(
+            map.get("max_comments"),
+            "tracker.prompt_comment_limits.max_comments",
+        )?
+        .unwrap_or(25) as usize,
+        max_comment_chars: parse_positive_u64(
+            map.get("max_comment_chars"),
+            "tracker.prompt_comment_limits.max_comment_chars",
+        )?
+        .unwrap_or(2_000) as usize,
+        max_total_chars: parse_positive_u64(
+            map.get("max_total_chars"),
+            "tracker.prompt_comment_limits.max_total_chars",
+        )?
+        .unwrap_or(12_000) as usize,
+    })
 }
 
 fn parse_string_list(
@@ -731,6 +804,66 @@ mod tests {
         assert_eq!(
             config.tracker.active_states,
             vec!["Todo", "In Progress", "Review"]
+        );
+    }
+
+    #[test]
+    fn tracker_defaults_to_curated_tool_surface_and_comment_limits() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.tracker.todoist_tool_surface,
+            super::TodoistToolSurface::Curated
+        );
+        assert_eq!(
+            config.tracker.todoist_prompt_comment_limits,
+            super::TodoistPromptCommentLimits::default()
+        );
+    }
+
+    #[test]
+    fn tracker_accepts_extended_tool_surface_and_comment_limit_overrides() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj",
+                    "tool_surface": "extended",
+                    "prompt_comment_limits": {
+                        "max_comments": 10,
+                        "max_comment_chars": 500,
+                        "max_total_chars": 2500
+                    }
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert_eq!(
+            config.tracker.todoist_tool_surface,
+            super::TodoistToolSurface::Extended
+        );
+        assert_eq!(
+            config.tracker.todoist_prompt_comment_limits,
+            super::TodoistPromptCommentLimits {
+                max_comments: 10,
+                max_comment_chars: 500,
+                max_total_chars: 2_500,
+            }
         );
     }
 
