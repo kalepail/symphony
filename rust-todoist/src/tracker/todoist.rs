@@ -3587,6 +3587,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_issue_states_splits_large_refresh_sets_into_batches() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let tasks = (0..205)
+            .rev()
+            .map(|index| {
+                json!({
+                    "id": format!("task-{index}"),
+                    "content": format!("Task {index}"),
+                    "project_id": "proj",
+                    "section_id": "sec-todo",
+                    "assignee_id": "user-1"
+                })
+            })
+            .collect::<Vec<_>>();
+        let issue_ids = (0..205)
+            .map(|index| format!("task-{index}"))
+            .collect::<Vec<_>>();
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": true,
+                    "can_assign_tasks": true
+                }),
+                sections: vec![
+                    json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                    json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+                ],
+                collaborators: Vec::new(),
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks,
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
+        let issues = tracker
+            .fetch_issue_states_by_ids(&issue_ids)
+            .await
+            .expect("batched state refresh");
+
+        assert_eq!(issues.len(), 205);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            issue_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.task_details.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.current_user.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn startup_validation_requires_non_done_terminal_sections() {
         let server = spawn_mock_todoist(MockTodoistState {
             project: json!({

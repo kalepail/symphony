@@ -23,6 +23,7 @@ This document is now also the implementation tracker for the follow-on work.
 - Done on 2026-03-13: the Todoist tracker now caches configured-project metadata in `src/tracker/todoist.rs` with bounded TTLs for project details, section maps, assignee resolution, collaborator IDs, current-user lookup, and plan limits.
 - Done on 2026-03-13: `fetch_issue_states_by_ids()` now batches Todoist refresh lookups through `/tasks?ids=...` instead of issuing one request per task.
 - Done on 2026-03-13: added request-count tests proving repeated poll and refresh paths reuse cached metadata instead of re-hitting Todoist control-plane endpoints.
+- Done on 2026-03-13: added large-batch coverage proving 205 issue refreshes split into three Todoist batch reads rather than detail-endpoint fan-out.
 - Done on 2026-03-13: added a dedicated `rust-todoist` CI workflow plus `rust-toolchain.toml`, `rust-version`, conservative lint policy, and an explicit thin-LTO release profile.
 - Next: split the largest modules and add fixture-backed performance measurement for the Todoist poll/refresh paths.
 - Deferred unless upstream practice changes: `cargo-deny` or `cargo-vet` rollout. `cargo audit` in CI is sufficient for now.
@@ -32,7 +33,7 @@ This document is now also the implementation tracker for the follow-on work.
 Local checks run during this audit:
 
 - `cargo test`: passed
-  - 219 unit/integration tests in `src`
+  - 220 unit/integration tests in `src`
   - 17 non-ignored tests in `tests/live_e2e.rs`
   - 6 live end-to-end tests remain intentionally ignored unless credentials are provided
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
