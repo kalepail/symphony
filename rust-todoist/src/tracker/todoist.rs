@@ -44,12 +44,15 @@ const TODOIST_REST_BUCKET_REFILL_PER_SEC: f64 = 1.0;
 const TODOIST_SYNC_BUCKET_CAPACITY: f64 = 5.0;
 const TODOIST_SYNC_BUCKET_REFILL_PER_SEC: f64 = 5.0 / 60.0;
 const TODOIST_PRETHROTTLE_MAX_WAIT_SECS: u64 = 60;
+const TODOIST_METADATA_CACHE_TTL_SECS: u64 = 30;
+const TODOIST_PLAN_LIMITS_CACHE_TTL_SECS: u64 = 300;
 
 #[derive(Clone)]
 pub struct TodoistTracker {
     client: Client,
     config: ServiceConfig,
     rate_state: Arc<Mutex<TodoistRateState>>,
+    metadata_cache: Arc<Mutex<TodoistMetadataCache>>,
 }
 
 #[derive(Clone)]
@@ -96,6 +99,21 @@ struct TodoistRateState {
     throttled_until: Option<DateTime<Utc>>,
     next_request_at: Option<DateTime<Utc>>,
     observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct TodoistMetadataCache {
+    projects: HashMap<String, TodoistCachedValue<Value>>,
+    sections_by_project: HashMap<String, TodoistCachedValue<HashMap<String, String>>>,
+    collaborators_by_project: HashMap<String, TodoistCachedValue<BTreeSet<String>>>,
+    assignee_filters_by_project: HashMap<String, TodoistCachedValue<Option<AssigneeFilter>>>,
+    current_user: Option<TodoistCachedValue<Value>>,
+    user_plan_limits: Option<TodoistCachedValue<Value>>,
+}
+
+struct TodoistCachedValue<T> {
+    value: T,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -320,6 +338,107 @@ impl TodoistTokenBucket {
     }
 }
 
+impl<T> TodoistCachedValue<T> {
+    fn new(value: T, ttl: Duration) -> Self {
+        Self {
+            value,
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
+}
+
+impl<T: Clone> TodoistCachedValue<T> {
+    fn clone_if_fresh(&self) -> Option<T> {
+        self.is_fresh().then(|| self.value.clone())
+    }
+}
+
+impl TodoistMetadataCache {
+    fn project(&self, project_id: &str) -> Option<Value> {
+        self.projects
+            .get(project_id)
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_project(&mut self, project_id: &str, project: Value) {
+        self.projects.insert(
+            project_id.to_string(),
+            TodoistCachedValue::new(project, metadata_cache_ttl()),
+        );
+    }
+
+    fn sections(&self, project_id: &str) -> Option<HashMap<String, String>> {
+        self.sections_by_project
+            .get(project_id)
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_sections(&mut self, project_id: &str, sections: HashMap<String, String>) {
+        self.sections_by_project.insert(
+            project_id.to_string(),
+            TodoistCachedValue::new(sections, metadata_cache_ttl()),
+        );
+    }
+
+    fn collaborators(&self, project_id: &str) -> Option<BTreeSet<String>> {
+        self.collaborators_by_project
+            .get(project_id)
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_collaborators(&mut self, project_id: &str, collaborator_ids: BTreeSet<String>) {
+        self.collaborators_by_project.insert(
+            project_id.to_string(),
+            TodoistCachedValue::new(collaborator_ids, metadata_cache_ttl()),
+        );
+    }
+
+    fn assignee_filter(&self, project_id: &str) -> Option<Option<AssigneeFilter>> {
+        self.assignee_filters_by_project
+            .get(project_id)
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_assignee_filter(&mut self, project_id: &str, assignee_filter: Option<AssigneeFilter>) {
+        self.assignee_filters_by_project.insert(
+            project_id.to_string(),
+            TodoistCachedValue::new(assignee_filter, metadata_cache_ttl()),
+        );
+    }
+
+    fn current_user(&self) -> Option<Value> {
+        self.current_user
+            .as_ref()
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_current_user(&mut self, current_user: Value) {
+        self.current_user = Some(TodoistCachedValue::new(current_user, metadata_cache_ttl()));
+    }
+
+    fn user_plan_limits(&self) -> Option<Value> {
+        self.user_plan_limits
+            .as_ref()
+            .and_then(TodoistCachedValue::clone_if_fresh)
+    }
+
+    fn cache_user_plan_limits(&mut self, limits: Value) {
+        self.user_plan_limits = Some(TodoistCachedValue::new(limits, plan_limits_cache_ttl()));
+    }
+}
+
+fn metadata_cache_ttl() -> Duration {
+    Duration::from_secs(TODOIST_METADATA_CACHE_TTL_SECS)
+}
+
+fn plan_limits_cache_ttl() -> Duration {
+    Duration::from_secs(TODOIST_PLAN_LIMITS_CACHE_TTL_SECS)
+}
+
 fn todoist_rate_state_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<TodoistRateState>>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<TodoistRateState>>>>> =
         OnceLock::new();
@@ -399,6 +518,7 @@ impl TodoistTracker {
             client,
             config,
             rate_state,
+            metadata_cache: Arc::new(Mutex::new(TodoistMetadataCache::default())),
         }
     }
 
@@ -647,14 +767,29 @@ impl TodoistTracker {
     }
 
     async fn get_project_resource(&self, project_id: &str) -> Result<Value, TrackerError> {
-        self.request_json(Method::GET, &format!("/projects/{project_id}"), None, None)
+        if let Some(project) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .project(project_id)
+        {
+            return Ok(project);
+        }
+
+        let project = self
+            .request_json(Method::GET, &format!("/projects/{project_id}"), None, None)
             .await
             .map_err(|error| match error {
                 TrackerError::TodoistApiStatus { status: 404, .. } => {
                     TrackerError::TodoistProjectNotFound(project_id.to_string())
                 }
                 other => other,
-            })
+            })?;
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_project(project_id, project.clone());
+        Ok(project)
     }
 
     async fn get_projects_page(
@@ -774,6 +909,15 @@ impl TodoistTracker {
         &self,
         project_id: &str,
     ) -> Result<HashMap<String, String>, TrackerError> {
+        if let Some(sections_by_id) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .sections(project_id)
+        {
+            return Ok(sections_by_id);
+        }
+
         self.get_project_resource(project_id).await?;
         let mut sections = Vec::new();
         let mut cursor: Option<String> = None;
@@ -806,6 +950,10 @@ impl TodoistTracker {
                 map.insert(id, name);
             }
         }
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_sections(project_id, map.clone());
         Ok(map)
     }
 
@@ -828,6 +976,15 @@ impl TodoistTracker {
     }
 
     async fn collaborator_ids(&self, project_id: &str) -> Result<BTreeSet<String>, TrackerError> {
+        if let Some(collaborator_ids) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .collaborators(project_id)
+        {
+            return Ok(collaborator_ids);
+        }
+
         let mut collaborator_ids = BTreeSet::new();
         let mut cursor: Option<String> = None;
 
@@ -855,6 +1012,10 @@ impl TodoistTracker {
             }
         }
 
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_collaborators(project_id, collaborator_ids.clone());
         Ok(collaborator_ids)
     }
 
@@ -881,6 +1042,15 @@ impl TodoistTracker {
         project_id: &str,
         project: &Value,
     ) -> Result<Option<AssigneeFilter>, TrackerError> {
+        if let Some(assignee_filter) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .assignee_filter(project_id)
+        {
+            return Ok(assignee_filter);
+        }
+
         let assignee = match self.config.tracker.assignee.clone() {
             Some(value) if !value.trim().is_empty() => value,
             _ => return Ok(None),
@@ -889,13 +1059,22 @@ impl TodoistTracker {
         let capabilities = Self::project_assignment_capabilities(project);
 
         if !capabilities.can_assign_tasks {
+            self.metadata_cache
+                .lock()
+                .expect("todoist metadata cache poisoned")
+                .cache_assignee_filter(project_id, None);
             return Ok(None);
         }
 
         if assignee == "me" {
-            let user = self.get_current_user().await?;
+            let user = self.current_user_resource().await?;
             let id = json_id(user.get("id")).ok_or(TrackerError::MissingTodoistCurrentUser)?;
-            return Ok(Some(AssigneeFilter { match_value: id }));
+            let assignee_filter = Some(AssigneeFilter { match_value: id });
+            self.metadata_cache
+                .lock()
+                .expect("todoist metadata cache poisoned")
+                .cache_assignee_filter(project_id, assignee_filter.clone());
+            return Ok(assignee_filter);
         }
 
         if capabilities.is_shared {
@@ -908,9 +1087,14 @@ impl TodoistTracker {
             }
         }
 
-        Ok(Some(AssigneeFilter {
+        let assignee_filter = Some(AssigneeFilter {
             match_value: assignee,
-        }))
+        });
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_assignee_filter(project_id, assignee_filter.clone());
+        Ok(assignee_filter)
     }
 
     async fn resolve_assignee_filter(&self) -> Result<Option<AssigneeFilter>, TrackerError> {
@@ -1064,17 +1248,49 @@ impl TodoistTracker {
     }
 
     async fn user_plan_limits(&self) -> Result<Value, TrackerError> {
+        if let Some(limits) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .user_plan_limits()
+        {
+            return Ok(limits);
+        }
+
         let limits = self
             .sync_json(&[
                 ("sync_token", "*"),
                 ("resource_types", "[\"user_plan_limits\"]"),
             ])
             .await?;
-        Ok(limits
+        let current_limits = limits
             .get("user_plan_limits")
             .and_then(|value| value.get("current"))
             .cloned()
-            .unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_user_plan_limits(current_limits.clone());
+        Ok(current_limits)
+    }
+
+    async fn current_user_resource(&self) -> Result<Value, TrackerError> {
+        if let Some(current_user) = self
+            .metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .current_user()
+        {
+            return Ok(current_user);
+        }
+
+        let current_user = self.request_json(Method::GET, "/user", None, None).await?;
+        self.metadata_cache
+            .lock()
+            .expect("todoist metadata cache poisoned")
+            .cache_current_user(current_user.clone());
+        Ok(current_user)
     }
 
     async fn validate_startup_config(&self) -> Result<(), TrackerError> {
@@ -1360,7 +1576,7 @@ impl TrackerClient for TodoistTracker {
     }
 
     async fn get_current_user(&self) -> Result<Value, TrackerError> {
-        self.request_json(Method::GET, "/user", None, None).await
+        self.current_user_resource().await
     }
 
     async fn list_projects(&self, arguments: Value) -> Result<Value, TrackerError> {
@@ -2488,6 +2704,25 @@ mod tests {
         plan_limits: Value,
     }
 
+    #[derive(Default)]
+    struct MetadataRequestCounts {
+        project: AtomicUsize,
+        sections: AtomicUsize,
+        collaborators: AtomicUsize,
+        current_user: AtomicUsize,
+        plan_limits: AtomicUsize,
+        tasks: AtomicUsize,
+        task_details: AtomicUsize,
+        comments: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct CountingMockTodoistState {
+        inner: MockTodoistState,
+        tasks: Vec<Value>,
+        counts: Arc<MetadataRequestCounts>,
+    }
+
     struct MockTodoistServer {
         base_url: String,
         join: JoinHandle<()>,
@@ -2549,6 +2784,120 @@ mod tests {
             )
             .route("/user", get(get_user))
             .route("/sync", post(sync))
+            .with_state(Arc::new(state));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        MockTodoistServer {
+            base_url: format!("http://{address}"),
+            join,
+        }
+    }
+
+    async fn spawn_counting_mock_todoist(state: CountingMockTodoistState) -> MockTodoistServer {
+        async fn get_project(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Path(_project_id): Path<String>,
+        ) -> Json<Value> {
+            state.counts.project.fetch_add(1, Ordering::SeqCst);
+            Json(state.inner.project.clone())
+        }
+
+        async fn list_sections(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            state.counts.sections.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": state.inner.sections,
+                "next_cursor": null
+            }))
+        }
+
+        async fn list_collaborators(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Path(_project_id): Path<String>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            state.counts.collaborators.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": state.inner.collaborators,
+                "next_cursor": null
+            }))
+        }
+
+        async fn get_user(State(state): State<Arc<CountingMockTodoistState>>) -> Json<Value> {
+            state.counts.current_user.fetch_add(1, Ordering::SeqCst);
+            Json(state.inner.current_user.clone())
+        }
+
+        async fn sync(State(state): State<Arc<CountingMockTodoistState>>) -> Json<Value> {
+            state.counts.plan_limits.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "user_plan_limits": {
+                    "current": state.inner.plan_limits
+                }
+            }))
+        }
+
+        async fn list_tasks(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            state.counts.tasks.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": state.tasks,
+                "next_cursor": null
+            }))
+        }
+
+        async fn get_task(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Path(task_id): Path<String>,
+        ) -> impl IntoResponse {
+            state.counts.task_details.fetch_add(1, Ordering::SeqCst);
+            match state
+                .tasks
+                .iter()
+                .find(|task| task.get("id").and_then(Value::as_str) == Some(task_id.as_str()))
+            {
+                Some(task) => (HttpStatusCode::OK, Json(task.clone())).into_response(),
+                None => (HttpStatusCode::NOT_FOUND, "").into_response(),
+            }
+        }
+
+        async fn list_comments(
+            State(state): State<Arc<CountingMockTodoistState>>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            state.counts.comments.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": [
+                    {
+                        "id": "comment-1",
+                        "item_id": "task-1",
+                        "content": "cached"
+                    }
+                ],
+                "next_cursor": null
+            }))
+        }
+
+        let app = Router::new()
+            .route("/projects/{project_id}", get(get_project))
+            .route("/sections", get(list_sections))
+            .route(
+                "/projects/{project_id}/collaborators",
+                get(list_collaborators),
+            )
+            .route("/user", get(get_user))
+            .route("/sync", post(sync))
+            .route("/tasks", get(list_tasks))
+            .route("/tasks/{task_id}", get(get_task))
+            .route("/comments", get(list_comments))
             .with_state(Arc::new(state));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local addr");
@@ -3026,6 +3375,158 @@ mod tests {
                 activity_log: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_candidate_issues_reuses_cached_project_metadata_across_polls() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": true,
+                    "can_assign_tasks": true
+                }),
+                sections: vec![
+                    json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                    json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+                ],
+                collaborators: vec![json!({"id": "user-1", "project_id": "proj"})],
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks: vec![json!({
+                "id": "task-1",
+                "content": "Ship cache",
+                "project_id": "proj",
+                "section_id": "sec-todo",
+                "assignee_id": "user-1"
+            })],
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("user-1")));
+        tracker.validate_startup().await.expect("startup valid");
+
+        let first = tracker
+            .fetch_candidate_issues()
+            .await
+            .expect("first candidate fetch");
+        let second = tracker
+            .fetch_candidate_issues()
+            .await
+            .expect("second candidate fetch");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.collaborators.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.current_user.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_reuses_cached_current_user_lookup() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": true,
+                    "can_assign_tasks": true
+                }),
+                sections: vec![
+                    json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                    json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+                ],
+                collaborators: Vec::new(),
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks: vec![
+                json!({
+                    "id": "task-1",
+                    "content": "Ship cache",
+                    "project_id": "proj",
+                    "section_id": "sec-todo",
+                    "assignee_id": "user-1"
+                }),
+                json!({
+                    "id": "task-2",
+                    "content": "Review cache",
+                    "project_id": "proj",
+                    "section_id": "sec-progress",
+                    "assignee_id": "user-1"
+                }),
+            ],
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
+        let issue_ids = vec!["task-1".to_string(), "task-2".to_string()];
+
+        let first = tracker
+            .fetch_issue_states_by_ids(&issue_ids)
+            .await
+            .expect("first state refresh");
+        let second = tracker
+            .fetch_issue_states_by_ids(&issue_ids)
+            .await
+            .expect("second state refresh");
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.current_user.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.collaborators.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.task_details.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn plan_limit_probes_are_cached_across_capability_and_comment_checks() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": false,
+                    "can_assign_tasks": false
+                }),
+                sections: vec![json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"})],
+                collaborators: Vec::new(),
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({
+                    "comments": true,
+                    "reminders": false,
+                    "activity_log": false
+                }),
+            },
+            tasks: vec![json!({
+                "id": "task-1",
+                "content": "Check comments",
+                "project_id": "proj",
+                "section_id": "sec-todo"
+            })],
+            counts: counts.clone(),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, None));
+        let capabilities = tracker.capabilities().await.expect("capabilities");
+        let comments = tracker
+            .list_comments(json!({"task_id": "task-1"}))
+            .await
+            .expect("comments");
+
+        assert!(capabilities.comments);
+        assert_eq!(comments["results"][0]["id"], "comment-1");
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.comments.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
