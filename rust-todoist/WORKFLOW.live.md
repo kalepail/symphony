@@ -2,8 +2,9 @@
 tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
-  project_id: $SYMPHONY_LIVE_PROJECT_ID
+  project_id: 6g8h36cQ5wmHRrv3
   label: symphony-live
+  tool_surface: curated
   # `Human Review` is a handoff state, not an active dispatch state.
   active_states:
     - Todo
@@ -18,7 +19,7 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: ~/code/symphony-workspaces
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .
@@ -75,7 +76,7 @@ Todoist review comments:
   {% if comment.attachment_name or comment.attachment_url %}Attachment: {% if comment.attachment_name %}{{ comment.attachment_name }}{% else %}resource{% endif %}{% if comment.attachment_url %} ({{ comment.attachment_url }}){% endif %}{% endif %}
 {% endfor %}
 {% if issue.todoist_comments_truncated is defined and issue.todoist_comments_truncated %}
-Some older or oversized Todoist comments were compacted before prompt rendering. Use `todoist.list_comments` if full history is needed.
+Some older Todoist comments were omitted before prompt rendering. Use `todoist.list_comments` if older history is needed.
 {% endif %}
 {% else %}
 No Todoist task comments provided.

@@ -2,16 +2,10 @@
 tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
-  # Set to a real Todoist project id before running.
-  project_id: $SYMPHONY_TODOIST_PROJECT_ID
-  # Default is `curated`; use `extended` only when a workflow truly needs the
-  # broader Todoist action surface.
-  # tool_surface: curated
-  # Optional prompt-side preload budget for human Todoist task comments.
-  # prompt_comment_limits:
-  #   max_comments: 25
-  #   max_comment_chars: 2000
-  #   max_total_chars: 12000
+  # Set this directly to the Todoist project id this workflow should own.
+  project_id: your-project-id
+  # Keep the model-visible Todoist action surface lean by default.
+  tool_surface: curated
   # Optional: set `label` when one runtime should own only part of a shared project.
   # label: symphony-runtime
   # Optional: leave unset for the common personal-project case.
@@ -31,7 +25,7 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: ~/code/symphony-workspaces
 hooks:
   after_create: |
     git clone --depth 1 ${SOURCE_REPO_URL:-git@github.com:your-org/your-repo.git} .
@@ -98,7 +92,7 @@ Todoist review comments:
   {% if comment.attachment_name or comment.attachment_url %}Attachment: {% if comment.attachment_name %}{{ comment.attachment_name }}{% else %}resource{% endif %}{% if comment.attachment_url %} ({{ comment.attachment_url }}){% endif %}{% endif %}
 {% endfor %}
 {% if issue.todoist_comments_truncated is defined and issue.todoist_comments_truncated %}
-Some older or oversized Todoist comments were compacted before prompt rendering. Use `todoist.list_comments` if full history is needed.
+Some older Todoist comments were omitted before prompt rendering. Use `todoist.list_comments` if older history is needed.
 {% endif %}
 {% else %}
 No Todoist task comments provided.

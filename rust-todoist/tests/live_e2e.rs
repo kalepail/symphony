@@ -142,13 +142,6 @@ async fn run_live_todoist_task_end_to_end(backend: LiveWorkerBackend) {
     let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
     runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
 
-    if runtime_env::get("SYMPHONY_RUN_LIVE_E2E").as_deref() != Some("1") {
-        eprintln!(
-            "skipping live e2e; set SYMPHONY_RUN_LIVE_E2E=1 in rust-todoist/.env.local or export it"
-        );
-        return;
-    }
-
     let token = match runtime_env::get("TODOIST_API_TOKEN") {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -164,6 +157,9 @@ async fn run_live_todoist_task_end_to_end(backend: LiveWorkerBackend) {
 
     let client = live_http_client();
     let base_url = todoist_base_url();
+    reap_orphaned_live_e2e_projects(&client, &base_url, &token)
+        .await
+        .expect("reap orphaned Todoist live e2e projects");
     let backend_label = match backend {
         LiveWorkerBackend::Local => "local",
         LiveWorkerBackend::Ssh => "ssh",
@@ -366,13 +362,6 @@ async fn run_minimal_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) 
     let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
     runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
 
-    if runtime_env::get("SYMPHONY_RUN_LIVE_E2E").as_deref() != Some("1") {
-        eprintln!(
-            "skipping minimal smoke live e2e; set SYMPHONY_RUN_LIVE_E2E=1 in rust-todoist/.env.local or export it"
-        );
-        return;
-    }
-
     let token = match runtime_env::get("TODOIST_API_TOKEN") {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -388,6 +377,9 @@ async fn run_minimal_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) 
 
     let client = live_http_client();
     let base_url = todoist_base_url();
+    reap_orphaned_live_e2e_projects(&client, &base_url, &token)
+        .await
+        .expect("reap orphaned Todoist live e2e projects");
     let backend_label = match backend {
         LiveWorkerBackend::Local => "local",
         LiveWorkerBackend::Ssh => "ssh",
@@ -595,13 +587,6 @@ async fn run_full_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) {
     let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
     runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
 
-    if runtime_env::get("SYMPHONY_RUN_LIVE_E2E").as_deref() != Some("1") {
-        eprintln!(
-            "skipping live smoke parity e2e; set SYMPHONY_RUN_LIVE_E2E=1 in rust-todoist/.env.local or export it"
-        );
-        return;
-    }
-
     let token = match runtime_env::get("TODOIST_API_TOKEN") {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -625,6 +610,9 @@ async fn run_full_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) {
     let github_token = github_api_token().expect("GitHub auth token");
     let client = live_http_client();
     let base_url = todoist_base_url();
+    reap_orphaned_live_e2e_projects(&client, &base_url, &token)
+        .await
+        .expect("reap orphaned Todoist live e2e projects");
     let backend_label = match backend {
         LiveWorkerBackend::Local => "local",
         LiveWorkerBackend::Ssh => "ssh",
@@ -1655,6 +1643,20 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
     )
 }
 
+#[test]
+fn identifies_live_e2e_project_names_by_prefix() {
+    assert!(is_live_e2e_project_name(
+        "Symphony Rust Todoist Live E2E local-123"
+    ));
+    assert!(is_live_e2e_project_name(
+        "Symphony Rust Todoist Minimal Smoke E2E local-123"
+    ));
+    assert!(is_live_e2e_project_name(
+        "Symphony Rust Todoist Smoke E2E local-123"
+    ));
+    assert!(!is_live_e2e_project_name("My Test"));
+}
+
 fn write_workflow_from_template(
     workflow_dir: &Path,
     template_name: &str,
@@ -1672,6 +1674,8 @@ fn write_workflow_from_template(
     {
         template = inject_todoist_base_url(&template, &base_url);
     }
+    template = inject_tracker_project_id(&template, project_id);
+    template = inject_workspace_root(&template, &worker_setup.workspace_root);
     template = inject_worker_yaml(&template, &worker_setup.worker_yaml());
 
     let workflow_path = workflow_dir.join("WORKFLOW.md");
@@ -1683,14 +1687,7 @@ fn write_workflow_from_template(
             .map_err(|error| format!("failed to create workflow workspace root: {error}"))?;
     }
 
-    let mut env_lines = vec![
-        format!("TODOIST_API_TOKEN={}", dotenv_quoted(token)),
-        format!(
-            "SYMPHONY_WORKSPACE_ROOT={}",
-            dotenv_quoted(&worker_setup.workspace_root)
-        ),
-        format!("SYMPHONY_SMOKE_PROJECT_ID={}", dotenv_quoted(project_id)),
-    ];
+    let mut env_lines = vec![format!("TODOIST_API_TOKEN={}", dotenv_quoted(token))];
     if let Some(base_url) = runtime_env::get("TODOIST_API_BASE_URL")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1717,12 +1714,83 @@ fn inject_todoist_base_url(template: &str, base_url: &str) -> String {
     )
 }
 
+fn inject_tracker_project_id(template: &str, project_id: &str) -> String {
+    let mut output = String::with_capacity(template.len() + project_id.len());
+    let mut replaced = false;
+
+    for line in template.lines() {
+        if !replaced && line.trim_start().starts_with("project_id:") {
+            let indent = line
+                .chars()
+                .take_while(|ch| ch.is_ascii_whitespace())
+                .collect::<String>();
+            output.push_str(&format!(
+                "{indent}project_id: {}\n",
+                yaml_single_quoted(project_id)
+            ));
+            replaced = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if replaced {
+        output
+    } else {
+        template.to_string()
+    }
+}
+
+fn inject_workspace_root(template: &str, workspace_root: &str) -> String {
+    let mut output = String::with_capacity(template.len() + workspace_root.len());
+    let mut in_workspace = false;
+    let mut replaced = false;
+
+    for line in template.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+
+        if indent_len == 0 && trimmed == "workspace:" {
+            in_workspace = true;
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        if in_workspace && indent_len == 0 && !trimmed.is_empty() {
+            in_workspace = false;
+        }
+
+        if in_workspace && !replaced && trimmed.starts_with("root:") {
+            let indent = line
+                .chars()
+                .take_while(|ch| ch.is_ascii_whitespace())
+                .collect::<String>();
+            output.push_str(&format!(
+                "{indent}root: {}\n",
+                yaml_single_quoted(workspace_root)
+            ));
+            replaced = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if replaced {
+        output
+    } else {
+        template.to_string()
+    }
+}
+
 fn inject_worker_yaml(template: &str, worker_yaml: &str) -> String {
     if worker_yaml.is_empty() || template.contains("\nworker:\n") {
         return template.to_string();
     }
 
-    let needle = "workspace:\n  root: $SYMPHONY_WORKSPACE_ROOT\n";
+    let needle = "workspace:\n  root: ~/code/symphony-workspaces\n";
     template.replacen(needle, &format!("{needle}{worker_yaml}"), 1)
 }
 
@@ -1807,6 +1875,56 @@ async fn create_project(
         Some(json!({ "name": name })),
     )
     .await
+}
+
+async fn list_projects(client: &Client, base_url: &str, token: &str) -> Result<Vec<Value>, String> {
+    let response = todoist_request(
+        client,
+        base_url,
+        token,
+        Method::GET,
+        "/projects",
+        None,
+        None,
+    )
+    .await?;
+
+    response
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "Todoist projects payload did not contain `results`".to_string())
+}
+
+async fn reap_orphaned_live_e2e_projects(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+) -> Result<(), String> {
+    let projects = list_projects(client, base_url, token).await?;
+
+    for project in projects {
+        let Some(name) = project.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !is_live_e2e_project_name(name) {
+            continue;
+        }
+        let project_id = json_id(&project);
+        delete_project(client, base_url, token, &project_id).await?;
+    }
+
+    Ok(())
+}
+
+fn is_live_e2e_project_name(name: &str) -> bool {
+    [
+        LIVE_E2E_PROJECT_PREFIX,
+        LIVE_MINIMAL_SMOKE_PROJECT_PREFIX,
+        LIVE_FULL_SMOKE_PROJECT_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 async fn create_section(

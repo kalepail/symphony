@@ -2,8 +2,10 @@
 tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
-  project_id: $SYMPHONY_SMOKE_PROJECT_ID
+  # Set this directly to the dedicated Todoist smoke project id.
+  project_id: your-smoke-project-id
   label: symphony-smoke-full
+  tool_surface: curated
   # `Human Review` is a handoff state, not an active dispatch state.
   active_states:
     - Todo
@@ -18,7 +20,7 @@ tracker:
 polling:
   interval_ms: 2500
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: ~/code/symphony-workspaces
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .
@@ -100,7 +102,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - Derive the raw Todoist task id by stripping the `TD-` prefix from `{{ issue.identifier }}`.
 - Fetch the current task with `{"action":"get_task","task_id":"<task-id>"}`.
 - Manage the persistent task workpad with `{"action":"get_workpad","task_id":"<task-id>"}`, `{"action":"upsert_workpad","task_id":"<task-id>","content":"...","comment_id":"<optional-comment-id>"}`, and `{"action":"delete_workpad","task_id":"<task-id>"}`.
-- Use `create_project_comment` only for true project-level comments. Agent-owned task comments must use the single workpad via `upsert_workpad`.
+- Project-comment actions are hidden by default. If the runtime explicitly exposes them, use them only for true project-level notes; agent-owned task comments must stay on the single workpad via `upsert_workpad`.
 - Todoist comment responses identify task comments with `item_id`.
 - Resolve active workflow states by calling `{"action":"list_sections"}` for the configured project and matching by exact section name.
 - Move between active states with `{"action":"move_task","task_id":"<task-id>","section_id":"<section-id>"}` and use `{"action":"close_task","task_id":"<task-id>"}` only after the task is in `Merging` and the workpad links a PR that is actually merged.

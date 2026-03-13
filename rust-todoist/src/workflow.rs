@@ -402,9 +402,6 @@ mod tests {
         unsafe {
             env::set_var("TODOIST_API_TOKEN", "token");
             env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
-            env::set_var("SYMPHONY_TODOIST_PROJECT_ID", "todoist-proj");
-            env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
-            env::set_var("SYMPHONY_LIVE_PROJECT_ID", "live-proj");
         }
 
         for relative_path in [
@@ -431,9 +428,6 @@ mod tests {
         unsafe {
             env::remove_var("TODOIST_API_TOKEN");
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
-            env::remove_var("SYMPHONY_TODOIST_PROJECT_ID");
-            env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
-            env::remove_var("SYMPHONY_LIVE_PROJECT_ID");
         }
     }
 
@@ -448,9 +442,6 @@ mod tests {
         unsafe {
             env::set_var("TODOIST_API_TOKEN", "token");
             env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
-            env::set_var("SYMPHONY_TODOIST_PROJECT_ID", "todoist-proj");
-            env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
-            env::set_var("SYMPHONY_LIVE_PROJECT_ID", "live-proj");
         }
 
         for relative_path in ["WORKFLOW.md", "WORKFLOW.live.md", "WORKFLOW.smoke.full.md"] {
@@ -479,9 +470,6 @@ mod tests {
         unsafe {
             env::remove_var("TODOIST_API_TOKEN");
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
-            env::remove_var("SYMPHONY_TODOIST_PROJECT_ID");
-            env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
-            env::remove_var("SYMPHONY_LIVE_PROJECT_ID");
         }
     }
 }

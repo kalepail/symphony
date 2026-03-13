@@ -2,14 +2,16 @@
 tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
-  project_id: $SYMPHONY_SMOKE_PROJECT_ID
+  # Set this directly to the dedicated Todoist smoke project id.
+  project_id: your-smoke-project-id
   label: symphony-smoke-minimal
+  tool_surface: curated
   active_states:
     - Todo
 polling:
   interval_ms: 5000
 workspace:
-  root: $SYMPHONY_WORKSPACE_ROOT
+  root: ~/code/symphony-workspaces
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/kalepail/symphony-smoke-lab.git .

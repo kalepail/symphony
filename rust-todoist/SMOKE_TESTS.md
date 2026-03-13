@@ -16,8 +16,6 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 ## Required Environment
 
 - `TODOIST_API_TOKEN`
-- `SYMPHONY_WORKSPACE_ROOT`
-- `SYMPHONY_SMOKE_PROJECT_ID`
 - For automated remote-worker live E2E, either set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` to reachable SSH targets with the same repo/bootstrap prerequisites available on those hosts, or leave it unset and let the harness provision Docker-backed SSH workers using Codex auth from `SYMPHONY_LIVE_DOCKER_AUTH_JSON` or `~/.codex/auth.json`
 - If `tracker.assignee` will be set, a Todoist project that supports assignment and exposes the intended assignee as a collaborator
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
@@ -25,7 +23,7 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - Prefer `gh auth login` or a classic PAT with `repo` scope over a fine-grained PAT. Symphony publish/merge flows read check runs and mutate PR metadata, and smoke helpers also update repository contents and refs.
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
-`SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
+For manual smoke runs, `tracker.project_id` in `WORKFLOW.smoke.full.md` and `WORKFLOW.smoke.minimal.md` should point at the Todoist project you want that operator session to own. Automated Rust smoke runs create a disposable Todoist project per run and inject it into a copied workflow.
 Use a dedicated Todoist user for smoke whenever possible. Todoist applies rate limits per user, so separate API tokens on the same account still contend for the same upstream budget.
 Seed minimal smoke tasks with the label `symphony-smoke-minimal` and full/rework/merge smoke tasks with the label `symphony-smoke-full`.
 Todoist comments must be available on the connected account or plan because the persistent Symphony workpad is a task-scoped comment and startup now validates that capability.
