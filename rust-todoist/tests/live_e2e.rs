@@ -41,7 +41,7 @@ const LIVE_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
 const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
 const TODOIST_RATE_LIMIT_MAX_DELAY_SECS: u64 = 60;
-const TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS: u64 = 300;
+const TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS: u64 = 1_800;
 const LIVE_E2E_CLEANUP_TIMEOUT_SECS: u64 = 60;
 const ORCHESTRATOR_START_MAX_RETRIES: usize = 2;
 const FULL_SMOKE_HUMAN_REVIEW_TIMEOUT_SECS: u64 = 900;
@@ -59,7 +59,7 @@ const GITHUB_USER_AGENT: &str = "symphony-rust-todoist/live_e2e";
 const GITHUB_REQUEST_MAX_RETRIES: usize = 4;
 const GITHUB_REQUEST_DEFAULT_DELAY_SECS: u64 = 2;
 const GITHUB_REQUEST_MAX_DELAY_SECS: u64 = 60;
-const GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS: u64 = 300;
+const GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS: u64 = 1_800;
 const GITHUB_COPILOT_REVIEW_AUTHOR_PREFIX: &str = "copilot-pull-request-reviewer";
 const SMOKE_REPO_OWNER: &str = "kalepail";
 const SMOKE_REPO_NAME: &str = "symphony-smoke-lab";
@@ -2339,7 +2339,7 @@ fn todoist_retry_delay_seconds_caps_large_retry_after_values() {
         Some(60)
     );
     assert_eq!(
-        todoist_retry_delay_seconds(Some(1_027), Some(StatusCode::TOO_MANY_REQUESTS), 0, 0),
+        todoist_retry_delay_seconds(Some(1_801), Some(StatusCode::TOO_MANY_REQUESTS), 0, 0),
         None
     );
 }
@@ -3499,7 +3499,7 @@ fn github_retry_delay_seconds_retries_and_caps_rate_limit_hints() {
     );
     assert_eq!(
         github_retry_delay_seconds(
-            Some(1_024),
+            Some(1_801),
             Some(StatusCode::TOO_MANY_REQUESTS),
             Some("{}"),
             0,

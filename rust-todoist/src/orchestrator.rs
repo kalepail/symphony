@@ -785,9 +785,24 @@ fn notify_observers(updates: &watch::Sender<u64>, update_version: &mut u64) {
 }
 
 fn schedule_next_tick(tx: &mpsc::Sender<Command>, state: &mut State) {
-    let delay = Duration::from_millis(state.poll_interval_ms);
+    let delay = next_poll_delay(state);
     state.next_poll_due_at = Some(Instant::now() + delay);
-    schedule_tick(tx, state.poll_interval_ms);
+    schedule_tick(tx, delay.as_millis() as u64);
+}
+
+fn next_poll_delay(state: &State) -> Duration {
+    let poll_delay = Duration::from_millis(state.poll_interval_ms);
+    let tracker_delay_secs = state.todoist_rate_budget.as_ref().and_then(|budget| {
+        budget
+            .throttled_for_seconds
+            .or(budget.next_request_in_seconds)
+            .or(budget.reset_in_seconds)
+            .or(budget.retry_after_seconds)
+    });
+
+    tracker_delay_secs
+        .map(Duration::from_secs)
+        .map_or(poll_delay, |tracker_delay| poll_delay.max(tracker_delay))
 }
 
 fn schedule_tick(tx: &mpsc::Sender<Command>, delay_ms: u64) {
@@ -2510,19 +2525,20 @@ mod tests {
     use tempfile::tempdir;
     use tokio::{
         net::TcpListener,
-        sync::{oneshot, watch},
+        sync::{mpsc, oneshot, watch},
         task::JoinHandle,
     };
     use tokio_util::sync::CancellationToken;
 
     use crate::issue::Issue;
+    use crate::tracker::TrackerRateBudget;
 
     use super::{
         Orchestrator, OrchestratorHandle, OrchestratorHandleError, RetryEntry, RunningEntry, State,
         WorkerDisposition, WorkerError, WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig,
         WorkerSelection, build_snapshot, candidate_issue, dispatch_issue,
         guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
-        handle_worker_exit, run_startup_terminal_cleanup, select_worker_host,
+        handle_worker_exit, next_poll_delay, run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
     };
@@ -2577,6 +2593,31 @@ mod tests {
         let snapshot = build_snapshot(&State::default());
         assert_eq!(snapshot.counts.running, 0);
         assert_eq!(snapshot.counts.retrying, 0);
+    }
+
+    #[tokio::test]
+    async fn next_poll_delay_respects_todoist_rate_budget() {
+        let _tx = mpsc::channel::<super::Command>(1).0;
+        let mut state = State {
+            poll_interval_ms: 5_000,
+            ..State::default()
+        };
+
+        assert_eq!(next_poll_delay(&state), Duration::from_millis(5_000));
+
+        state.todoist_rate_budget = Some(TrackerRateBudget {
+            service: "todoist".to_string(),
+            retry_after_seconds: Some(90),
+            ..TrackerRateBudget::default()
+        });
+        assert_eq!(next_poll_delay(&state), Duration::from_secs(90));
+
+        state.todoist_rate_budget = Some(TrackerRateBudget {
+            service: "todoist".to_string(),
+            next_request_in_seconds: Some(2),
+            ..TrackerRateBudget::default()
+        });
+        assert_eq!(next_poll_delay(&state), Duration::from_millis(5_000));
     }
 
     #[tokio::test]
