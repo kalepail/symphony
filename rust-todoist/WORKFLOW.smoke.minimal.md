@@ -17,7 +17,7 @@ agent:
   max_concurrent_agents: 1
   max_turns: 8
 codex:
-  command: codex --config shell_environment_policy.inherit=core app-server
+  command: codex --config shell_environment_policy.inherit=core --config model_reasoning_effort=low --model gpt-5.4 app-server
 server:
   port: 3000
 ---

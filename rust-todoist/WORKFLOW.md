@@ -2,9 +2,12 @@
 tracker:
   kind: todoist
   api_key: $TODOIST_API_TOKEN
-  project_id: "replace-me"
+  # Set to a real Todoist project id before running.
+  project_id: $SYMPHONY_TODOIST_PROJECT_ID
   # Optional: set `label` when one runtime should own only part of a shared project.
-  # label: symphony-full-smoke
+  # label: symphony-runtime
+  # Optional: when the Todoist project is shared and supports assignment.
+  # assignee: me
   # `Human Review` is a handoff state, not an active dispatch state.
   active_states:
     - Todo
@@ -21,7 +24,7 @@ workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
   after_create: |
-    git clone --depth 1 git@github.com:your-org/your-repo.git .
+    git clone --depth 1 ${SOURCE_REPO_URL:-git@github.com:your-org/your-repo.git} .
   before_remove: |
     if [ -f scripts/workspace_before_remove.sh ]; then
       sh scripts/workspace_before_remove.sh
@@ -32,7 +35,7 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=core --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  command: ${CODEX_BIN:-codex} --config shell_environment_policy.inherit=core --config model_reasoning_effort=high --model gpt-5.4 app-server
   approval_policy: never
   thread_sandbox: workspace-write
 server:
@@ -40,6 +43,15 @@ server:
 ---
 
 You are working on a Todoist task `{{ issue.identifier }}`
+
+This file is a reusable template, not a repo-specific smoke workflow.
+
+Before using it for a live project, make sure:
+
+- `tracker.project_id` points at the intended Todoist project.
+- `hooks.after_create` clones the intended repository.
+- the Todoist project contains the canonical sections needed by your workflow.
+- any repo-specific validation commands, publish rules, and cleanup logic are added below.
 
 {% if attempt %}
 Continuation context:
@@ -124,6 +136,8 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - Use subtasks only when the work is truly a child deliverable of the current task. Use a new top-level task for independent follow-up work.
 - Runtime-scoped follow-up tasks should rely on the tracker defaults for project, label, and Todo-lane placement unless the workflow explicitly needs a different target.
 - Move status only when the matching quality bar is met.
+- Keep shell invocations atomic. Prefer one command or tool call per step so retries and failure evidence stay readable.
+- If Todoist comment writes start failing or rate limiting, batch workpad edits and avoid rewriting the whole comment for checklist-only churn.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
 
