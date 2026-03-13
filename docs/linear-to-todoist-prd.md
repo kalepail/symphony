@@ -146,7 +146,7 @@ The following decisions are locked for this migration:
   - `tracker.assignee` supporting `me`, explicit Todoist user IDs, or unset
 - Todoist section names represent active workflow states.
 - Final `Done` is represented by closing the task.
-- `Cancelled` and `Duplicate` remain explicit open-task workflow buckets if the workflow wants
+- `Canceled` and `Duplicate` remain explicit open-task workflow buckets if the workflow wants
   them; they are not close reasons.
 - Symphony keeps the single persistent tracker-side workpad comment model.
 - The default workpad marker remains `## Codex Workpad`.

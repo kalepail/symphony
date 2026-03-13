@@ -836,7 +836,10 @@ async fn resolve_workpad_comment(
     comment_hint: Option<&str>,
     repair_duplicates: bool,
 ) -> Result<WorkpadCommentResolution, TrackerError> {
-    if let Some(comment_hint) = comment_hint.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(comment_hint) = comment_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         match tracker.get_comment(comment_hint).await {
             Ok(comment) => {
                 if !is_workpad_comment(&comment) {
@@ -861,7 +864,7 @@ async fn resolve_workpad_comment(
                     repaired_duplicates: false,
                 });
             }
-            Err(TrackerError::TodoistApiStatus { status, .. }) if status == 404 => {}
+            Err(TrackerError::TodoistApiStatus { status: 404, .. }) => {}
             Err(error) => return Err(error),
         }
     }
@@ -978,13 +981,11 @@ fn choose_canonical_workpad_comment(
     if let Some(comment_hint) = comment_hint
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        if comments
+        && comments
             .iter()
             .any(|comment| workpad_comment_id(comment).as_deref() == Some(comment_hint))
-        {
-            return Ok(comment_hint.to_string());
-        }
+    {
+        return Ok(comment_hint.to_string());
     }
 
     let normalized_contents = comments
@@ -1094,11 +1095,10 @@ fn compact_workpad_content(content: &str) -> String {
 }
 
 fn strip_workpad_prefix(content: &str) -> String {
-    let mut lines = content.lines();
     let mut body = Vec::new();
     let mut skipped_header = false;
     let mut skipped_marker = false;
-    while let Some(line) = lines.next() {
+    for line in content.lines() {
         if !skipped_header && line.trim() == WORKPAD_HEADER {
             skipped_header = true;
             continue;
@@ -1721,6 +1721,7 @@ fn tool_error_payload(error: TrackerError) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use async_trait::async_trait;
     use axum::{Json, Router, http::StatusCode as HttpStatusCode, routing::get};
@@ -2530,6 +2531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn close_task_requires_merged_pr_in_workpad() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()
@@ -2574,6 +2576,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn close_task_accepts_merged_pr_verified_via_runtime_github_api() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()
@@ -2616,6 +2619,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn close_task_falls_back_to_gh_when_runtime_github_api_is_unreachable() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()

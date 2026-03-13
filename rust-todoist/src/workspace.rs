@@ -654,7 +654,11 @@ async fn list_workspace_paths(
             .map(|(workspace_key, _)| {
                 (
                     workspace_key.clone(),
-                    workspace_path_for_identifier_on_host(config, &workspace_key, Some(worker_host)),
+                    workspace_path_for_identifier_on_host(
+                        config,
+                        &workspace_key,
+                        Some(worker_host),
+                    ),
                 )
             })
             .collect());
@@ -832,6 +836,7 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::{fs, path::Path};
 
@@ -1359,6 +1364,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn creates_remote_workspace_with_tilde_root_and_runs_remote_hooks() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()
@@ -1437,6 +1443,7 @@ exec /bin/sh -lc "$command"
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn sweeps_remote_stale_workspaces() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()

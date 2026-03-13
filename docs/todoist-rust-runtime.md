@@ -151,6 +151,7 @@ The final spec now locks the implementation choice:
 Operator recommendation:
 
 - shared Symphony Todoist projects should use Todoist board layout by default
+- smoke, development, and production should use separate Todoist users when rate-limit isolation matters because Todoist budgets are enforced per user, not per token
 
 ### Tracker Contract
 
@@ -167,12 +168,12 @@ tracker:
   active_states:
     - Todo
     - In Progress
-    - Human Review
     - Merging
     - Rework
   terminal_states:
-    - Cancelled
+    - Canceled
     - Duplicate
+    - Done
 worker:
   ssh_hosts:
     - builder-a
@@ -184,7 +185,7 @@ worker:
 
 - active workflow states -> Todoist section names
 - `Done` -> close task
-- `Cancelled` / `Duplicate` -> explicit open-task sections
+- `Canceled` / `Duplicate` -> explicit open-task sections
 - orchestrator dispatch targets top-level tasks by default, not subtasks
 - non-`Done` terminal sections are only required at startup when the workflow explicitly configures
   them in `terminal_states`
@@ -198,6 +199,13 @@ worker:
   agent limit
 - remote workspace paths preserve the configured `workspace.root` string, including `~`, so hooks,
   Codex sessions, cleanup, and operator surfaces all refer to the same logical remote path
+
+### Rate-Limit Guardrails
+
+- the Rust runtime should pre-throttle Todoist requests locally before they hit upstream 429s
+- `X-RateLimit-*` and `Retry-After` data should be surfaced in operator views as a Todoist budget
+  distinct from Codex account limits
+- oversized Todoist lockouts should fail fast instead of churning inside short retry loops
 
 ### Identifier Model
 

@@ -312,7 +312,7 @@ Use sections for:
 - `Human Review`
 - `Rework`
 - `Merging`
-- optional open terminal lanes such as `Cancelled` or `Duplicate`
+- optional open terminal lanes such as `Canceled` or `Duplicate`
 
 Do not use labels or comments as the primary workflow-state representation.
 
@@ -500,11 +500,10 @@ tracker:
   active_states:
     - Todo
     - In Progress
-    - Human Review
     - Merging
     - Rework
   terminal_states:
-    - Cancelled
+    - Canceled
     - Duplicate
 workspace:
   root: ~/code/symphony-workspaces
@@ -659,7 +658,7 @@ Canonical mapping:
   - represented by Todoist section names
 - `Done`
   - represented by closing the task
-- `Cancelled`, `Duplicate`
+- `Canceled`, `Duplicate`
   - represented by explicit open-task sections if the workflow needs them
 
 In v1, do not add a second terminal representation such as label-based terminal routing. Keep the

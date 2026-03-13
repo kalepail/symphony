@@ -113,6 +113,32 @@ struct ToolInputReply {
     message: String,
 }
 
+#[derive(Clone, Default)]
+struct EventIdentity {
+    pid: Option<u32>,
+    worker_host: Option<String>,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl EventIdentity {
+    fn new(pid: Option<u32>, worker_host: Option<String>) -> Self {
+        Self {
+            pid,
+            worker_host,
+            ..Self::default()
+        }
+    }
+
+    fn with_turn(mut self, session_id: String, thread_id: String, turn_id: String) -> Self {
+        self.session_id = Some(session_id);
+        self.thread_id = Some(thread_id);
+        self.turn_id = Some(turn_id);
+        self
+    }
+}
+
 #[derive(Debug)]
 enum RawLine {
     Stdout(String),
@@ -178,6 +204,10 @@ impl AppServerClient {
 }
 
 impl AppServerSession {
+    fn event_identity(&self) -> EventIdentity {
+        EventIdentity::new(self.codex_app_server_pid, self.worker_host.clone())
+    }
+
     pub async fn run_turn<F>(
         &mut self,
         prompt: &str,
@@ -213,11 +243,7 @@ impl AppServerSession {
             .inspect_err(|error| {
                 on_event(event_with(
                     "startup_failed",
-                    self.codex_app_server_pid,
-                    self.worker_host.clone(),
-                    None,
-                    None,
-                    None,
+                    self.event_identity(),
                     Some(error.to_string()),
                     None,
                 ));
@@ -229,13 +255,14 @@ impl AppServerSession {
             .ok_or_else(|| CodexError::ResponseError(response.to_string()))?
             .to_string();
         let session_id = format!("{}-{turn_id}", self.thread_id);
+        let turn_identity = self.event_identity().with_turn(
+            session_id.clone(),
+            self.thread_id.clone(),
+            turn_id.clone(),
+        );
         on_event(event_with(
             "session_started",
-            self.codex_app_server_pid,
-            self.worker_host.clone(),
-            Some(session_id.clone()),
-            Some(self.thread_id.clone()),
-            Some(turn_id.clone()),
+            turn_identity.clone(),
             None,
             None,
         ));
@@ -293,11 +320,7 @@ impl AppServerSession {
                     Err(_) => {
                         on_event(event_with(
                             "malformed",
-                            self.codex_app_server_pid,
-                            self.worker_host.clone(),
-                            Some(session_id.clone()),
-                            Some(self.thread_id.clone()),
-                            Some(turn_id.clone()),
+                            turn_identity.clone(),
                             Some(raw.clone()),
                             Some(raw),
                         ));
@@ -306,11 +329,7 @@ impl AppServerSession {
                 Some(RawLine::StdoutMalformed(raw)) => {
                     on_event(event_with(
                         "malformed",
-                        self.codex_app_server_pid,
-                        self.worker_host.clone(),
-                        Some(session_id.clone()),
-                        Some(self.thread_id.clone()),
-                        Some(turn_id.clone()),
+                        turn_identity.clone(),
                         Some(raw.clone()),
                         Some(raw),
                     ));
@@ -1012,22 +1031,18 @@ fn event(
 
 fn event_with(
     event: &str,
-    pid: Option<u32>,
-    worker_host: Option<String>,
-    session_id: Option<String>,
-    thread_id: Option<String>,
-    turn_id: Option<String>,
+    identity: EventIdentity,
     message: Option<String>,
     raw: Option<String>,
 ) -> CodexEvent {
     CodexEvent {
         event: event.to_string(),
         timestamp: Utc::now(),
-        worker_host,
-        session_id,
-        thread_id,
-        turn_id,
-        codex_app_server_pid: pid,
+        worker_host: identity.worker_host,
+        session_id: identity.session_id,
+        thread_id: identity.thread_id,
+        turn_id: identity.turn_id,
+        codex_app_server_pid: identity.pid,
         usage: None,
         rate_limits: None,
         payload: None,
@@ -1123,6 +1138,7 @@ fn rate_limits_map(payload: &Value) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::{
         fs,
@@ -1233,6 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn start_session_strips_todoist_token_from_child_environment() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()
@@ -1295,6 +1312,7 @@ done
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn start_session_on_host_uses_ssh_launch_and_emits_worker_host_metadata() {
         let _guard = crate::runtime_env::test_env_lock()
             .lock()

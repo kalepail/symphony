@@ -21,7 +21,7 @@ use crate::{
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
     prompt,
-    tracker::{TrackerClient, build_tracker_client},
+    tracker::{TrackerClient, TrackerRateBudget, build_tracker_client},
     workflow::WorkflowStore,
     workspace::{
         Workspace, sanitize_identifier, ssh_args, ssh_executable,
@@ -66,6 +66,7 @@ struct State {
     retry_attempts: BTreeMap<String, RetryEntry>,
     codex_totals: CodexTotals,
     codex_rate_limits: Option<Value>,
+    todoist_rate_budget: Option<TrackerRateBudget>,
 }
 
 struct RunningEntry {
@@ -105,6 +106,17 @@ struct RetryEntry {
     cancel: CancellationToken,
 }
 
+struct RetryRequest {
+    issue_id: String,
+    attempt: u32,
+    identifier: String,
+    tracked_issue: Option<Issue>,
+    worker_host: Option<String>,
+    workspace_location: Option<String>,
+    error: Option<String>,
+    continuation: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct WorkerRuntimeConfig {
     ssh_hosts: Vec<String>,
@@ -139,6 +151,7 @@ pub struct Snapshot {
     pub retrying: Vec<RetrySnapshot>,
     pub codex_totals: SnapshotTotals,
     pub rate_limits: Option<Value>,
+    pub todoist_rate_budget: Option<TrackerRateBudget>,
     pub polling: PollingSnapshot,
 }
 
@@ -268,7 +281,7 @@ enum Command {
     },
     WorkerExit {
         issue_id: String,
-        result: Result<WorkerDisposition, String>,
+        result: Box<Result<WorkerDisposition, String>>,
     },
     RetryIssue {
         issue_id: String,
@@ -308,6 +321,7 @@ impl Orchestrator {
             .validate_startup()
             .await
             .map_err(|error| error.to_string())?;
+        let initial_todoist_rate_budget = tracker.rate_budget().await;
         let (tx, mut rx) = mpsc::channel(256);
         let (updates_tx, updates_rx) = watch::channel(0u64);
         let join_tx = tx.clone();
@@ -316,6 +330,7 @@ impl Orchestrator {
                 poll_interval_ms: effective.config.polling.interval_ms,
                 max_concurrent_agents: effective.config.agent.max_concurrent_agents,
                 max_retry_backoff_ms: effective.config.agent.max_retry_backoff_ms,
+                todoist_rate_budget: initial_todoist_rate_budget,
                 ..State::default()
             };
             let mut update_version = 0u64;
@@ -344,7 +359,7 @@ impl Orchestrator {
                         notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::WorkerExit { issue_id, result } => {
-                        handle_worker_exit(&mut state, &join_tx, &issue_id, result);
+                        handle_worker_exit(&mut state, &join_tx, &issue_id, *result);
                         notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::RetryIssue { issue_id } => {
@@ -528,14 +543,18 @@ async fn run_tick(
                             return;
                         }
                     };
-                    if let Err(error) = tracker.validate_startup().await {
+                    let validate_result = tracker.validate_startup().await;
+                    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+                    if let Err(error) = validate_result {
                         error!("dispatch=status=blocked reason={error}");
                         schedule_next_tick(tx, state);
                         state.poll_check_in_progress = false;
                         notify_observers(updates, update_version);
                         return;
                     }
-                    match tracker.fetch_candidate_issues().await {
+                    let issues_result = tracker.fetch_candidate_issues().await;
+                    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+                    match issues_result {
                         Ok(issues) => {
                             let active_states = effective.config.active_state_set();
                             let terminal_states = effective.config.terminal_state_set();
@@ -599,6 +618,10 @@ fn refresh_runtime_config(workflow_store: &WorkflowStore, state: &mut State) {
     state.max_concurrent_agents = effective.config.agent.max_concurrent_agents;
     state.max_retry_backoff_ms = effective.config.agent.max_retry_backoff_ms;
     state.worker_runtime = worker_runtime_from_config(&effective.config);
+}
+
+async fn capture_tracker_rate_budget(state: &mut State, tracker: &dyn TrackerClient) {
+    state.todoist_rate_budget = tracker.rate_budget().await;
 }
 
 fn worker_runtime_from_config(config: &ServiceConfig) -> WorkerRuntimeConfig {
@@ -715,7 +738,9 @@ async fn reconcile_running_issues(
         }
     };
     let running_ids: Vec<String> = state.running.keys().cloned().collect();
-    match tracker.fetch_issue_states_by_ids(&running_ids).await {
+    let issues_result = tracker.fetch_issue_states_by_ids(&running_ids).await;
+    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+    match issues_result {
         Ok(issues) => {
             let returned_ids: BTreeSet<String> =
                 issues.iter().map(|issue| issue.id.clone()).collect();
@@ -893,14 +918,16 @@ async fn reconcile_stalled_runs(
             schedule_retry(
                 tx,
                 state,
-                issue_id.clone(),
-                next_attempt,
-                identifier,
-                Some(tracked_issue),
-                worker_host,
-                Some(workspace_location),
-                Some(format!("stalled for {elapsed_ms}ms without codex activity")),
-                false,
+                RetryRequest {
+                    issue_id: issue_id.clone(),
+                    attempt: next_attempt,
+                    identifier,
+                    tracked_issue: Some(tracked_issue),
+                    worker_host,
+                    workspace_location: Some(workspace_location),
+                    error: Some(format!("stalled for {elapsed_ms}ms without codex activity")),
+                    continuation: false,
+                },
             );
         }
     }
@@ -1089,10 +1116,11 @@ async fn dispatch_issue(
         }
     };
 
-    match tracker
+    let refreshed = tracker
         .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
-        .await
-    {
+        .await;
+    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+    match refreshed {
         Ok(refreshed) => {
             let Some(issue) = refreshed.into_iter().next() else {
                 info!(
@@ -1156,7 +1184,7 @@ async fn dispatch_issue(
                 let _ = join_tx
                     .send(Command::WorkerExit {
                         issue_id: worker_issue_id,
-                        result,
+                        result: Box::new(result),
                     })
                     .await;
             });
@@ -1229,14 +1257,16 @@ fn handle_worker_exit(
             schedule_retry(
                 tx,
                 state,
-                issue_id.to_string(),
-                1,
-                running.identifier.clone(),
-                Some(issue.clone()),
-                running.worker_host.clone(),
-                Some(running.workspace_location.clone()),
-                None,
-                true,
+                RetryRequest {
+                    issue_id: issue_id.to_string(),
+                    attempt: 1,
+                    identifier: running.identifier.clone(),
+                    tracked_issue: Some(issue.clone()),
+                    worker_host: running.worker_host.clone(),
+                    workspace_location: Some(running.workspace_location.clone()),
+                    error: None,
+                    continuation: true,
+                },
             );
             info!(
                 "worker=status=completed issue_id={} issue_identifier={} session_id={} continuation=queued next_state={}",
@@ -1266,14 +1296,16 @@ fn handle_worker_exit(
             schedule_retry(
                 tx,
                 state,
-                issue_id.to_string(),
-                attempt,
-                running.identifier.clone(),
-                Some(running.issue.clone()),
-                running.worker_host.clone(),
-                Some(running.workspace_location.clone()),
-                Some(error.clone()),
-                false,
+                RetryRequest {
+                    issue_id: issue_id.to_string(),
+                    attempt,
+                    identifier: running.identifier.clone(),
+                    tracked_issue: Some(running.issue.clone()),
+                    worker_host: running.worker_host.clone(),
+                    workspace_location: Some(running.workspace_location.clone()),
+                    error: Some(error.clone()),
+                    continuation: false,
+                },
             );
             warn!(
                 "worker=status=failed issue_id={} issue_identifier={} session_id={} error={}",
@@ -1322,10 +1354,11 @@ async fn handle_retry_issue_with_tracker(
     let effective = workflow_store.effective();
     let active_states = effective.config.active_state_set();
     let terminal_states = effective.config.terminal_state_set();
-    match tracker
+    let issues_result = tracker
         .fetch_issue_states_by_ids(&[issue_id.to_string()])
-        .await
-    {
+        .await;
+    capture_tracker_rate_budget(state, tracker).await;
+    match issues_result {
         Ok(issues) => {
             if let Some(issue) = issues.into_iter().find(|issue| issue.id == issue_id) {
                 if terminal_states.contains(&issue.state_key()) {
@@ -1355,14 +1388,16 @@ async fn handle_retry_issue_with_tracker(
                         schedule_retry(
                             tx,
                             state,
-                            issue.id.clone(),
-                            retry_entry.attempt + 1,
-                            issue.identifier.clone(),
-                            Some(issue.clone()),
-                            retry_entry.worker_host.clone(),
-                            retry_entry.workspace_location.clone(),
-                            Some("no available orchestrator slots".to_string()),
-                            false,
+                            RetryRequest {
+                                issue_id: issue.id.clone(),
+                                attempt: retry_entry.attempt + 1,
+                                identifier: issue.identifier.clone(),
+                                tracked_issue: Some(issue.clone()),
+                                worker_host: retry_entry.worker_host.clone(),
+                                workspace_location: retry_entry.workspace_location.clone(),
+                                error: Some("no available orchestrator slots".to_string()),
+                                continuation: false,
+                            },
                         );
                     }
                 } else {
@@ -1376,14 +1411,16 @@ async fn handle_retry_issue_with_tracker(
             schedule_retry(
                 tx,
                 state,
-                issue_id.to_string(),
-                retry_entry.attempt + 1,
-                retry_entry.identifier,
-                retry_entry.tracked_issue.clone(),
-                retry_entry.worker_host.clone(),
-                retry_entry.workspace_location.clone(),
-                Some(format!("retry poll failed: {error}")),
-                false,
+                RetryRequest {
+                    issue_id: issue_id.to_string(),
+                    attempt: retry_entry.attempt + 1,
+                    identifier: retry_entry.identifier,
+                    tracked_issue: retry_entry.tracked_issue.clone(),
+                    worker_host: retry_entry.worker_host.clone(),
+                    workspace_location: retry_entry.workspace_location.clone(),
+                    error: Some(format!("retry poll failed: {error}")),
+                    continuation: false,
+                },
             );
         }
     }
@@ -1443,18 +1480,17 @@ fn guarded_close_transition_may_be_in_flight(issue: &Issue) -> bool {
     issue.state_key() == "merging"
 }
 
-fn schedule_retry(
-    tx: &mpsc::Sender<Command>,
-    state: &mut State,
-    issue_id: String,
-    attempt: u32,
-    identifier: String,
-    tracked_issue: Option<Issue>,
-    worker_host: Option<String>,
-    workspace_location: Option<String>,
-    error: Option<String>,
-    continuation: bool,
-) {
+fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryRequest) {
+    let RetryRequest {
+        issue_id,
+        attempt,
+        identifier,
+        tracked_issue,
+        worker_host,
+        workspace_location,
+        error,
+        continuation,
+    } = request;
     if let Some(existing) = state.retry_attempts.remove(&issue_id) {
         existing.cancel.cancel();
     }
@@ -1705,6 +1741,7 @@ fn build_snapshot(state: &State) -> Snapshot {
             seconds_running: state.codex_totals.ended_seconds + live_seconds,
         },
         rate_limits: state.codex_rate_limits.clone(),
+        todoist_rate_budget: state.todoist_rate_budget.clone(),
         polling: PollingSnapshot {
             checking: state.poll_check_in_progress,
             next_poll_in_ms: state
@@ -1754,7 +1791,7 @@ fn build_issue_detail(
         .or_else(|| retry_entry.map(|(issue_id, _)| issue_id.clone()));
     let tracked_issue = running
         .map(|running| running.issue.clone())
-        .or_else(|| retry.map(|retry| retry.tracked_issue.clone()).flatten());
+        .or_else(|| retry.and_then(|retry| retry.tracked_issue.clone()));
     let status = if running.is_some() {
         "running"
     } else {
@@ -2564,8 +2601,10 @@ mod tests {
             assigned_to_worker: true,
             ..Issue::default()
         };
-        let mut state = State::default();
-        state.max_retry_backoff_ms = 60_000;
+        let mut state = State {
+            max_retry_backoff_ms: 60_000,
+            ..State::default()
+        };
         state.running.insert(
             issue.id.clone(),
             RunningEntry {

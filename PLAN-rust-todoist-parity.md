@@ -394,7 +394,7 @@ Add or expand tests around `rust-todoist/src/orchestrator.rs` for:
 - manual refresh coalescing
 - immediate poll after startup
 - stall detection and retry reflection in snapshot
-- local and remote worker variants once SSH support lands
+- local and remote worker variants
 
 #### 6.2 Codex app-server and stream behavior
 
@@ -405,7 +405,7 @@ Add or expand tests around `rust-todoist/src/codex/mod.rs` for:
 - unsupported dynamic tool failure path
 - successful Todoist tool call path
 - approval and request-user-input variants
-- remote app-server startup and teardown behavior once SSH support lands
+- remote app-server startup and teardown behavior
 
 #### 6.3 Todoist tracker/tool guardrails
 
@@ -477,11 +477,11 @@ Move from one live E2E to a meaningful live smoke matrix.
 
 ### Proposed live smoke coverage
 
-1. minimal task completion flow
+1. repo-backed minimal smoke flow that returns to `Backlog`
 2. publish/PR flow
 3. human review to rework flow
 4. merge and guarded close flow
-5. remote-worker smoke once SSH support lands
+5. remote-worker smoke through the SSH/Docker-backed live harness
 
 ### Tasks
 

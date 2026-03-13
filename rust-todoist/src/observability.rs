@@ -22,6 +22,7 @@ use crate::{
         IssueDetail, OrchestratorHandle, PollingSnapshot, RecentEvent, RetrySnapshot, Snapshot,
         SnapshotCounts, TokenSnapshot,
     },
+    tracker::TrackerRateBudget,
     workflow::WorkflowStore,
 };
 
@@ -47,6 +48,7 @@ pub struct StatePayload {
     pub retrying: Vec<RetrySnapshot>,
     pub codex_totals: CodexTotalsPayload,
     pub rate_limits: Option<Value>,
+    pub todoist_rate_budget: Option<TrackerRateBudget>,
     pub polling: PollingSnapshot,
     pub workflow: WorkflowPayload,
     pub links: LinksPayload,
@@ -264,6 +266,7 @@ impl Presenter {
                 seconds_running: snapshot.codex_totals.seconds_running,
             },
             rate_limits: snapshot.rate_limits,
+            todoist_rate_budget: snapshot.todoist_rate_budget,
             polling: snapshot.polling,
             workflow: WorkflowPayload {
                 path: workflow_store.path().display().to_string(),
@@ -578,8 +581,12 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
               </section>\
               <section class=\"meta-grid\">\
                 <div class=\"card section\">\
-                  <h2>Rate Limits</h2>\
+                  <h2>Codex Rate Limits</h2>\
                   <pre id=\"rate-limits-json\"></pre>\
+                </div>\
+                <div class=\"card section\">\
+                  <h2>Todoist Budget</h2>\
+                  <pre id=\"todoist-rate-budget-json\"></pre>\
                 </div>\
                 <div class=\"card section\">\
                   <h2>Polling State</h2>\
@@ -656,12 +663,23 @@ pub fn render_terminal_dashboard(
         ),
         format!(
             "{}{}",
-            colorize("│ Rate Limits: ", ANSI_BOLD),
+            colorize("│ Codex Limits: ", ANSI_BOLD),
             format_rate_limits(
                 payload
                     .rate_limits
                     .as_ref()
                     .map(format_rate_limits_summary)
+                    .as_deref(),
+            )
+        ),
+        format!(
+            "{}{}",
+            colorize("│ Todoist Budget: ", ANSI_BOLD),
+            format_rate_limits(
+                payload
+                    .todoist_rate_budget
+                    .as_ref()
+                    .map(format_todoist_rate_budget_summary)
                     .as_deref(),
             )
         ),
@@ -1599,6 +1617,36 @@ pub fn format_rate_limits_summary(rate_limits: &Value) -> String {
     }
 }
 
+pub fn format_todoist_rate_budget_summary(budget: &TrackerRateBudget) -> String {
+    let mut parts = Vec::new();
+
+    if let (Some(remaining), Some(limit)) = (budget.remaining, budget.limit) {
+        parts.push(format!("{remaining}/{limit} remaining"));
+    } else if let Some(limit) = budget.limit {
+        parts.push(format!("limit {limit}"));
+    }
+
+    if let Some(reset_in_seconds) = budget.reset_in_seconds {
+        parts.push(format!("reset {reset_in_seconds}s"));
+    }
+
+    if let Some(throttled_for_seconds) = budget.throttled_for_seconds {
+        parts.push(format!("throttled {throttled_for_seconds}s"));
+    } else if let Some(retry_after_seconds) = budget.retry_after_seconds {
+        parts.push(format!("retry_after {retry_after_seconds}s"));
+    }
+
+    if let Some(next_request_in_seconds) = budget.next_request_in_seconds {
+        parts.push(format!("next slot {next_request_in_seconds}s"));
+    }
+
+    if parts.is_empty() {
+        "n/a".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
 fn format_rate_limit_bucket_summary(bucket: &Value) -> Option<String> {
     let used_percent = json_number(bucket, &[&["usedPercent"], &["used_percent"]]);
     let remaining = parse_integer(json_value(bucket, &[&["remaining"]]));
@@ -1756,7 +1804,10 @@ fn consume_csi_sequence<I>(chars: &mut Peekable<I>)
 where
     I: Iterator<Item = char>,
 {
-    while let Some(next) = chars.next() {
+    loop {
+        let Some(next) = chars.next() else {
+            break;
+        };
         if ('@'..='~').contains(&next) {
             break;
         }
@@ -1767,7 +1818,10 @@ fn consume_osc_sequence<I>(chars: &mut Peekable<I>)
 where
     I: Iterator<Item = char>,
 {
-    while let Some(next) = chars.next() {
+    loop {
+        let Some(next) = chars.next() else {
+            break;
+        };
         match next {
             '\u{7}' => break,
             '\u{1b}' if matches!(chars.peek().copied(), Some('\\')) => {
@@ -1783,7 +1837,10 @@ fn consume_st_terminated_sequence<I>(chars: &mut Peekable<I>)
 where
     I: Iterator<Item = char>,
 {
-    while let Some(next) = chars.next() {
+    loop {
+        let Some(next) = chars.next() else {
+            break;
+        };
         if next == '\u{1b}' && matches!(chars.peek().copied(), Some('\\')) {
             chars.next();
             break;
@@ -2323,6 +2380,7 @@ const DASHBOARD_JS: &str = r#"
     document.getElementById('running-body').innerHTML = renderRunningRows(payload);
     document.getElementById('retry-body').innerHTML = renderRetryRows(payload);
     document.getElementById('rate-limits-json').textContent = JSON.stringify(payload.rate_limits ?? 'No rate-limit payload observed yet.', null, 2);
+    document.getElementById('todoist-rate-budget-json').textContent = JSON.stringify(payload.todoist_rate_budget ?? 'No Todoist budget observed yet.', null, 2);
     document.getElementById('polling-json').textContent = JSON.stringify(payload.polling ?? {}, null, 2);
 
     const workflowNote = document.getElementById('workflow-note');
@@ -2462,6 +2520,7 @@ mod tests {
         config::ObservabilityConfig,
         issue::Issue,
         orchestrator::{IssueDetail, Orchestrator, PollingSnapshot, SnapshotCounts, TokenSnapshot},
+        tracker::TrackerRateBudget,
         workflow::WorkflowStore,
     };
 
@@ -2518,6 +2577,8 @@ mod tests {
         assert!(rendered.contains("Graph: "));
         assert!(rendered.contains("ABC-123"));
         assert!(rendered.contains("Backoff queue"));
+        assert!(rendered.contains("Todoist Budget"));
+        assert!(rendered.contains("24/300 remaining"));
     }
 
     #[test]
@@ -2530,6 +2591,8 @@ mod tests {
         assert!(!html.contains("&quot;generated_at&quot;"));
         assert!(html.contains("window.setInterval(updateRuntimeClocks, 1000)"));
         assert!(!html.contains("window.location.reload"));
+        assert!(html.contains("Todoist Budget"));
+        assert!(html.contains("todoist-rate-budget-json"));
     }
 
     #[test]
@@ -3103,6 +3166,19 @@ mod tests {
                 "secondary": { "remaining": 40, "limit": 50, "reset_in_seconds": 12 },
                 "credits": { "has_credits": true, "balance": 42.0 }
             })),
+            todoist_rate_budget: Some(TrackerRateBudget {
+                service: "todoist".to_string(),
+                limit: Some(300),
+                remaining: Some(24),
+                reset_at: Some(Utc.with_ymd_and_hms(2026, 3, 11, 0, 5, 0).unwrap()),
+                reset_in_seconds: Some(300),
+                retry_after_seconds: None,
+                throttled_until: None,
+                throttled_for_seconds: None,
+                next_request_at: Some(Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 1).unwrap()),
+                next_request_in_seconds: Some(1),
+                observed_at: Some(Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap()),
+            }),
             polling: PollingSnapshot {
                 checking: false,
                 next_poll_in_ms: Some(5_000),

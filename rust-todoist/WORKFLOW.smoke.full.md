@@ -11,13 +11,11 @@ tracker:
     - Merging
     - Rework
   terminal_states:
-    - Closed
-    - Cancelled
     - Canceled
     - Duplicate
     - Done
 polling:
-  interval_ms: 1000
+  interval_ms: 2500
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:
@@ -123,6 +121,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - Persist the workpad `comment_id` returned by `get_workpad`/`upsert_workpad` and pass it back into later `upsert_workpad` calls so Todoist rewrites stay single-request.
 - Keep the workpad on the task itself. Do not fall back to project comments for task execution state.
 - Todoist comment writes are rate limited. Batch workpad edits so you only rewrite the full comment when a milestone materially changes the handoff state, and avoid redundant rewrites with no new reviewer-facing information.
+- This workflow intentionally polls more slowly than the minimal harness so live smoke runs do not burn a shared Todoist user's budget. Do not tighten the interval unless the run uses an isolated Todoist account.
 - For `Merging`, skip the generic execution bootstrap. Do not start with repo-wide planning, reproduction, pull-sync, or routine workpad reconciliation. Treat `Merging` as a fast path: identify the surviving PR, verify it is merge-ready, run the `land` flow, then guarded `close_task`.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,

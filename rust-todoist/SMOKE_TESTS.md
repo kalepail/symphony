@@ -18,13 +18,14 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - `TODOIST_API_TOKEN`
 - `SYMPHONY_WORKSPACE_ROOT`
 - `SYMPHONY_SMOKE_PROJECT_ID`
-- For remote-worker smoke, SSH access from the Symphony host to every configured `worker.ssh_hosts` target, with the same repo/bootstrap prerequisites available on those hosts
+- For automated remote-worker live E2E, either set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` to reachable SSH targets with the same repo/bootstrap prerequisites available on those hosts, or leave it unset and let the harness provision Docker-backed SSH workers using Codex auth from `SYMPHONY_LIVE_DOCKER_AUTH_JSON` or `~/.codex/auth.json`
 - If `tracker.assignee` will be set, a Todoist project that supports assignment and exposes the intended assignee as a collaborator
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
 - For the direct GitHub REST fallback, either `GH_TOKEN` / `GITHUB_TOKEN` is exported or `gh auth token` succeeds on the host
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
+Use a dedicated Todoist user for smoke whenever possible. Todoist applies rate limits per user, so separate API tokens on the same account still contend for the same upstream budget.
 Seed minimal smoke tasks with the label `symphony-smoke-minimal` and full/rework/merge smoke tasks with the label `symphony-smoke-full`.
 Todoist comments must be available on the connected account or plan because the persistent Symphony workpad is a task-scoped comment and startup now validates that capability.
 
@@ -55,7 +56,7 @@ This verifies both the `gh` path and the direct GitHub REST fallback against the
 - Minimal live smoke: [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md)
 - Full live smoke: [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md)
 - Repo-owned live E2E harness: [tests/live_e2e.rs](./tests/live_e2e.rs)
-  - Includes the lightweight disposable Todoist handoff smoke plus the full parity smoke that exercises PR creation, automated `Human Review` approval, `Merging`, verified merge, and guarded `todoist.close_task`.
+  - Includes dedicated local and SSH-worker variants for the lightweight disposable Todoist handoff smoke, the repo-backed minimal smoke workflow, and the full parity smoke that exercises PR creation, automated `Human Review` approval, `Merging`, verified merge, and guarded `todoist.close_task`.
 - Shared-state cleanup helper: [../scripts/reset_smoke_state.py](../scripts/reset_smoke_state.py)
 
 ## Observability Evidence
@@ -64,11 +65,13 @@ Each live smoke should capture both operator surfaces while the run is active:
 
 - Terminal dashboard evidence:
   - header with agents/max, runtime, tokens, project URL, and next refresh
+  - distinct `Codex Limits` and `Todoist Budget` lines when either payload has been observed
   - running or backoff row for the active smoke issue
 - Web dashboard evidence:
   - live status badge connected to `/api/v1/stream`
   - runtime and throughput cards
   - running session row with JSON details link
+  - separate `Codex Rate Limits` and `Todoist Budget` JSON panes
 - When the run is remote, also capture the worker host and remote workspace location shown in the running session row and issue detail view
 
 If the stream degrades, also capture the polling-fallback badge state. For one unavailable-path check, capture the terminal offline frame and the web fallback/offline badge behavior.
@@ -78,6 +81,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 1. `smoke-minimal`
    - Workflow: `WORKFLOW.smoke.minimal.md`
    - Seed task label: `symphony-smoke-minimal`
+   - Automated coverage: `completes_a_repo_backed_minimal_smoke_workflow_end_to_end` and `completes_a_repo_backed_minimal_smoke_workflow_end_to_end_with_ssh_worker` in `tests/live_e2e.rs`
    - Proves: live Todoist polling, workspace bootstrap, Codex turn execution, repo mutation, validation command execution, single-workpad comment discipline, a bounded non-terminal state transition back to `Backlog`, and terminal/web observability during a live run
    - Expected repo effect: one appended bullet in `SMOKE_TARGET.md`
 
@@ -85,23 +89,27 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
    - Workflow: `WORKFLOW.smoke.full.md`
    - Seed the issue in `Todo`
    - Seed task label: `symphony-smoke-full`
+   - Automated coverage: the first half of `completes_a_full_smoke_repo_workflow_end_to_end` and `completes_a_full_smoke_repo_workflow_end_to_end_with_ssh_worker`
    - Task body should instruct the agent to update `SMOKE_TARGET.md`, run `sh scripts/validate-smoke-repo.sh`, commit, push, open a PR, label it `symphony`, and attach the PR details to the Todoist task
    - Expected outcome: issue reaches `Human Review` with a green PR
    - Expected observability: SSE dashboard stays live during publish; terminal dashboard shows live activity and any retry pressure without flooding
 
 3. `smoke-rework`
-   - Start from a `smoke-pr` PR in the team's review handoff state
-   - Add at least one actionable PR review comment that requires a concrete repo change
-   - Move the issue to `Rework`
-   - Expected outcome: the agent addresses or explicitly replies to the feedback, reruns validation, updates the PR, and returns the issue to the team's review handoff state
+    - Start from a `smoke-pr` PR in the team's review handoff state
+    - Add at least one actionable PR review comment that requires a concrete repo change
+    - Move the issue to `Rework`
+    - Automation status: workflow contract is implemented in `WORKFLOW.smoke.full.md`, but `tests/live_e2e.rs` does not yet auto-drive reviewer feedback through a full rework cycle
+    - Expected outcome: the agent addresses or explicitly replies to the feedback, reruns validation, updates the PR, and returns the issue to the team's review handoff state
 
 4. `smoke-merge`
    - Start from a reviewed and approved `smoke-pr`
    - Move the issue to `Merging`
+   - Automated coverage: the second half of `completes_a_full_smoke_repo_workflow_end_to_end` and `completes_a_full_smoke_repo_workflow_end_to_end_with_ssh_worker`
    - Expected outcome: the `land` flow merges the PR, guarded `todoist.close_task` completes the task, and the workspace is cleaned up
 
 5. `parity-smoke`
-   - Run the same seeded scenario once with Rust and once with Elixir
+   - Run equivalent seeded scenarios once with Rust Todoist and once with the Elixir Linear service
+   - Automation status: manual artifact comparison only; Elixir's live harness is still Linear-native, so there is no cross-runtime Todoist automation target
    - Compare external artifacts only:
    - Todoist section and completion transitions
    - workpad comment behavior
@@ -112,6 +120,7 @@ If the stream degrades, also capture the polling-fallback badge state. For one u
 
 6. `smoke-remote-worker`
    - Run `WORKFLOW.smoke.full.md` or an equivalent bounded scenario with `worker.ssh_hosts` configured
+   - The repo-owned `tests/live_e2e.rs` harness now includes dedicated ignored SSH tests for the minimal handoff flow, the repo-backed minimal smoke flow, and the full parity smoke flow
    - Expected outcome: dispatch lands on one remote worker, observability shows the selected `worker_host`, retries preserve host affinity when they occur, and remote workspace cleanup removes the remote directory after completion
    - Expected observability: `/api/v1/state`, `/api/v1/<issue_identifier>`, and the dashboard running row all show the same worker host and logical remote workspace path
 

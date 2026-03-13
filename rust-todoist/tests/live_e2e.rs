@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
+    net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::OnceLock,
@@ -18,20 +19,25 @@ use symphony_rust_todoist::{
     orchestrator::{Orchestrator, OrchestratorHandle, OrchestratorHandleError},
     runtime_env,
     workflow::WorkflowStore,
-    workspace::workspace_path_for_identifier,
+    workspace::{workspace_path_for_identifier, workspace_path_for_identifier_on_host},
 };
 use tempfile::tempdir;
 use tokio::{sync::Mutex, time::sleep};
 
 const RESULT_FILE: &str = "LIVE_E2E_RESULT.txt";
 const LIVE_E2E_PROJECT_PREFIX: &str = "Symphony Rust Todoist Live E2E";
+const LIVE_MINIMAL_SMOKE_PROJECT_PREFIX: &str = "Symphony Rust Todoist Minimal Smoke E2E";
 const LIVE_FULL_SMOKE_PROJECT_PREFIX: &str = "Symphony Rust Todoist Smoke E2E";
+const LIVE_DOCKER_WORKER_COUNT: usize = 2;
 const LIVE_E2E_TODO_SECTION: &str = "Todo";
 const LIVE_E2E_REVIEW_SECTION: &str = "Human Review";
 const LIVE_E2E_MERGING_SECTION: &str = "Merging";
+const LIVE_MINIMAL_SMOKE_LABEL: &str = "symphony-smoke-minimal";
 const LIVE_FULL_SMOKE_LABEL: &str = "symphony-smoke-full";
 const TODOIST_WORKPAD_MARKER: &str = "<!-- symphony:workpad -->";
 const TODOIST_WORKPAD_HEADER: &str = "## Codex Workpad";
+const LIVE_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const LIVE_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
 const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
 const TODOIST_RATE_LIMIT_MAX_DELAY_SECS: u64 = 60;
@@ -45,6 +51,7 @@ const FULL_SMOKE_POST_MERGE_CLOSE_GRACE_SECS: u64 = FULL_SMOKE_TODOIST_WRITE_GRA
 const FULL_SMOKE_CONTROL_PLANE_GRACE_SECS: u64 = TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS + 30;
 const FULL_SMOKE_HANDOFF_QUIESCE_TIMEOUT_SECS: u64 = FULL_SMOKE_CONTROL_PLANE_GRACE_SECS;
 const FULL_SMOKE_MERGING_DISPATCH_TIMEOUT_SECS: u64 = FULL_SMOKE_CONTROL_PLANE_GRACE_SECS;
+const TODOIST_PROJECT_VISIBILITY_TIMEOUT_SECS: u64 = 15;
 const GITHUB_API_DEFAULT_BASE_URL: &str = "https://api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_USER_AGENT: &str = "symphony-rust-todoist/live_e2e";
@@ -71,9 +78,66 @@ const CANONICAL_SMOKE_SECTIONS: &[&str] = &[
     "Duplicate",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveWorkerBackend {
+    Local,
+    Ssh,
+}
+
+#[derive(Debug)]
+struct LiveWorkerSetup {
+    ssh_worker_hosts: Vec<String>,
+    workspace_root: String,
+    remote_test_root: Option<String>,
+    docker_cleanup: Option<LiveDockerCleanup>,
+}
+
+#[derive(Debug)]
+struct LiveDockerCleanup {
+    project_name: String,
+    env: Vec<(String, String)>,
+    previous_ssh_config: Option<String>,
+}
+
+impl LiveWorkerSetup {
+    fn worker_yaml(&self) -> String {
+        if self.ssh_worker_hosts.is_empty() {
+            return String::new();
+        }
+
+        let hosts = self
+            .ssh_worker_hosts
+            .iter()
+            .map(|host| format!("    - {}", yaml_single_quoted(host)))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!("worker:\n  ssh_hosts:\n{hosts}\n  max_concurrent_agents_per_host: 1\n")
+    }
+}
+
+fn live_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(LIVE_HTTP_CONNECT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(LIVE_HTTP_REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(LIVE_HTTP_REQUEST_TIMEOUT_SECS))
+        .build()
+        .expect("live e2e HTTP client")
+}
+
 #[tokio::test]
 #[ignore = "requires live Todoist and Codex access"]
 async fn completes_a_real_todoist_task_end_to_end() {
+    run_live_todoist_task_end_to_end(LiveWorkerBackend::Local).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Todoist, Codex, and SSH worker access"]
+async fn completes_a_real_todoist_task_end_to_end_with_ssh_worker() {
+    run_live_todoist_task_end_to_end(LiveWorkerBackend::Ssh).await;
+}
+
+async fn run_live_todoist_task_end_to_end(backend: LiveWorkerBackend) {
     let _guard = live_e2e_lock().lock().await;
     let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
     runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
@@ -98,10 +162,14 @@ async fn completes_a_real_todoist_task_end_to_end() {
         "`codex` must be on PATH for rust-todoist live e2e"
     );
 
-    let client = Client::new();
+    let client = live_http_client();
     let base_url = todoist_base_url();
+    let backend_label = match backend {
+        LiveWorkerBackend::Local => "local",
+        LiveWorkerBackend::Ssh => "ssh",
+    };
     let run_id = format!(
-        "symphony-rust-todoist-live-e2e-{}",
+        "symphony-rust-todoist-live-e2e-{backend_label}-{}",
         Utc::now().timestamp_millis()
     );
     let project = create_project(
@@ -115,6 +183,7 @@ async fn completes_a_real_todoist_task_end_to_end() {
     let project_id = json_id(&project);
 
     let outcome = async {
+        wait_for_todoist_project_visibility(&client, &base_url, &token, &project_id).await?;
         let todo_section = create_section(
             &client,
             &base_url,
@@ -151,95 +220,23 @@ async fn completes_a_real_todoist_task_end_to_end() {
             format!("## Live E2E Marker\nidentifier={identifier}\nproject_id={project_id}");
 
         let dir = tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
-        let workspace_root = dir.path().join("workspaces");
-        fs::create_dir_all(&workspace_root)
-            .map_err(|error| format!("workspace root create failed: {error}"))?;
+        let worker_setup = live_worker_setup(backend, &run_id, dir.path())?;
         let workflow_path = dir.path().join("WORKFLOW.md");
-        fs::write(
+        write_live_issue_workflow(
             &workflow_path,
-            format!(
-                r#"---
-tracker:
-  kind: todoist
-  api_key: {api_key}
-  base_url: {base_url}
-  project_id: {tracker_project_id}
-  active_states:
-    - Todo
-  terminal_states:
-    - Done
-polling:
-  interval_ms: 1000
-workspace:
-  root: {}
-observability:
-  terminal_enabled: false
-codex:
-  approval_policy: never
-  turn_timeout_ms: 600000
-  stall_timeout_ms: 600000
----
-You are running a real Symphony rust-todoist end-to-end test.
-
-The current working directory is the workspace root.
-
-Step 1:
-Create a file named {result_file} in the current working directory by running exactly:
-
-```sh
-cat > {result_file} <<'EOF'
-identifier={{{{ issue.identifier }}}}
-project_id={project_id}
-EOF
-```
-
-Then verify it by running:
-
-```sh
-cat {result_file}
-```
-
-The file content must be exactly:
-identifier={{{{ issue.identifier }}}}
-project_id={project_id}
-
-Step 2:
-Use the `todoist` tool to read the current task `{{{{ issue.id }}}}` and its task-scoped workpad.
-Ensure there is exactly one persistent workpad comment for this task and that its content includes
-the exact marker block below somewhere verbatim. If the marker is missing, update or create the
-workpad with `todoist.upsert_workpad` so it contains the marker block verbatim in addition to any
-other useful notes:
-
-{expected_workpad_marker}
-
-Step 3:
-Use the `todoist` tool to list sections for the current project `"{project_id}"`, find the
-section named `Human Review`, and move the current task into that section with `todoist.move_task`.
-
-Step 4:
-Before stopping, verify all three outcomes:
-1. the file exists with the exact contents above
-2. the task workpad contains the exact marker block above
-3. the current task is in the `Human Review` section
-
-Do not ask for approval.
-"#,
-                workspace_root.display(),
-                api_key = yaml_single_quoted(&token),
-                base_url = yaml_single_quoted(&base_url),
-                tracker_project_id = yaml_single_quoted(&project_id),
-                result_file = RESULT_FILE,
-                project_id = project_id,
-                expected_workpad_marker = expected_workpad_marker,
-            ),
-        )
-        .map_err(|error| format!("workflow write failed: {error}"))?;
+            &token,
+            &base_url,
+            &project_id,
+            &worker_setup,
+            &expected_workpad_marker,
+        )?;
 
         let workflow_store =
             WorkflowStore::new(workflow_path.clone()).map_err(|error| error.to_string())?;
-        let workspace_path =
-            workspace_path_for_identifier(&workflow_store.effective().config, &identifier);
         let orchestrator = start_orchestrator_with_retry(workflow_store.clone()).await?;
+        let orchestrator_handle = orchestrator.handle();
+        let local_workspace_path =
+            workspace_path_for_identifier(&workflow_store.effective().config, &identifier);
 
         let result = async {
             let started = tokio::time::Instant::now();
@@ -247,12 +244,26 @@ Do not ask for approval.
             let mut observed_comment = false;
             let mut observed_result = false;
             let mut completed = false;
+            let mut remote_worker_host = None::<String>;
+            let mut remote_workspace_path = None::<PathBuf>;
+            let mut observed_remote_worker = false;
 
             while started.elapsed() < timeout {
                 if !observed_result {
-                    observed_result = fs::read_to_string(workspace_path.join(RESULT_FILE))
-                        .ok()
-                        .is_some_and(|content| content == expected_result);
+                    observed_result = if worker_setup.ssh_worker_hosts.is_empty() {
+                        fs::read_to_string(local_workspace_path.join(RESULT_FILE))
+                            .ok()
+                            .is_some_and(|content| content == expected_result)
+                    } else if let (Some(worker_host), Some(workspace_path)) = (
+                        remote_worker_host.as_deref(),
+                        remote_workspace_path.as_ref(),
+                    ) {
+                        read_remote_file(worker_host, &workspace_path.join(RESULT_FILE))
+                            .ok()
+                            .is_some_and(|content| content == expected_result)
+                    } else {
+                        false
+                    };
                 }
                 if !observed_comment {
                     observed_comment = task_comments_contain(
@@ -274,10 +285,24 @@ Do not ask for approval.
                     )
                     .await?;
                 }
+                if !worker_setup.ssh_worker_hosts.is_empty()
+                    && (remote_worker_host.is_none() || remote_workspace_path.is_none())
+                    && let Ok(Some(detail)) =
+                        orchestrator_handle.issue_detail(identifier.clone()).await
+                    && let Some(worker_host) = detail.workspace.worker_host
+                {
+                    observed_remote_worker = true;
+                    remote_workspace_path = Some(workspace_path_for_identifier_on_host(
+                        &workflow_store.effective().config,
+                        &identifier,
+                        Some(worker_host.as_str()),
+                    ));
+                    remote_worker_host = Some(worker_host);
+                }
                 if observed_result && observed_comment && completed {
                     break;
                 }
-                sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
             }
 
             if !observed_result {
@@ -289,13 +314,20 @@ Do not ask for approval.
             if !completed {
                 return Err("expected Todoist task to reach the Human Review section".to_string());
             }
+            if !worker_setup.ssh_worker_hosts.is_empty() && !observed_remote_worker {
+                return Err("expected live e2e task to dispatch onto an SSH worker".to_string());
+            }
 
             Ok::<(), String>(())
         }
         .await;
 
         orchestrator.shutdown().await;
-        result
+        match cleanup_live_worker_setup(worker_setup) {
+            Some(error) if result.is_ok() => Err(error),
+            Some(error) => Err(format!("{}; {error}", result.unwrap_err())),
+            None => result,
+        }
     }
     .await;
 
@@ -314,8 +346,243 @@ Do not ask for approval.
 }
 
 #[tokio::test]
+#[ignore = "requires live Todoist and Codex access"]
+async fn completes_a_repo_backed_minimal_smoke_workflow_end_to_end() {
+    run_minimal_smoke_repo_workflow_end_to_end(LiveWorkerBackend::Local).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Todoist, Codex, and SSH worker access"]
+async fn completes_a_repo_backed_minimal_smoke_workflow_end_to_end_with_ssh_worker() {
+    run_minimal_smoke_repo_workflow_end_to_end(LiveWorkerBackend::Ssh).await;
+}
+
+async fn run_minimal_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) {
+    let _guard = live_e2e_lock().lock().await;
+    let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
+    runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
+
+    if runtime_env::get("SYMPHONY_RUN_LIVE_E2E").as_deref() != Some("1") {
+        eprintln!(
+            "skipping minimal smoke live e2e; set SYMPHONY_RUN_LIVE_E2E=1 in rust-todoist/.env.local or export it"
+        );
+        return;
+    }
+
+    let token = match runtime_env::get("TODOIST_API_TOKEN") {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skipping minimal smoke live e2e; TODOIST_API_TOKEN is missing");
+            return;
+        }
+    };
+
+    assert!(
+        command_is_ready("codex"),
+        "`codex` must be on PATH for rust-todoist minimal smoke live e2e"
+    );
+
+    let client = live_http_client();
+    let base_url = todoist_base_url();
+    let backend_label = match backend {
+        LiveWorkerBackend::Local => "local",
+        LiveWorkerBackend::Ssh => "ssh",
+    };
+    let run_id = format!(
+        "symphony-rust-todoist-minimal-smoke-e2e-{backend_label}-{}",
+        Utc::now().timestamp_millis()
+    );
+    let project = create_project(
+        &client,
+        &base_url,
+        &token,
+        &format!("{LIVE_MINIMAL_SMOKE_PROJECT_PREFIX} {run_id}"),
+    )
+    .await
+    .expect("create Todoist project");
+    let project_id = json_id(&project);
+
+    let outcome = async {
+        wait_for_todoist_project_visibility(&client, &base_url, &token, &project_id).await?;
+        let sections =
+            create_canonical_smoke_sections(&client, &base_url, &token, &project_id).await?;
+        let backlog_section_id = sections
+            .get("Backlog")
+            .cloned()
+            .ok_or_else(|| "missing Backlog section in canonical smoke setup".to_string())?;
+        let todo_section_id = sections
+            .get(LIVE_E2E_TODO_SECTION)
+            .cloned()
+            .ok_or_else(|| "missing Todo section in canonical smoke setup".to_string())?;
+
+        let task_title = format!("Symphony rust-todoist minimal smoke {run_id}");
+        let task = create_task_with_body(
+            &client,
+            &base_url,
+            &token,
+            &project_id,
+            &todo_section_id,
+            &task_title,
+            &format!("Run a repo-backed minimal Symphony smoke cycle for {run_id}."),
+            &[LIVE_MINIMAL_SMOKE_LABEL],
+        )
+        .await?;
+        let task_id = json_id(&task);
+        let identifier = format!("TD-{task_id}");
+
+        let dir = tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
+        let worker_setup = live_worker_setup(backend, &run_id, dir.path())?;
+        let workflow_path = write_workflow_from_template(
+            dir.path(),
+            "WORKFLOW.smoke.minimal.md",
+            &token,
+            &project_id,
+            &worker_setup,
+        )?;
+        let workflow_store =
+            WorkflowStore::new(workflow_path).map_err(|error| error.to_string())?;
+        let orchestrator = start_orchestrator_with_retry(workflow_store.clone()).await?;
+        let orchestrator_handle = orchestrator.handle();
+        let local_workspace_path =
+            workspace_path_for_identifier(&workflow_store.effective().config, &identifier);
+
+        let result = async {
+            let started = tokio::time::Instant::now();
+            let timeout = Duration::from_secs(300);
+            let mut observed_file_update = false;
+            let mut observed_workpad = false;
+            let mut returned_to_backlog = false;
+            let mut remote_worker_host = None::<String>;
+            let mut remote_workspace_path = None::<PathBuf>;
+            let mut observed_remote_worker = false;
+
+            while started.elapsed() < timeout {
+                if !worker_setup.ssh_worker_hosts.is_empty()
+                    && (remote_worker_host.is_none() || remote_workspace_path.is_none())
+                    && let Ok(Some(detail)) =
+                        orchestrator_handle.issue_detail(identifier.clone()).await
+                    && let Some(worker_host) = detail.workspace.worker_host
+                {
+                    observed_remote_worker = true;
+                    remote_workspace_path = Some(workspace_path_for_identifier_on_host(
+                        &workflow_store.effective().config,
+                        &identifier,
+                        Some(worker_host.as_str()),
+                    ));
+                    remote_worker_host = Some(worker_host);
+                }
+
+                if !observed_file_update {
+                    observed_file_update = if worker_setup.ssh_worker_hosts.is_empty() {
+                        fs::read_to_string(local_workspace_path.join(SMOKE_TARGET_FILE))
+                            .ok()
+                            .is_some_and(|content| {
+                                minimal_smoke_target_contains(&content, &identifier, &task_title)
+                            })
+                    } else if let (Some(worker_host), Some(workspace_path)) = (
+                        remote_worker_host.as_deref(),
+                        remote_workspace_path.as_ref(),
+                    ) {
+                        read_remote_file(worker_host, &workspace_path.join(SMOKE_TARGET_FILE))
+                            .ok()
+                            .is_some_and(|content| {
+                                minimal_smoke_target_contains(&content, &identifier, &task_title)
+                            })
+                    } else {
+                        false
+                    };
+                }
+
+                if !observed_workpad {
+                    let comments = task_comments(&client, &base_url, &token, &task_id).await?;
+                    let workpads = workpad_comments(&comments);
+                    observed_workpad = workpads.len() == 1
+                        && workpads[0]
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| {
+                                content.contains("SMOKE_TARGET.md")
+                                    && content.contains(TODOIST_WORKPAD_HEADER)
+                            });
+                }
+
+                if !returned_to_backlog {
+                    returned_to_backlog = task_is_in_section(
+                        &client,
+                        &base_url,
+                        &token,
+                        &task_id,
+                        &backlog_section_id,
+                    )
+                    .await?;
+                }
+
+                if observed_file_update && observed_workpad && returned_to_backlog {
+                    break;
+                }
+
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            }
+
+            if !observed_file_update {
+                return Err(
+                    "expected minimal smoke workspace to update `SMOKE_TARGET.md`".to_string(),
+                );
+            }
+            if !observed_workpad {
+                return Err(
+                    "expected exactly one persistent workpad comment for minimal smoke".to_string(),
+                );
+            }
+            if !returned_to_backlog {
+                return Err("expected minimal smoke task to return to `Backlog`".to_string());
+            }
+            if !worker_setup.ssh_worker_hosts.is_empty() && !observed_remote_worker {
+                return Err(
+                    "expected minimal smoke task to dispatch onto an SSH worker".to_string()
+                );
+            }
+
+            Ok::<(), String>(())
+        }
+        .await;
+
+        orchestrator.shutdown().await;
+        match cleanup_live_worker_setup(worker_setup) {
+            Some(error) if result.is_ok() => Err(error),
+            Some(error) => Err(format!("{}; {error}", result.unwrap_err())),
+            None => result,
+        }
+    }
+    .await;
+
+    finalize_live_e2e(
+        outcome,
+        vec![
+            delete_project(&client, &base_url, &token, &project_id)
+                .await
+                .err()
+                .map(|error| format!("minimal smoke live e2e cleanup failed: {error}")),
+            runtime_env::load_dotenv_for_workflow(&manifest_workflow)
+                .err()
+                .map(|error| format!("failed to restore dotenv state: {error}")),
+        ],
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires live Todoist, Codex, and GitHub access"]
 async fn completes_a_full_smoke_repo_workflow_end_to_end() {
+    run_full_smoke_repo_workflow_end_to_end(LiveWorkerBackend::Local).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Todoist, Codex, GitHub, and SSH worker access"]
+async fn completes_a_full_smoke_repo_workflow_end_to_end_with_ssh_worker() {
+    run_full_smoke_repo_workflow_end_to_end(LiveWorkerBackend::Ssh).await;
+}
+
+async fn run_full_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) {
     let _guard = live_e2e_lock().lock().await;
     let manifest_workflow = manifest_workflow_path("WORKFLOW.md");
     runtime_env::load_dotenv_for_workflow(&manifest_workflow).expect("dotenv");
@@ -348,10 +615,14 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
     reset_shared_smoke_state().expect("reset shared smoke state");
 
     let github_token = github_api_token().expect("GitHub auth token");
-    let client = Client::new();
+    let client = live_http_client();
     let base_url = todoist_base_url();
+    let backend_label = match backend {
+        LiveWorkerBackend::Local => "local",
+        LiveWorkerBackend::Ssh => "ssh",
+    };
     let run_id = format!(
-        "symphony-rust-todoist-smoke-e2e-{}",
+        "symphony-rust-todoist-smoke-e2e-{backend_label}-{}",
         Utc::now().timestamp_millis()
     );
     let project = create_project(
@@ -365,6 +636,7 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
     let project_id = json_id(&project);
 
     let outcome = async {
+        wait_for_todoist_project_visibility(&client, &base_url, &token, &project_id).await?;
         let sections =
             create_canonical_smoke_sections(&client, &base_url, &token, &project_id).await?;
         let todo_section_id = sections
@@ -395,17 +667,17 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
         let identifier = format!("TD-{task_id}");
 
         let dir = tempdir().map_err(|error| format!("tempdir failed: {error}"))?;
+        let worker_setup = live_worker_setup(backend, &run_id, dir.path())?;
         let workflow_path = write_workflow_from_template(
             dir.path(),
             "WORKFLOW.smoke.full.md",
             &token,
             &project_id,
+            &worker_setup,
         )?;
         let workflow_store =
             WorkflowStore::new(workflow_path).map_err(|error| error.to_string())?;
-        let workspace_path =
-            workspace_path_for_identifier(&workflow_store.effective().config, &identifier);
-        let orchestrator = start_orchestrator_with_retry(workflow_store).await?;
+        let orchestrator = start_orchestrator_with_retry(workflow_store.clone()).await?;
         let orchestrator_handle = orchestrator.handle();
 
         let result = async {
@@ -414,8 +686,18 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
             let mut pr_url = None;
             let mut last_review_error = None;
             let mut ready_pr_without_handoff_since = None;
+            let mut remote_worker_host = worker_setup.ssh_worker_hosts.first().cloned();
+            let mut observed_remote_worker = false;
 
             while review_started.elapsed() < review_timeout {
+                if !worker_setup.ssh_worker_hosts.is_empty()
+                    && let Ok(Some(detail)) =
+                        orchestrator_handle.issue_detail(identifier.clone()).await
+                    && let Some(worker_host) = detail.workspace.worker_host
+                {
+                    observed_remote_worker = true;
+                    remote_worker_host = Some(worker_host);
+                }
                 match poll_full_smoke_handoff(
                     &client,
                     &base_url,
@@ -499,6 +781,19 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
             let mut merge_observed_at = None;
 
             while merge_started.elapsed() < merge_timeout {
+                if !worker_setup.ssh_worker_hosts.is_empty()
+                    && let Ok(Some(detail)) =
+                        orchestrator_handle.issue_detail(identifier.clone()).await
+                    && let Some(worker_host) = detail.workspace.worker_host
+                {
+                    observed_remote_worker = true;
+                    remote_worker_host = Some(worker_host);
+                }
+                let workspace_path = workspace_path_for_identifier_on_host(
+                    &workflow_store.effective().config,
+                    &identifier,
+                    remote_worker_host.as_deref(),
+                );
                 match poll_full_smoke_merge(
                     &client,
                     &base_url,
@@ -510,6 +805,7 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
                     &run_id,
                     &pr_url,
                     &workspace_path,
+                    remote_worker_host.as_deref(),
                 )
                 .await
                 {
@@ -536,6 +832,10 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
                 sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
             }
 
+            if !worker_setup.ssh_worker_hosts.is_empty() && !observed_remote_worker {
+                return Err("expected full smoke run to dispatch onto an SSH worker".to_string());
+            }
+
             if !merged {
                 return Err(last_merge_error.unwrap_or_else(|| {
                     "expected merged PR and guarded Todoist completion after Merging".to_string()
@@ -547,7 +847,11 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
         .await;
 
         orchestrator.shutdown().await;
-        result
+        match cleanup_live_worker_setup(worker_setup) {
+            Some(error) if result.is_ok() => Err(error),
+            Some(error) => Err(format!("{}; {error}", result.unwrap_err())),
+            None => result,
+        }
     }
     .await;
 
@@ -564,9 +868,267 @@ async fn completes_a_full_smoke_repo_workflow_end_to_end() {
     );
 }
 
+fn write_live_issue_workflow(
+    workflow_path: &Path,
+    token: &str,
+    base_url: &str,
+    project_id: &str,
+    worker_setup: &LiveWorkerSetup,
+    expected_workpad_marker: &str,
+) -> Result<(), String> {
+    let worker_yaml = worker_setup.worker_yaml();
+
+    fs::write(
+        workflow_path,
+        format!(
+            r#"---
+tracker:
+  kind: todoist
+  api_key: {api_key}
+  base_url: {base_url}
+  project_id: {tracker_project_id}
+  active_states:
+    - Todo
+  terminal_states:
+    - Done
+polling:
+  interval_ms: 2500
+workspace:
+  root: {workspace_root}
+{worker_yaml}observability:
+  terminal_enabled: false
+codex:
+  approval_policy: never
+  turn_timeout_ms: 600000
+  stall_timeout_ms: 600000
+---
+You are running a real Symphony rust-todoist end-to-end test.
+
+The current working directory is the workspace root.
+
+Step 1:
+Create a file named {result_file} in the current working directory by running exactly:
+
+```sh
+cat > {result_file} <<'EOF'
+identifier={{{{ issue.identifier }}}}
+project_id={project_id}
+EOF
+```
+
+Then verify it by running:
+
+```sh
+cat {result_file}
+```
+
+The file content must be exactly:
+identifier={{{{ issue.identifier }}}}
+project_id={project_id}
+
+Step 2:
+Use the `todoist` tool to read the current task `{{{{ issue.id }}}}` and its task-scoped workpad.
+Ensure there is exactly one persistent workpad comment for this task and that its content includes
+the exact marker block below somewhere verbatim. If the marker is missing, update or create the
+workpad with `todoist.upsert_workpad` so it contains the marker block verbatim in addition to any
+other useful notes:
+
+{expected_workpad_marker}
+
+Step 3:
+Use the `todoist` tool to list sections for the current project `"{project_id}"`, find the
+section named `Human Review`, and move the current task into that section with `todoist.move_task`.
+
+Step 4:
+Before stopping, verify all three outcomes:
+1. the file exists with the exact contents above
+2. the task workpad contains the exact marker block above
+3. the current task is in the `Human Review` section
+
+Do not ask for approval.
+"#,
+            api_key = yaml_single_quoted(token),
+            base_url = yaml_single_quoted(base_url),
+            tracker_project_id = yaml_single_quoted(project_id),
+            workspace_root = yaml_single_quoted(&worker_setup.workspace_root),
+            worker_yaml = worker_yaml,
+            result_file = RESULT_FILE,
+            project_id = project_id,
+            expected_workpad_marker = expected_workpad_marker,
+        ),
+    )
+    .map_err(|error| format!("workflow write failed: {error}"))
+}
+
 fn live_e2e_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn live_worker_setup(
+    backend: LiveWorkerBackend,
+    run_id: &str,
+    test_root: &Path,
+) -> Result<LiveWorkerSetup, String> {
+    match backend {
+        LiveWorkerBackend::Local => {
+            let workspace_root = test_root.join("workspaces");
+            fs::create_dir_all(&workspace_root)
+                .map_err(|error| format!("workspace root create failed: {error}"))?;
+            Ok(LiveWorkerSetup {
+                ssh_worker_hosts: Vec::new(),
+                workspace_root: workspace_root.display().to_string(),
+                remote_test_root: None,
+                docker_cleanup: None,
+            })
+        }
+        LiveWorkerBackend::Ssh => live_ssh_worker_setup(run_id, test_root),
+    }
+}
+
+fn live_ssh_worker_setup(run_id: &str, test_root: &Path) -> Result<LiveWorkerSetup, String> {
+    let ssh_worker_hosts = live_ssh_worker_hosts();
+    if ssh_worker_hosts.is_empty() {
+        live_docker_worker_setup(run_id, test_root)
+    } else {
+        let remote_test_root = format!("{}/.{run_id}", shared_remote_home(&ssh_worker_hosts)?);
+        Ok(LiveWorkerSetup {
+            ssh_worker_hosts,
+            workspace_root: format!("~/.{run_id}/workspaces"),
+            remote_test_root: Some(remote_test_root),
+            docker_cleanup: None,
+        })
+    }
+}
+
+fn cleanup_live_worker_setup(worker_setup: LiveWorkerSetup) -> Option<String> {
+    let mut errors = Vec::new();
+
+    if let Some(remote_test_root) = worker_setup.remote_test_root.as_deref()
+        && let Err(error) =
+            cleanup_remote_test_root(remote_test_root, &worker_setup.ssh_worker_hosts)
+    {
+        errors.push(error);
+    }
+
+    if let Some(docker_cleanup) = worker_setup.docker_cleanup {
+        restore_env_var(
+            "SYMPHONY_SSH_CONFIG",
+            docker_cleanup.previous_ssh_config.as_deref(),
+        );
+        if let Err(error) = docker_compose_down(&docker_cleanup.project_name, &docker_cleanup.env) {
+            errors.push(error);
+        }
+    }
+
+    (!errors.is_empty()).then(|| errors.join("; "))
+}
+
+fn live_ssh_worker_hosts() -> Vec<String> {
+    runtime_env::get("SYMPHONY_LIVE_SSH_WORKER_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn live_docker_worker_setup(run_id: &str, test_root: &Path) -> Result<LiveWorkerSetup, String> {
+    let ssh_root = test_root.join("live-docker-ssh");
+    let key_path = ssh_root.join("id_ed25519");
+    let config_path = ssh_root.join("config");
+    let auth_json_path = default_docker_auth_json();
+    let worker_ports = reserve_tcp_ports(LIVE_DOCKER_WORKER_COUNT)?;
+    let worker_hosts = worker_ports
+        .iter()
+        .map(|port| format!("localhost:{port}"))
+        .collect::<Vec<_>>();
+    let project_name = docker_project_name(run_id);
+    let previous_ssh_config = runtime_env::get("SYMPHONY_SSH_CONFIG");
+    let docker_env = docker_compose_env(
+        &worker_ports,
+        &auth_json_path,
+        &key_path.with_extension("pub"),
+    );
+
+    if !command_is_ready("docker") {
+        return Err("docker worker mode requires `docker` on PATH".to_string());
+    }
+    if !auth_json_path.is_file() {
+        return Err(format!(
+            "docker worker mode requires Codex auth at {}",
+            auth_json_path.display()
+        ));
+    }
+
+    generate_ssh_keypair(&key_path)?;
+    write_docker_ssh_config(&config_path, &key_path)?;
+    unsafe {
+        env::set_var("SYMPHONY_SSH_CONFIG", &config_path);
+    }
+
+    let remote_test_root = match (|| -> Result<String, String> {
+        docker_compose_up(&project_name, &docker_env)?;
+        wait_for_ssh_hosts(&worker_hosts)?;
+        Ok(format!("{}/.{run_id}", shared_remote_home(&worker_hosts)?))
+    })() {
+        Ok(remote_test_root) => remote_test_root,
+        Err(error) => {
+            restore_env_var("SYMPHONY_SSH_CONFIG", previous_ssh_config.as_deref());
+            let _ = docker_compose_down(&project_name, &docker_env);
+            return Err(error);
+        }
+    };
+
+    Ok(LiveWorkerSetup {
+        ssh_worker_hosts: worker_hosts,
+        workspace_root: format!("~/.{run_id}/workspaces"),
+        remote_test_root: Some(remote_test_root),
+        docker_cleanup: Some(LiveDockerCleanup {
+            project_name,
+            env: docker_env,
+            previous_ssh_config,
+        }),
+    })
+}
+
+fn cleanup_remote_test_root(test_root: &str, ssh_worker_hosts: &[String]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for worker_host in ssh_worker_hosts {
+        if let Err(error) = ssh_run(worker_host, &format!("rm -rf {}", shell_escape(test_root))) {
+            errors.push(format!("{worker_host}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("remote cleanup failed: {}", errors.join("; ")))
+    }
+}
+
+fn remote_path_exists(worker_host: &str, remote_path: &Path) -> Result<bool, String> {
+    let remote_path = remote_path.display().to_string();
+    ssh_run(
+        worker_host,
+        &format!(
+            "path={}; case \"$path\" in ~/*) path=\"$HOME/${{path#~/}}\" ;; \"~\") path=\"$HOME\" ;; esac; if [ -e \"$path\" ]; then printf present; fi",
+            shell_escape(&remote_path)
+        ),
+    )
+    .map(|output| output.trim() == "present")
+}
+
+fn restore_env_var(key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        unsafe {
+            env::set_var(key, value);
+        }
+    } else {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 }
 
 fn manifest_workflow_path(filename: &str) -> PathBuf {
@@ -591,6 +1153,13 @@ fn finalize_live_e2e(outcome: Result<(), String>, cleanup_steps: Vec<Option<Stri
     }
 }
 
+fn minimal_smoke_target_contains(content: &str, identifier: &str, task_title: &str) -> bool {
+    content.contains("## Change Log")
+        && content.contains(identifier)
+        && content.contains(task_title)
+        && content.contains("minimal smoke test")
+}
+
 fn full_smoke_poll_error_is_fatal(error: &str) -> bool {
     error.starts_with("Todoist project `")
         || error.starts_with("Todoist task disappeared before PR merge was observed")
@@ -612,6 +1181,322 @@ enum FullSmokeMergeStatus {
     Complete,
 }
 
+fn default_docker_auth_json() -> PathBuf {
+    runtime_env::get("SYMPHONY_LIVE_DOCKER_AUTH_JSON")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(&env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".codex/auth.json")
+        })
+}
+
+fn shared_remote_home(worker_hosts: &[String]) -> Result<String, String> {
+    let mut homes = worker_hosts
+        .iter()
+        .map(|worker_host| remote_home(worker_host).map(|home| (worker_host.clone(), home)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let Some((_, first_home)) = homes.first() else {
+        return Err("expected at least one live SSH worker host".to_string());
+    };
+
+    if homes.iter().all(|(_, home)| home == first_home) {
+        Ok(first_home.clone())
+    } else {
+        homes.sort_by(|left, right| left.0.cmp(&right.0));
+        Err(format!(
+            "expected all live SSH workers to share one home directory, got: {homes:?}"
+        ))
+    }
+}
+
+fn remote_home(worker_host: &str) -> Result<String, String> {
+    let output = ssh_run(worker_host, "printf '%s\\n' \"$HOME\"")?;
+    let home = output.trim().to_string();
+    if home.is_empty() {
+        Err(format!("expected non-empty remote home for {worker_host}"))
+    } else {
+        Ok(home)
+    }
+}
+
+fn reserve_tcp_ports(count: usize) -> Result<Vec<u16>, String> {
+    let mut ports = Vec::with_capacity(count);
+    while ports.len() < count {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("failed to reserve TCP port: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("failed to read reserved TCP port: {error}"))?
+            .port();
+        drop(listener);
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    Ok(ports)
+}
+
+fn generate_ssh_keypair(key_path: &Path) -> Result<(), String> {
+    let key_dir = key_path
+        .parent()
+        .ok_or_else(|| "ssh key path had no parent directory".to_string())?;
+    fs::create_dir_all(key_dir)
+        .map_err(|error| format!("failed to create ssh key directory: {error}"))?;
+    let _ = fs::remove_file(key_path);
+    let _ = fs::remove_file(key_path.with_extension("pub"));
+
+    let output = StdCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(key_path)
+        .output()
+        .map_err(|error| format!("failed to launch `ssh-keygen`: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to generate live docker ssh key (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn write_docker_ssh_config(config_path: &Path, key_path: &Path) -> Result<(), String> {
+    let config_contents = format!(
+        "Host localhost 127.0.0.1\n  User root\n  IdentityFile {}\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n",
+        key_path.display()
+    );
+
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| "ssh config path had no parent directory".to_string())?;
+    fs::create_dir_all(config_dir)
+        .map_err(|error| format!("failed to create ssh config directory: {error}"))?;
+    fs::write(config_path, config_contents)
+        .map_err(|error| format!("failed to write ssh config: {error}"))
+}
+
+fn docker_project_name(run_id: &str) -> String {
+    run_id
+        .chars()
+        .map(|ch| {
+            let lower = ch.to_ascii_lowercase();
+            if lower.is_ascii_alphanumeric() || matches!(lower, '_' | '-') {
+                lower
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn docker_compose_env(
+    worker_ports: &[u16],
+    auth_json_path: &Path,
+    authorized_key_path: &Path,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "SYMPHONY_LIVE_DOCKER_AUTH_JSON".to_string(),
+            auth_json_path.display().to_string(),
+        ),
+        (
+            "SYMPHONY_LIVE_DOCKER_AUTHORIZED_KEY".to_string(),
+            authorized_key_path.display().to_string(),
+        ),
+        (
+            "SYMPHONY_LIVE_DOCKER_WORKER_1_PORT".to_string(),
+            worker_ports
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        (
+            "SYMPHONY_LIVE_DOCKER_WORKER_2_PORT".to_string(),
+            worker_ports.get(1).copied().unwrap_or_default().to_string(),
+        ),
+    ]
+}
+
+fn docker_compose_up(project_name: &str, docker_env: &[(String, String)]) -> Result<(), String> {
+    let support_dir = repo_root().join("elixir/test/support/live_e2e_docker");
+    let compose_file = support_dir.join("docker-compose.yml");
+    let output = StdCommand::new("docker")
+        .args([
+            "compose",
+            "-f",
+            compose_file.to_str().unwrap_or_default(),
+            "-p",
+            project_name,
+            "up",
+            "-d",
+            "--build",
+        ])
+        .current_dir(&support_dir)
+        .envs(docker_env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .map_err(|error| format!("failed to launch docker compose: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to start live docker workers (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))
+    }
+}
+
+fn docker_compose_down(project_name: &str, docker_env: &[(String, String)]) -> Result<(), String> {
+    let support_dir = repo_root().join("elixir/test/support/live_e2e_docker");
+    let compose_file = support_dir.join("docker-compose.yml");
+    let output = StdCommand::new("docker")
+        .args([
+            "compose",
+            "-f",
+            compose_file.to_str().unwrap_or_default(),
+            "-p",
+            project_name,
+            "down",
+            "-v",
+            "--remove-orphans",
+        ])
+        .current_dir(&support_dir)
+        .envs(docker_env.iter().map(|(key, value)| (key, value)))
+        .output()
+        .map_err(|error| format!("failed to launch docker compose cleanup: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to stop live docker workers (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim()
+        ))
+    }
+}
+
+fn wait_for_ssh_hosts(worker_hosts: &[String]) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for worker_host in worker_hosts {
+        loop {
+            match ssh_run(worker_host, "printf ok") {
+                Ok(output) if output.trim() == "ok" => break,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Ok(output) => {
+                    return Err(format!(
+                        "timed out waiting for ssh host {worker_host} to return `ok`, got `{}`",
+                        output.trim()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "timed out waiting for ssh host {worker_host}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_remote_file(worker_host: &str, remote_path: &Path) -> Result<String, String> {
+    let remote_path = remote_path.display().to_string();
+    ssh_run(
+        worker_host,
+        &format!(
+            "path={}; case \"$path\" in ~/*) path=\"$HOME/${{path#~/}}\" ;; \"~\") path=\"$HOME\" ;; esac; cat \"$path\"",
+            shell_escape(&remote_path)
+        ),
+    )
+}
+
+fn ssh_run(worker_host: &str, command: &str) -> Result<String, String> {
+    let executable = ssh_executable_for_tests()?;
+    let output = StdCommand::new(executable)
+        .args(ssh_args_for_tests(worker_host, command))
+        .output()
+        .map_err(|error| format!("failed to launch ssh for {worker_host}: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let merged = if output.stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        };
+        Err(format!(
+            "ssh to {worker_host} failed with status {}: {}",
+            output.status, merged
+        ))
+    }
+}
+
+fn ssh_executable_for_tests() -> Result<String, String> {
+    if let Some(explicit) = runtime_env::get("SYMPHONY_SSH_BIN").filter(|value| !value.is_empty()) {
+        return Ok(explicit);
+    }
+
+    if let Some(path) = env::var_os("PATH") {
+        for candidate_dir in env::split_paths(&path) {
+            let candidate = candidate_dir.join("ssh");
+            if candidate.is_file() {
+                return Ok(candidate.display().to_string());
+            }
+        }
+    }
+
+    Err("ssh executable not found".to_string())
+}
+
+fn ssh_args_for_tests(worker_host: &str, command: &str) -> Vec<String> {
+    let (destination, port) = parse_worker_host(worker_host);
+    let mut args = Vec::new();
+    if let Some(config_path) =
+        runtime_env::get("SYMPHONY_SSH_CONFIG").filter(|value| !value.trim().is_empty())
+    {
+        args.push("-F".to_string());
+        args.push(config_path);
+    }
+    args.push("-T".to_string());
+    if let Some(port) = port {
+        args.push("-p".to_string());
+        args.push(port);
+    }
+    args.push(destination);
+    args.push(remote_shell_command(command));
+    args
+}
+
+fn parse_worker_host(worker_host: &str) -> (String, Option<String>) {
+    let trimmed = worker_host.trim();
+    if let Some((destination, port)) = trimmed.rsplit_once(':')
+        && !destination.is_empty()
+        && port.chars().all(|ch| ch.is_ascii_digit())
+        && (!destination.contains(':') || (destination.contains('[') && destination.contains(']')))
+    {
+        return (destination.to_string(), Some(port.to_string()));
+    }
+    (trimmed.to_string(), None)
+}
+
+fn remote_shell_command(command: &str) -> String {
+    format!("sh -lc {}", shell_escape(command))
+}
+
+fn shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn todoist_base_url() -> String {
     runtime_env::get("TODOIST_API_BASE_URL")
         .filter(|value| !value.trim().is_empty())
@@ -619,11 +1504,14 @@ fn todoist_base_url() -> String {
 }
 
 fn command_is_ready(command: &str) -> bool {
-    StdCommand::new(command)
-        .arg("--version")
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    env::var_os("PATH").is_some_and(|search_path| {
+        env::split_paths(&search_path).any(|directory| directory.join(command).is_file())
+    })
 }
 
 fn preflight_smoke_repo() -> Result<(), String> {
@@ -729,6 +1617,7 @@ fn write_workflow_from_template(
     template_name: &str,
     token: &str,
     project_id: &str,
+    worker_setup: &LiveWorkerSetup,
 ) -> Result<PathBuf, String> {
     let template_path = manifest_workflow_path(template_name);
     let mut template = fs::read_to_string(&template_path)
@@ -740,20 +1629,22 @@ fn write_workflow_from_template(
     {
         template = inject_todoist_base_url(&template, &base_url);
     }
+    template = inject_worker_yaml(&template, &worker_setup.worker_yaml());
 
     let workflow_path = workflow_dir.join("WORKFLOW.md");
     fs::write(&workflow_path, template)
         .map_err(|error| format!("failed to write workflow template copy: {error}"))?;
 
-    let workspace_root = workflow_dir.join("workspaces");
-    fs::create_dir_all(&workspace_root)
-        .map_err(|error| format!("failed to create workflow workspace root: {error}"))?;
+    if worker_setup.ssh_worker_hosts.is_empty() {
+        fs::create_dir_all(Path::new(&worker_setup.workspace_root))
+            .map_err(|error| format!("failed to create workflow workspace root: {error}"))?;
+    }
 
     let mut env_lines = vec![
         format!("TODOIST_API_TOKEN={}", dotenv_quoted(token)),
         format!(
             "SYMPHONY_WORKSPACE_ROOT={}",
-            dotenv_quoted(&workspace_root.display().to_string())
+            dotenv_quoted(&worker_setup.workspace_root)
         ),
         format!("SYMPHONY_SMOKE_PROJECT_ID={}", dotenv_quoted(project_id)),
     ];
@@ -783,6 +1674,15 @@ fn inject_todoist_base_url(template: &str, base_url: &str) -> String {
     )
 }
 
+fn inject_worker_yaml(template: &str, worker_yaml: &str) -> String {
+    if worker_yaml.is_empty() || template.contains("\nworker:\n") {
+        return template.to_string();
+    }
+
+    let needle = "workspace:\n  root: $SYMPHONY_WORKSPACE_ROOT\n";
+    template.replacen(needle, &format!("{needle}{worker_yaml}"), 1)
+}
+
 fn dotenv_quoted(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -810,6 +1710,7 @@ fn json_id_scalar(value: &Value) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_task_with_body(
     client: &Client,
     base_url: &str,
@@ -990,7 +1891,7 @@ async fn task_comments_contain(
         }))
 }
 
-fn workpad_comments<'a>(comments: &'a [Value]) -> Vec<&'a Value> {
+fn workpad_comments(comments: &[Value]) -> Vec<&Value> {
     comments
         .iter()
         .filter(|comment| {
@@ -1042,6 +1943,28 @@ async fn todoist_project_exists(
     )
     .await?
     .is_some())
+}
+
+async fn wait_for_todoist_project_visibility(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    project_id: &str,
+) -> Result<(), String> {
+    let started = tokio::time::Instant::now();
+    let timeout = Duration::from_secs(TODOIST_PROJECT_VISIBILITY_TIMEOUT_SECS);
+
+    loop {
+        if todoist_project_exists(client, base_url, token, project_id).await? {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "Todoist project `{project_id}` did not become visible within {TODOIST_PROJECT_VISIBILITY_TIMEOUT_SECS}s"
+            ));
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn todoist_task_status(
@@ -1167,12 +2090,21 @@ async fn todoist_request_optional(
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if let Some(delay_secs) = todoist_retry_delay_seconds(
-            todoist_retry_after_hint(&headers, &text),
-            Some(status),
-            attempts,
-            waited_secs,
-        ) {
+        let retry_after = todoist_retry_after_hint(&headers, &text);
+        if status == StatusCode::TOO_MANY_REQUESTS
+            && retry_after_exceeds_wait_budget(
+                retry_after,
+                waited_secs,
+                TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS,
+            )
+        {
+            return Err(format!(
+                "Todoist rate limit retry_after={retry_after:?} exceeds live test wait budget of {TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS}s for {path}: {text}"
+            ));
+        }
+        if let Some(delay_secs) =
+            todoist_retry_delay_seconds(retry_after, Some(status), attempts, waited_secs)
+        {
             attempts += 1;
             waited_secs = waited_secs.saturating_add(delay_secs);
             sleep(Duration::from_secs(delay_secs)).await;
@@ -1222,6 +2154,15 @@ fn todoist_retry_after_hint(headers: &HeaderMap, text: &str) -> Option<u64> {
     }
 }
 
+fn retry_after_exceeds_wait_budget(
+    retry_after: Option<u64>,
+    waited_secs: u64,
+    total_wait_budget_secs: u64,
+) -> bool {
+    retry_after
+        .is_some_and(|retry_after| retry_after > total_wait_budget_secs.saturating_sub(waited_secs))
+}
+
 fn todoist_retry_delay_seconds(
     retry_after: Option<u64>,
     status: Option<StatusCode>,
@@ -1229,6 +2170,16 @@ fn todoist_retry_delay_seconds(
     waited_secs: u64,
 ) -> Option<u64> {
     if attempts >= TODOIST_RATE_LIMIT_MAX_RETRIES {
+        return None;
+    }
+
+    if matches!(status, Some(StatusCode::TOO_MANY_REQUESTS))
+        && retry_after_exceeds_wait_budget(
+            retry_after,
+            waited_secs,
+            TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS,
+        )
+    {
         return None;
     }
 
@@ -1268,6 +2219,7 @@ fn todoist_status_is_transient(status: StatusCode) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn auto_approve_full_smoke_review(
     orchestrator: &OrchestratorHandle,
     client: &Client,
@@ -1340,9 +2292,21 @@ fn todoist_retry_delay_seconds_retries_transport_failures() {
 #[test]
 fn todoist_retry_delay_seconds_caps_large_retry_after_values() {
     assert_eq!(
-        todoist_retry_delay_seconds(Some(1_027), Some(StatusCode::TOO_MANY_REQUESTS), 0, 0),
+        todoist_retry_delay_seconds(Some(60), Some(StatusCode::TOO_MANY_REQUESTS), 0, 0),
         Some(60)
     );
+    assert_eq!(
+        todoist_retry_delay_seconds(Some(1_027), Some(StatusCode::TOO_MANY_REQUESTS), 0, 0),
+        None
+    );
+}
+
+#[test]
+fn retry_after_exceeds_wait_budget_detects_oversized_hints() {
+    assert!(retry_after_exceeds_wait_budget(Some(301), 0, 300));
+    assert!(retry_after_exceeds_wait_budget(Some(51), 250, 300));
+    assert!(!retry_after_exceeds_wait_budget(Some(50), 250, 300));
+    assert!(!retry_after_exceeds_wait_budget(None, 0, 300));
 }
 
 #[test]
@@ -1455,9 +2419,22 @@ async fn github_request_json(
             .text()
             .await
             .map_err(|error| format!("GitHub body read failed for {path}: {error}"))?;
+        let retry_after = github_retry_after_hint(&headers, &text);
+
+        if github_status_uses_retry_after(status, &text)
+            && retry_after_exceeds_wait_budget(
+                retry_after,
+                waited_secs,
+                GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS,
+            )
+        {
+            return Err(format!(
+                "GitHub rate limit retry_after={retry_after:?} exceeds live test wait budget of {GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS}s for {path}: {text}"
+            ));
+        }
 
         if let Some(delay_secs) = github_retry_delay_seconds(
-            github_retry_after_hint(&headers, &text),
+            retry_after,
             Some(status),
             Some(&text),
             attempts,
@@ -1518,9 +2495,22 @@ async fn github_request_raw(client: &Client, token: &str, path: &str) -> Result<
             .text()
             .await
             .map_err(|error| format!("GitHub raw body read failed for {path}: {error}"))?;
+        let retry_after = github_retry_after_hint(&headers, &text);
+
+        if github_status_uses_retry_after(status, &text)
+            && retry_after_exceeds_wait_budget(
+                retry_after,
+                waited_secs,
+                GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS,
+            )
+        {
+            return Err(format!(
+                "GitHub rate limit retry_after={retry_after:?} exceeds live test wait budget of {GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS}s for {path}: {text}"
+            ));
+        }
 
         if let Some(delay_secs) = github_retry_delay_seconds(
-            github_retry_after_hint(&headers, &text),
+            retry_after,
             Some(status),
             Some(&text),
             attempts,
@@ -1794,6 +2784,16 @@ fn github_retry_delay_seconds(
     waited_secs: u64,
 ) -> Option<u64> {
     if attempts >= GITHUB_REQUEST_MAX_RETRIES {
+        return None;
+    }
+
+    if status.is_some_and(|status| github_status_uses_retry_after(status, text.unwrap_or_default()))
+        && retry_after_exceeds_wait_budget(
+            retry_after,
+            waited_secs,
+            GITHUB_REQUEST_MAX_TOTAL_WAIT_SECS,
+        )
+    {
         return None;
     }
 
@@ -2254,6 +3254,7 @@ async fn poll_full_smoke_ready_pr_without_handoff(
     Ok(Some(pr_url))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_full_smoke_merge(
     client: &Client,
     base_url: &str,
@@ -2265,6 +3266,7 @@ async fn poll_full_smoke_merge(
     run_id: &str,
     pr_url: &str,
     workspace_path: &Path,
+    worker_host: Option<&str>,
 ) -> Result<FullSmokeMergeStatus, String> {
     let pr = github_pull_request_details(client, github_token, pr_url).await?;
     let merged = github_pr_is_merged(&pr);
@@ -2295,7 +3297,12 @@ async fn poll_full_smoke_merge(
         return Ok(FullSmokeMergeStatus::Pending);
     }
 
-    if workspace_path.exists() {
+    let workspace_exists = match worker_host {
+        Some(worker_host) => remote_path_exists(worker_host, workspace_path)?,
+        None => workspace_path.exists(),
+    };
+
+    if workspace_exists {
         return Ok(FullSmokeMergeStatus::Pending);
     }
 
@@ -2439,13 +3446,23 @@ fn github_status_is_transient_recognizes_rate_limit_responses() {
 fn github_retry_delay_seconds_retries_and_caps_rate_limit_hints() {
     assert_eq!(
         github_retry_delay_seconds(
-            Some(1_024),
+            Some(60),
             Some(StatusCode::TOO_MANY_REQUESTS),
             Some("{}"),
             0,
             0,
         ),
         Some(60)
+    );
+    assert_eq!(
+        github_retry_delay_seconds(
+            Some(1_024),
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            Some("{}"),
+            0,
+            0,
+        ),
+        None
     );
     assert_eq!(
         github_retry_delay_seconds(None, Some(StatusCode::BAD_GATEWAY), Some("{}"), 1, 2,),

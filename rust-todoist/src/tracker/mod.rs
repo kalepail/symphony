@@ -2,6 +2,8 @@ pub mod memory;
 pub mod todoist;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
@@ -26,6 +28,21 @@ impl TrackerCapabilities {
             activity_log: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TrackerRateBudget {
+    pub service: String,
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub reset_in_seconds: Option<u64>,
+    pub retry_after_seconds: Option<u64>,
+    pub throttled_until: Option<DateTime<Utc>>,
+    pub throttled_for_seconds: Option<u64>,
+    pub next_request_at: Option<DateTime<Utc>>,
+    pub next_request_in_seconds: Option<u64>,
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -77,6 +94,9 @@ pub enum TrackerError {
 pub trait TrackerClient: Send + Sync {
     async fn capabilities(&self) -> Result<TrackerCapabilities, TrackerError> {
         Ok(TrackerCapabilities::full())
+    }
+    async fn rate_budget(&self) -> Option<TrackerRateBudget> {
+        None
     }
     async fn validate_startup(&self) -> Result<(), TrackerError> {
         Ok(())

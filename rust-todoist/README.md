@@ -131,6 +131,7 @@ Notes:
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
 - `worker.ssh_hosts` enables distributed execution over SSH. When configured, Symphony picks the least-loaded host, applies `worker.max_concurrent_agents_per_host` as a per-host cap when present, preserves host affinity across retries, and sweeps stale remote workspaces during startup. Host strings may include an explicit port, for example `builder-b:2222`.
 - Remote workspace paths preserve the configured `workspace.root` string, including `~`, so operator surfaces and cleanup use the same logical path that remote hooks and Codex sessions receive.
+- Todoist rate limits are per user, not per token. Run smoke, development, and production against separate Todoist users when you need hard isolation; separate tokens on the same user still share one upstream budget.
 - `codex.command` is preserved as a shell command string and is launched via a POSIX shell (`bash -lc` when available, otherwise `sh -lc`).
 - Prompt rendering uses strict template behavior. Unknown variables or filters fail the affected run attempt.
 - The Rust implementation watches `WORKFLOW.md` and reloads the last good config without restart. Invalid reloads are logged and block new dispatches until fixed.
@@ -180,7 +181,7 @@ Todoist Operations Dashboard
 - Running / Retrying / Total Tokens / Runtime cards
 - Throughput card and 10-minute graph card
 - Running sessions table with JSON details and Copy ID affordance
-- Retry queue, rate-limit JSON, and polling JSON
+- Retry queue, Codex rate-limit JSON, Todoist budget JSON, and polling JSON
 ```
 
 ## Canonical Todoist Workflow
@@ -210,5 +211,5 @@ Tracked live-smoke workflow files now live alongside the main workflow:
 - [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
 - [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
 - [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`.
-- [tests/live_e2e.rs](./tests/live_e2e.rs) is the env-gated real Todoist/Codex integration harness modeled after Elixir’s live E2E tests. It now provides both the lightweight disposable-project handoff smoke and a full clean-slate parity smoke that seeds a disposable Todoist project, drives the checked-in full smoke workflow to `Human Review`, moves the task to `Merging`, verifies the PR merge, and confirms guarded `todoist.close_task` completion.
+- [tests/live_e2e.rs](./tests/live_e2e.rs) is the env-gated real Todoist/Codex integration harness modeled after Elixir’s live E2E tests. It now provides both local and SSH-worker variants for the lightweight disposable-project handoff smoke, the repo-backed minimal smoke workflow, and the full clean-slate parity smoke, including the Docker-backed SSH fallback when `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, then drives the checked-in full smoke workflow to `Human Review`, moves the task to `Merging`, verifies the PR merge, and confirms guarded `todoist.close_task` completion.
 - [`../scripts/reset_smoke_state.py`](../scripts/reset_smoke_state.py) resets the shared smoke surfaces by restoring the smoke repo baseline files, deleting disposable smoke branches, deleting open Todoist smoke tasks from `SYMPHONY_SMOKE_PROJECT_ID`, deleting disposable Rust Todoist live-E2E projects, removing the legacy shared active-project registry if present, and deleting disposable Linear live-E2E projects.

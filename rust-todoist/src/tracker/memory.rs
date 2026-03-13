@@ -15,6 +15,7 @@ use crate::{
     issue::{Issue, normalize_state_name},
     tracker::{
         TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
+        TrackerRateBudget,
         todoist::{normalize_task, todoist_task_url},
     },
 };
@@ -74,7 +75,7 @@ struct MemoryFixtureEnvelope {
 enum MemoryFixture {
     Issues(Vec<Issue>),
     Tasks(Vec<Value>),
-    Envelope(MemoryFixtureEnvelope),
+    Envelope(Box<MemoryFixtureEnvelope>),
 }
 
 impl MemoryTracker {
@@ -149,7 +150,7 @@ impl MemoryTracker {
         let is_shared = project
             .and_then(|project| project.get("is_shared"))
             .and_then(Value::as_bool)
-            .unwrap_or_else(|| !state.collaborators.is_empty());
+            .unwrap_or(!state.collaborators.is_empty());
         let can_assign_tasks = project
             .and_then(|project| project.get("can_assign_tasks"))
             .and_then(Value::as_bool)
@@ -386,6 +387,10 @@ impl MemoryTracker {
 impl TrackerClient for MemoryTracker {
     async fn capabilities(&self) -> Result<TrackerCapabilities, TrackerError> {
         Ok(self.capabilities_from_state(&self.state()))
+    }
+
+    async fn rate_budget(&self) -> Option<TrackerRateBudget> {
+        None
     }
 
     async fn validate_startup(&self) -> Result<(), TrackerError> {
@@ -1040,10 +1045,11 @@ impl TrackerClient for MemoryTracker {
             _ => None,
         });
         maybe_add_origin_back_reference(&mut task, origin_task_id.as_deref());
-        if task.get("parent_id").is_none() && task.get("section_id").is_none() {
-            if let Some(section_id) = self.default_todo_section_id(&state, &project_id) {
-                task.insert("section_id".to_string(), Value::String(section_id));
-            }
+        if task.get("parent_id").is_none()
+            && task.get("section_id").is_none()
+            && let Some(section_id) = self.default_todo_section_id(&state, &project_id)
+        {
+            task.insert("section_id".to_string(), Value::String(section_id));
         }
         if let Some(label) = self.runtime_label_filter().as_deref() {
             enforce_runtime_label_scope(&mut task, label);
@@ -1359,7 +1365,7 @@ fn parse_fixture(
                 ..MemoryFixtureEnvelope::default()
             },
         ),
-        MemoryFixture::Envelope(envelope) => state_from_envelope(config, envelope),
+        MemoryFixture::Envelope(envelope) => state_from_envelope(config, *envelope),
     })
 }
 
@@ -1741,7 +1747,7 @@ fn validate_required_open_sections(
     }
 
     for state in &required {
-        let key = normalize_state_name(&state);
+        let key = normalize_state_name(state);
         if !key.is_empty() && !available.contains(&key) {
             return Err(TrackerError::TodoistMissingRequiredSection(state.clone()));
         }
@@ -2515,7 +2521,10 @@ mod tests {
             .await
             .expect_err("missing merging section");
 
-        assert_eq!(error.to_string(), "todoist_missing_required_section Merging");
+        assert_eq!(
+            error.to_string(),
+            "todoist_missing_required_section Merging"
+        );
     }
 
     #[tokio::test]

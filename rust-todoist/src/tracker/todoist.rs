@@ -1,4 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,7 +18,10 @@ use tracing::warn;
 use crate::{
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
-    tracker::{TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError},
+    tracker::{
+        TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
+        TrackerRateBudget,
+    },
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -32,11 +39,17 @@ const TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS: u64 = 30;
 const TODOIST_PLAN_LIMITS_MAX_RETRIES: usize = 1;
 const TODOIST_PLAN_LIMITS_MAX_DELAY_SECS: u64 = 5;
 const TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS: u64 = 5;
+const TODOIST_REST_BUCKET_CAPACITY: f64 = 60.0;
+const TODOIST_REST_BUCKET_REFILL_PER_SEC: f64 = 1.0;
+const TODOIST_SYNC_BUCKET_CAPACITY: f64 = 5.0;
+const TODOIST_SYNC_BUCKET_REFILL_PER_SEC: f64 = 5.0 / 60.0;
+const TODOIST_PRETHROTTLE_MAX_WAIT_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct TodoistTracker {
     client: Client,
     config: ServiceConfig,
+    rate_state: Arc<Mutex<TodoistRateState>>,
 }
 
 #[derive(Clone)]
@@ -56,6 +69,47 @@ struct TodoistRetryPolicy {
     default_delay_secs: u64,
     max_delay_secs: u64,
     max_total_wait_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+enum TodoistRequestLane {
+    Rest,
+    Sync,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TodoistRateHeaders {
+    limit: Option<u64>,
+    remaining: Option<u64>,
+    reset_at: Option<DateTime<Utc>>,
+    retry_after: Option<u64>,
+}
+
+#[derive(Debug)]
+struct TodoistRateState {
+    rest_bucket: TodoistTokenBucket,
+    sync_bucket: TodoistTokenBucket,
+    limit: Option<u64>,
+    remaining: Option<u64>,
+    reset_at: Option<DateTime<Utc>>,
+    retry_after: Option<u64>,
+    throttled_until: Option<DateTime<Utc>>,
+    next_request_at: Option<DateTime<Utc>>,
+    observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TodoistTokenBucket {
+    capacity: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    last_refill_at: Instant,
+}
+
+enum TodoistThrottleAction {
+    Proceed,
+    Wait(Duration),
+    RateLimited { retry_after: Option<u64> },
 }
 
 const DEFAULT_TODOIST_RETRY_POLICY: TodoistRetryPolicy = TodoistRetryPolicy {
@@ -79,13 +133,273 @@ const PLAN_LIMITS_TODOIST_RETRY_POLICY: TodoistRetryPolicy = TodoistRetryPolicy 
     max_total_wait_secs: TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS,
 };
 
+impl TodoistRateState {
+    fn new() -> Self {
+        Self {
+            rest_bucket: TodoistTokenBucket::new(
+                TODOIST_REST_BUCKET_CAPACITY,
+                TODOIST_REST_BUCKET_REFILL_PER_SEC,
+            ),
+            sync_bucket: TodoistTokenBucket::new(
+                TODOIST_SYNC_BUCKET_CAPACITY,
+                TODOIST_SYNC_BUCKET_REFILL_PER_SEC,
+            ),
+            limit: None,
+            remaining: None,
+            reset_at: None,
+            retry_after: None,
+            throttled_until: None,
+            next_request_at: None,
+            observed_at: None,
+        }
+    }
+
+    fn reserve(&mut self, lane: TodoistRequestLane) -> TodoistThrottleAction {
+        let now = Utc::now();
+        self.prune(now);
+
+        if let Some(throttled_until) = self.throttled_until.filter(|until| *until > now) {
+            return throttle_action_for_target(now, throttled_until);
+        }
+
+        if let Some(next_request_at) = self
+            .next_request_at
+            .filter(|next_request_at| *next_request_at > now)
+        {
+            return throttle_action_for_target(now, next_request_at);
+        }
+
+        if self.remaining == Some(0)
+            && let Some(reset_at) = self.reset_at.filter(|reset_at| *reset_at > now)
+        {
+            return throttle_action_for_target(now, reset_at);
+        }
+
+        let bucket = match lane {
+            TodoistRequestLane::Rest => &mut self.rest_bucket,
+            TodoistRequestLane::Sync => &mut self.sync_bucket,
+        };
+
+        let wait = bucket.reserve(1.0);
+        if wait.is_zero() {
+            TodoistThrottleAction::Proceed
+        } else {
+            throttle_action_for_duration(wait)
+        }
+    }
+
+    fn observe_response(&mut self, status: StatusCode, headers: TodoistRateHeaders) {
+        let now = Utc::now();
+        self.prune(now);
+        self.observed_at = Some(now);
+
+        if headers.limit.is_some() {
+            self.limit = headers.limit;
+        }
+        if headers.remaining.is_some() {
+            self.remaining = headers.remaining;
+        }
+        if headers.reset_at.is_some() {
+            self.reset_at = headers.reset_at;
+        }
+
+        self.retry_after = headers.retry_after;
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            self.throttled_until = headers
+                .retry_after
+                .and_then(|retry_after| {
+                    chrono::Duration::from_std(Duration::from_secs(retry_after))
+                        .ok()
+                        .map(|duration| now + duration)
+                })
+                .or(self.reset_at.filter(|reset_at| *reset_at > now));
+            self.next_request_at = self.throttled_until.or(self.reset_at);
+            return;
+        }
+
+        if self
+            .throttled_until
+            .is_some_and(|throttled_until| throttled_until <= now)
+            || headers.remaining.is_some_and(|remaining| remaining > 0)
+        {
+            self.throttled_until = None;
+        }
+
+        self.next_request_at = next_observed_request_at(now, self.remaining, self.reset_at);
+    }
+
+    fn prune(&mut self, now: DateTime<Utc>) {
+        if self.reset_at.is_some_and(|reset_at| reset_at <= now) {
+            self.remaining = None;
+            self.reset_at = None;
+            self.retry_after = None;
+        }
+        if self
+            .throttled_until
+            .is_some_and(|throttled_until| throttled_until <= now)
+        {
+            self.throttled_until = None;
+        }
+        if self
+            .next_request_at
+            .is_some_and(|next_request_at| next_request_at <= now)
+        {
+            self.next_request_at = None;
+        }
+    }
+
+    fn snapshot(&self) -> Option<TrackerRateBudget> {
+        let now = Utc::now();
+        let reset_at = self.reset_at.filter(|reset_at| *reset_at > now);
+        let throttled_until = self
+            .throttled_until
+            .filter(|throttled_until| *throttled_until > now);
+        let budget = TrackerRateBudget {
+            service: "todoist".to_string(),
+            limit: self.limit,
+            remaining: self.remaining,
+            reset_at,
+            reset_in_seconds: reset_at.and_then(|reset_at| seconds_until(now, reset_at)),
+            retry_after_seconds: self.retry_after,
+            throttled_until,
+            throttled_for_seconds: throttled_until
+                .and_then(|throttled_until| seconds_until(now, throttled_until)),
+            next_request_at: self
+                .next_request_at
+                .filter(|next_request_at| *next_request_at > now),
+            next_request_in_seconds: self
+                .next_request_at
+                .filter(|next_request_at| *next_request_at > now)
+                .and_then(|next_request_at| seconds_until(now, next_request_at)),
+            observed_at: self.observed_at,
+        };
+
+        (budget.limit.is_some()
+            || budget.remaining.is_some()
+            || budget.reset_at.is_some()
+            || budget.retry_after_seconds.is_some()
+            || budget.throttled_until.is_some()
+            || budget.next_request_at.is_some()
+            || budget.observed_at.is_some())
+        .then_some(budget)
+    }
+}
+
+impl TodoistTokenBucket {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            refill_per_sec,
+            tokens: capacity,
+            last_refill_at: Instant::now(),
+        }
+    }
+
+    fn reserve(&mut self, cost: f64) -> Duration {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill_at)
+            .as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last_refill_at = now;
+        }
+
+        self.tokens -= cost;
+        if self.tokens >= 0.0 {
+            return Duration::ZERO;
+        }
+
+        let deficit = -self.tokens;
+        if self.refill_per_sec <= f64::EPSILON {
+            return Duration::from_secs(1);
+        }
+
+        Duration::from_secs_f64(deficit / self.refill_per_sec)
+    }
+}
+
+fn todoist_rate_state_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<TodoistRateState>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<TodoistRateState>>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn todoist_rate_state(config: &ServiceConfig) -> Arc<Mutex<TodoistRateState>> {
+    let key = format!(
+        "{}::{}",
+        config.tracker.base_url.trim_end_matches('/'),
+        config.tracker.api_key.as_deref().unwrap_or_default().trim()
+    );
+    let registry = todoist_rate_state_registry();
+    let mut registry = registry.lock().expect("todoist rate registry poisoned");
+    registry
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(TodoistRateState::new())))
+        .clone()
+}
+
+fn seconds_until(now: DateTime<Utc>, target: DateTime<Utc>) -> Option<u64> {
+    let millis = target.signed_duration_since(now).num_milliseconds();
+    (millis > 0).then(|| ((millis + 999) / 1_000) as u64)
+}
+
+fn duration_until(now: DateTime<Utc>, target: DateTime<Utc>) -> Option<Duration> {
+    let millis = target.signed_duration_since(now).num_milliseconds();
+    (millis > 0).then(|| Duration::from_millis(millis as u64))
+}
+
+fn throttle_action_for_target(now: DateTime<Utc>, target: DateTime<Utc>) -> TodoistThrottleAction {
+    duration_until(now, target)
+        .map(throttle_action_for_duration)
+        .unwrap_or(TodoistThrottleAction::Proceed)
+}
+
+fn throttle_action_for_duration(delay: Duration) -> TodoistThrottleAction {
+    if delay > Duration::from_secs(TODOIST_PRETHROTTLE_MAX_WAIT_SECS) {
+        TodoistThrottleAction::RateLimited {
+            retry_after: Some((delay.as_millis() as u64).div_ceil(1_000)),
+        }
+    } else if delay.is_zero() {
+        TodoistThrottleAction::Proceed
+    } else {
+        TodoistThrottleAction::Wait(delay)
+    }
+}
+
+fn next_observed_request_at(
+    now: DateTime<Utc>,
+    remaining: Option<u64>,
+    reset_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let remaining = remaining?;
+    let reset_at = reset_at.filter(|reset_at| *reset_at > now)?;
+    if remaining == 0 {
+        return Some(reset_at);
+    }
+
+    let millis_until_reset = reset_at.signed_duration_since(now).num_milliseconds();
+    if millis_until_reset <= 0 {
+        return None;
+    }
+
+    let spacing_ms = ((millis_until_reset as f64) / remaining as f64).ceil() as i64;
+    (spacing_ms > 0).then(|| now + chrono::Duration::milliseconds(spacing_ms.max(1)))
+}
+
 impl TodoistTracker {
     pub fn new(config: ServiceConfig) -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
             .build()
             .expect("reqwest client");
-        Self { client, config }
+        let rate_state = todoist_rate_state(&config);
+        Self {
+            client,
+            config,
+            rate_state,
+        }
     }
 
     fn base_url(&self) -> String {
@@ -114,6 +428,35 @@ impl TodoistTracker {
             .ok_or(TrackerError::MissingTrackerProjectId)
     }
 
+    async fn acquire_rate_limit_slot(&self, lane: TodoistRequestLane) -> Result<(), TrackerError> {
+        let action = {
+            let mut state = self.rate_state.lock().expect("todoist rate state poisoned");
+            state.reserve(lane)
+        };
+
+        match action {
+            TodoistThrottleAction::Proceed => Ok(()),
+            TodoistThrottleAction::Wait(delay) => {
+                sleep(delay).await;
+                Ok(())
+            }
+            TodoistThrottleAction::RateLimited { retry_after } => {
+                Err(TrackerError::TodoistRateLimited { retry_after })
+            }
+        }
+    }
+
+    fn observe_rate_limit_response(&self, status: StatusCode, headers: &HeaderMap, text: &str) {
+        let observed = rate_limit_headers(headers, text);
+        let mut state = self.rate_state.lock().expect("todoist rate state poisoned");
+        state.observe_response(status, observed);
+    }
+
+    fn rate_budget_snapshot(&self) -> Option<TrackerRateBudget> {
+        let state = self.rate_state.lock().expect("todoist rate state poisoned");
+        state.snapshot()
+    }
+
     async fn request_json(
         &self,
         method: Method,
@@ -129,6 +472,9 @@ impl TodoistTracker {
         let mut waited_secs = 0u64;
 
         loop {
+            self.acquire_rate_limit_slot(TodoistRequestLane::Rest)
+                .await?;
+
             let mut request = self
                 .client
                 .request(method.clone(), &url)
@@ -166,7 +512,7 @@ impl TodoistTracker {
                         );
                         attempts += 1;
                         waited_secs = waited_secs.saturating_add(delay_secs);
-                        sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        sleep(Duration::from_secs(delay_secs)).await;
                         continue;
                     }
                     return Err(error);
@@ -178,6 +524,7 @@ impl TodoistTracker {
                 .text()
                 .await
                 .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
+            self.observe_rate_limit_response(status, &headers, &text);
 
             if status.is_success() {
                 if text.trim().is_empty() {
@@ -204,7 +551,7 @@ impl TodoistTracker {
                 );
                 attempts += 1;
                 waited_secs = waited_secs.saturating_add(delay_secs);
-                sleep(std::time::Duration::from_secs(delay_secs)).await;
+                sleep(Duration::from_secs(delay_secs)).await;
                 continue;
             }
 
@@ -221,6 +568,9 @@ impl TodoistTracker {
         let mut waited_secs = 0u64;
 
         loop {
+            self.acquire_rate_limit_slot(TodoistRequestLane::Sync)
+                .await?;
+
             let response = match self
                 .client
                 .post(&url)
@@ -248,7 +598,7 @@ impl TodoistTracker {
                         );
                         attempts += 1;
                         waited_secs = waited_secs.saturating_add(delay_secs);
-                        sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        sleep(Duration::from_secs(delay_secs)).await;
                         continue;
                     }
                     return Err(error);
@@ -260,6 +610,7 @@ impl TodoistTracker {
                 .text()
                 .await
                 .map_err(|error| TrackerError::TodoistApiRequest(error.to_string()))?;
+            self.observe_rate_limit_response(status, &headers, &text);
 
             if status.is_success() {
                 return serde_json::from_str(&text)
@@ -281,7 +632,7 @@ impl TodoistTracker {
                 );
                 attempts += 1;
                 waited_secs = waited_secs.saturating_add(delay_secs);
-                sleep(std::time::Duration::from_secs(delay_secs)).await;
+                sleep(Duration::from_secs(delay_secs)).await;
                 continue;
             }
 
@@ -299,7 +650,7 @@ impl TodoistTracker {
         self.request_json(Method::GET, &format!("/projects/{project_id}"), None, None)
             .await
             .map_err(|error| match error {
-                TrackerError::TodoistApiStatus { status, .. } if status == 404 => {
+                TrackerError::TodoistApiStatus { status: 404, .. } => {
                     TrackerError::TodoistProjectNotFound(project_id.to_string())
                 }
                 other => other,
@@ -423,12 +774,12 @@ impl TodoistTracker {
         &self,
         project_id: &str,
     ) -> Result<HashMap<String, String>, TrackerError> {
-        self.get_project_resource(&project_id).await?;
+        self.get_project_resource(project_id).await?;
         let mut sections = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let page = self
-                .get_sections_page(&project_id, cursor.as_deref(), MAX_PAGE_SIZE)
+                .get_sections_page(project_id, cursor.as_deref(), MAX_PAGE_SIZE)
                 .await?;
             let page_results = page
                 .get("results")
@@ -606,7 +957,7 @@ impl TodoistTracker {
             .await
         {
             Ok(task) => Ok(Some(task)),
-            Err(TrackerError::TodoistApiStatus { status, .. }) if status == 404 => Ok(None),
+            Err(TrackerError::TodoistApiStatus { status: 404, .. }) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -889,6 +1240,10 @@ impl TrackerClient for TodoistTracker {
         })
     }
 
+    async fn rate_budget(&self) -> Option<TrackerRateBudget> {
+        self.rate_budget_snapshot()
+    }
+
     async fn validate_startup(&self) -> Result<(), TrackerError> {
         self.validate_startup_config().await
     }
@@ -965,15 +1320,15 @@ impl TrackerClient for TodoistTracker {
 
         let mut by_id = HashMap::new();
         for (task_id, result) in fetched {
-            if let Some(task) = result? {
-                if let Some(issue) = normalize_task(
+            if let Some(task) = result?
+                && let Some(issue) = normalize_task(
                     &task,
                     &sections_by_id,
                     assignee_filter.as_ref(),
                     completed_state.as_str(),
-                ) {
-                    by_id.insert(task_id, issue);
-                }
+                )
+            {
+                by_id.insert(task_id, issue);
             }
         }
 
@@ -993,7 +1348,9 @@ impl TrackerClient for TodoistTracker {
     async fn restore_active_issue(&self, issue: &Issue) -> Result<(), TrackerError> {
         match self.reopen_task(&issue.id).await {
             Ok(_) => {}
-            Err(TrackerError::TodoistApiStatus { status, .. }) if matches!(status, 400 | 409) => {}
+            Err(TrackerError::TodoistApiStatus {
+                status: 400 | 409, ..
+            }) => {}
             Err(error) => return Err(error),
         }
 
@@ -1308,14 +1665,14 @@ impl TrackerClient for TodoistTracker {
         if let Some(label) = self.runtime_label_filter().as_deref() {
             enforce_runtime_label_scope(&mut body, label);
         }
-        if body.get("parent_id").is_none() && body.get("section_id").is_none() {
-            if let Some(project_id) = body.get("project_id").and_then(json_id_from_value)
-                && let Some(section_id) = self
-                    .default_todo_section_id_for_project(&project_id)
-                    .await?
-            {
-                body.insert("section_id".to_string(), Value::String(section_id));
-            }
+        if body.get("parent_id").is_none()
+            && body.get("section_id").is_none()
+            && let Some(project_id) = body.get("project_id").and_then(json_id_from_value)
+            && let Some(section_id) = self
+                .default_todo_section_id_for_project(&project_id)
+                .await?
+        {
+            body.insert("section_id".to_string(), Value::String(section_id));
         }
         self.request_json(Method::POST, "/tasks", None, Some(Value::Object(body)))
             .await
@@ -1593,10 +1950,13 @@ enum CommentTarget {
     Project(String),
 }
 
+type TodoistQuery = Vec<(String, String)>;
+type TaskListRequest = (&'static str, TodoistQuery);
+
 fn task_list_request(
     arguments: &serde_json::Map<String, Value>,
     default_project_id: Option<String>,
-) -> Result<(&'static str, Vec<(String, String)>), TrackerError> {
+) -> Result<TaskListRequest, TrackerError> {
     let mut query = Vec::new();
 
     if let Some(filter) = arguments
@@ -1679,7 +2039,10 @@ fn maybe_add_origin_back_reference(body: &mut Map<String, Value>, origin_task_id
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    if existing.to_ascii_lowercase().contains(origin_lower.as_str()) {
+    if existing
+        .to_ascii_lowercase()
+        .contains(origin_lower.as_str())
+    {
         return;
     }
 
@@ -1965,6 +2328,32 @@ fn retry_after_hint(headers: &HeaderMap, text: &str) -> Option<u64> {
     }
 }
 
+fn rate_limit_headers(headers: &HeaderMap, text: &str) -> TodoistRateHeaders {
+    TodoistRateHeaders {
+        limit: rate_limit_header(headers, "X-RateLimit-Limit"),
+        remaining: rate_limit_header(headers, "X-RateLimit-Remaining"),
+        reset_at: rate_limit_header(headers, "X-RateLimit-Reset")
+            .and_then(|epoch| DateTime::<Utc>::from_timestamp(epoch as i64, 0)),
+        retry_after: retry_after_hint(headers, text),
+    }
+}
+
+fn rate_limit_header(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn retry_after_exceeds_wait_budget(
+    retry_after: Option<u64>,
+    waited_secs: u64,
+    total_wait_budget_secs: u64,
+) -> bool {
+    retry_after
+        .is_some_and(|retry_after| retry_after > total_wait_budget_secs.saturating_sub(waited_secs))
+}
+
 fn retry_delay_for_attempt(
     error: &TrackerError,
     attempts: usize,
@@ -1973,9 +2362,16 @@ fn retry_delay_for_attempt(
 ) -> Option<u64> {
     match error {
         TrackerError::TodoistRateLimited { retry_after } if attempts < policy.max_retries => {
+            if retry_after_exceeds_wait_budget(
+                *retry_after,
+                waited_secs,
+                policy.max_total_wait_secs,
+            ) {
+                return None;
+            }
             let delay_secs = retry_after
-                .unwrap_or(policy.default_delay_secs)
-                .clamp(1, policy.max_delay_secs);
+                .map(|retry_after| retry_after.max(1))
+                .unwrap_or_else(|| policy.default_delay_secs.clamp(1, policy.max_delay_secs));
             waited_secs
                 .saturating_add(delay_secs)
                 .le(&policy.max_total_wait_secs)
@@ -2052,6 +2448,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Instant,
     };
 
     use axum::{
@@ -2061,20 +2458,22 @@ mod tests {
         response::IntoResponse,
         routing::{get, post},
     };
+    use chrono::Utc;
     use reqwest::Method;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle};
 
+    type RequestIdCaptureState = (Arc<AtomicUsize>, Arc<Mutex<Vec<Option<String>>>>);
+
     use super::{
-        DEFAULT_TODOIST_RETRY_POLICY, RETRY_AFTER, TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS,
-        TODOIST_COMMENT_UPDATE_MAX_RETRIES, TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS,
-        TODOIST_PLAN_LIMITS_MAX_DELAY_SECS, TODOIST_PLAN_LIMITS_MAX_RETRIES,
+        DEFAULT_TODOIST_RETRY_POLICY, RETRY_AFTER, TODOIST_COMMENT_UPDATE_MAX_RETRIES,
+        TODOIST_COMMENT_UPDATE_MAX_TOTAL_WAIT_SECS, TODOIST_PLAN_LIMITS_MAX_RETRIES,
         TODOIST_PLAN_LIMITS_MAX_TOTAL_WAIT_SECS, TodoistTracker, comment_target_body,
         create_reminder_body, csv_query_value, enforce_runtime_label_scope,
-        extend_repeated_query_values, move_task_body, normalize_task, retry_after_hint,
-        retry_delay_for_attempt, retry_policy_for_request, retry_policy_for_sync_form,
-        sanitize_comment_arguments, sanitize_write_arguments, task_list_request,
-        update_reminder_body,
+        extend_repeated_query_values, move_task_body, normalize_task, rate_limit_headers,
+        retry_after_exceeds_wait_budget, retry_after_hint, retry_delay_for_attempt,
+        retry_policy_for_request, retry_policy_for_sync_form, sanitize_comment_arguments,
+        sanitize_write_arguments, task_list_request, update_reminder_body,
     };
     use crate::{
         config::ServiceConfig,
@@ -2640,7 +3039,10 @@ mod tests {
             .await
             .expect_err("missing merging section");
 
-        assert_eq!(error.to_string(), "todoist_missing_required_section Merging");
+        assert_eq!(
+            error.to_string(),
+            "todoist_missing_required_section Merging"
+        );
     }
 
     #[tokio::test]
@@ -2906,7 +3308,7 @@ mod tests {
         }
 
         async fn create_task(
-            State(state): State<(Arc<AtomicUsize>, Arc<Mutex<Vec<Option<String>>>>)>,
+            State(state): State<RequestIdCaptureState>,
             headers: HeaderMap,
         ) -> impl IntoResponse {
             let (attempts, request_ids) = state;
@@ -2975,6 +3377,68 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_headers_parse_budget_and_ignore_malformed_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-limit", "1000".parse().expect("limit"));
+        headers.insert("x-ratelimit-remaining", "200".parse().expect("remaining"));
+        headers.insert("x-ratelimit-reset", "1773197100".parse().expect("reset"));
+        headers.insert(RETRY_AFTER, "35".parse().expect("retry-after header"));
+
+        let parsed = rate_limit_headers(&headers, r#"{"error_extra":{"retry_after":129}}"#);
+        assert_eq!(parsed.limit, Some(1000));
+        assert_eq!(parsed.remaining, Some(200));
+        assert_eq!(
+            parsed.reset_at.map(|value| value.timestamp()),
+            Some(1_773_197_100)
+        );
+        assert_eq!(parsed.retry_after, Some(129));
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert("x-ratelimit-limit", "bogus".parse().expect("limit"));
+        malformed.insert(
+            "x-ratelimit-remaining",
+            "still-bogus".parse().expect("remaining"),
+        );
+        malformed.insert("x-ratelimit-reset", "nope".parse().expect("reset"));
+
+        let parsed = rate_limit_headers(&malformed, "{}");
+        assert_eq!(parsed.limit, None);
+        assert_eq!(parsed.remaining, None);
+        assert_eq!(parsed.reset_at, None);
+        assert_eq!(parsed.retry_after, None);
+    }
+
+    #[test]
+    fn rate_limit_headers_capture_budget_fields() {
+        let reset_at = (Utc::now() + chrono::Duration::seconds(90)).timestamp();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-limit", "1000".parse().expect("limit header"));
+        headers.insert(
+            "x-ratelimit-remaining",
+            "199".parse().expect("remaining header"),
+        );
+        headers.insert(
+            "x-ratelimit-reset",
+            reset_at.to_string().parse().expect("reset header"),
+        );
+        headers.insert(RETRY_AFTER, "7".parse().expect("retry-after header"));
+
+        let parsed = rate_limit_headers(&headers, "{}");
+        assert_eq!(parsed.limit, Some(1000));
+        assert_eq!(parsed.remaining, Some(199));
+        assert_eq!(parsed.retry_after, Some(7));
+        assert!(parsed.reset_at.is_some());
+    }
+
+    #[test]
+    fn retry_after_exceeds_wait_budget_detects_oversized_hints() {
+        assert!(retry_after_exceeds_wait_budget(Some(301), 0, 300));
+        assert!(retry_after_exceeds_wait_budget(Some(51), 250, 300));
+        assert!(!retry_after_exceeds_wait_budget(Some(50), 250, 300));
+        assert!(!retry_after_exceeds_wait_budget(None, 0, 300));
+    }
+
+    #[test]
     fn retry_delay_for_attempt_retries_transient_server_errors() {
         let error = TrackerError::TodoistApiStatus {
             status: 502,
@@ -3009,15 +3473,15 @@ mod tests {
 
         assert_eq!(
             retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
-            Some(60)
+            Some(200)
         );
         assert_eq!(
-            retry_delay_for_attempt(&error, 1, 60, DEFAULT_TODOIST_RETRY_POLICY),
-            Some(60)
+            retry_delay_for_attempt(&error, 1, 200, DEFAULT_TODOIST_RETRY_POLICY),
+            None
         );
         assert_eq!(
             retry_delay_for_attempt(&error, 3, 240, DEFAULT_TODOIST_RETRY_POLICY),
-            Some(60)
+            None
         );
         assert_eq!(
             retry_delay_for_attempt(&error, 4, 240, DEFAULT_TODOIST_RETRY_POLICY),
@@ -3030,14 +3494,14 @@ mod tests {
     }
 
     #[test]
-    fn retry_delay_for_attempt_caps_large_retry_after_values() {
+    fn retry_delay_for_attempt_fails_fast_on_oversized_retry_after_values() {
         let error = TrackerError::TodoistRateLimited {
             retry_after: Some(1_027),
         };
 
         assert_eq!(
             retry_delay_for_attempt(&error, 0, 0, DEFAULT_TODOIST_RETRY_POLICY),
-            Some(60)
+            None
         );
     }
 
@@ -3049,14 +3513,7 @@ mod tests {
         let policy = retry_policy_for_request(&Method::POST, "/comments/comment-1");
 
         assert_eq!(policy.max_retries, TODOIST_COMMENT_UPDATE_MAX_RETRIES);
-        assert_eq!(
-            retry_delay_for_attempt(&error, 0, 0, policy),
-            Some(TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS)
-        );
-        assert_eq!(
-            retry_delay_for_attempt(&error, 1, TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS, policy),
-            Some(TODOIST_COMMENT_UPDATE_MAX_DELAY_SECS)
-        );
+        assert_eq!(retry_delay_for_attempt(&error, 0, 0, policy), None);
         assert_eq!(
             retry_delay_for_attempt(
                 &error,
@@ -3079,10 +3536,7 @@ mod tests {
         ]);
 
         assert_eq!(policy.max_retries, TODOIST_PLAN_LIMITS_MAX_RETRIES);
-        assert_eq!(
-            retry_delay_for_attempt(&error, 0, 0, policy),
-            Some(TODOIST_PLAN_LIMITS_MAX_DELAY_SECS)
-        );
+        assert_eq!(retry_delay_for_attempt(&error, 0, 0, policy), None);
         assert_eq!(
             retry_delay_for_attempt(
                 &error,
@@ -3092,5 +3546,95 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn rate_budget_snapshot_tracks_headers_and_is_shared_across_tracker_instances() {
+        async fn list_projects() -> impl IntoResponse {
+            let reset_at = (Utc::now() + chrono::Duration::seconds(120)).timestamp();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ratelimit-limit", "1000".parse().expect("limit header"));
+            headers.insert(
+                "x-ratelimit-remaining",
+                "250".parse().expect("remaining header"),
+            );
+            headers.insert(
+                "x-ratelimit-reset",
+                reset_at.to_string().parse().expect("reset header"),
+            );
+
+            (
+                headers,
+                Json(json!({"results": [{"id": "proj"}], "next_cursor": null})),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let app = Router::new().route("/projects", get(list_projects));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config = tracker_config(&format!("http://{address}"), None);
+        let tracker = TodoistTracker::new(config.clone());
+        tracker
+            .list_projects(json!({}))
+            .await
+            .expect("projects after observing headers");
+
+        let sibling = TodoistTracker::new(config);
+        let budget = sibling.rate_budget().await.expect("shared rate budget");
+        join.abort();
+
+        assert_eq!(budget.service, "todoist");
+        assert_eq!(budget.limit, Some(1000));
+        assert_eq!(budget.remaining, Some(250));
+        assert!(
+            budget
+                .reset_in_seconds
+                .is_some_and(|seconds| (1..=120).contains(&seconds))
+        );
+        assert!(budget.observed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn request_pre_throttles_before_hitting_todoist_api() {
+        async fn list_projects(State(attempts): State<Arc<AtomicUsize>>) -> impl IntoResponse {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"results": [{"id": "proj"}], "next_cursor": null}))
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let server_attempts = attempts.clone();
+        let join = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/projects", get(list_projects))
+                .with_state(server_attempts);
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let tracker = TodoistTracker::new(tracker_config(&format!("http://{address}"), None));
+        {
+            let mut rate_state = tracker.rate_state.lock().expect("rate state");
+            rate_state.rest_bucket.capacity = 1.0;
+            rate_state.rest_bucket.refill_per_sec = 100.0;
+            rate_state.rest_bucket.tokens = 0.0;
+            rate_state.rest_bucket.last_refill_at = Instant::now();
+        }
+
+        let started = Instant::now();
+        let projects = tracker
+            .list_projects(json!({}))
+            .await
+            .expect("projects after local pre-throttle");
+        let elapsed = started.elapsed();
+        join.abort();
+
+        assert_eq!(projects["results"][0]["id"], "proj");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(elapsed >= std::time::Duration::from_millis(10));
     }
 }
