@@ -104,6 +104,7 @@ The agent should be able to talk to Todoist through the injected `todoist` tool.
 When the session includes `todoist`, prefer these exact narrow operations instead of exploratory searches:
 
 - Fetch the current task directly with `{"action":"get_task","task_id":"<task-id>"}`.
+- Use `list_comments` to read human-authored task comments and attached resources on the Todoist task itself. Treat the `## Codex Workpad` comment as agent-owned and exclude it from human review intake.
 - Manage the persistent task workpad with `get_workpad`, `upsert_workpad`, and `delete_workpad`. When `get_workpad` returns a `comment_id`, pass that hint back into later `upsert_workpad` calls.
 - Use `create_project_comment` only for true project-level comments. Agent-owned task comments must use the single workpad via `upsert_workpad`.
 - Todoist comment responses identify task comments with `item_id`.
@@ -127,6 +128,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - After the workpad exists, keep it current with `upsert_workpad`; do not use `create_project_comment` or raw `update_comment` for workpad writes.
 - Persist the workpad `comment_id` returned by `get_workpad`/`upsert_workpad` and pass it back into later `upsert_workpad` calls so Todoist rewrites stay single-request.
 - Keep the workpad on the task itself. Do not fall back to project comments for task execution state.
+- Treat non-workpad Todoist task comments as first-class human review input. They may contain general instructions, resources, or follow-up direction that must be carried into planning, validation, and rework just like GitHub PR feedback.
 - For `Merging`, skip the generic execution bootstrap. Do not start with repo-wide planning, reproduction, pull-sync, or routine workpad reconciliation. Treat `Merging` as a fast path: identify the surviving PR, verify it is merge-ready, run the `land` flow, then guarded `close_task`.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
@@ -225,12 +227,13 @@ When a ticket has an attached PR, run this protocol before moving to the team's 
 
 1. Identify the PR number from the task-scoped workpad comment. If native task-link metadata is present, use it as supplemental confirmation rather than the source of truth.
 2. Gather feedback from all channels:
+   - Todoist task comments other than the `## Codex Workpad` comment, including any attached resources or general review instructions.
    - Top-level PR comments (`gh pr view --comments`).
    - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
    - Review summaries/states (`gh pr view --json reviews`).
-3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
+3. Treat every actionable reviewer comment from Todoist or GitHub (human or bot), including inline review comments, as blocking until one of these is true:
    - code/test/docs updated to address it, or
-   - explicit, justified pushback reply is posted on that thread.
+   - explicit, justified pushback reply is posted on the relevant GitHub thread, or recorded in the workpad when the feedback came from a Todoist task comment.
 4. Update the workpad plan/checklist to include each feedback item and its resolution status.
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this sweep until there are no outstanding actionable comments.
@@ -328,7 +331,7 @@ Do not run this step while the task is in `Merging`.
 ## Step 3: Human Review and merge handling
 
 1. When the task is in `Human Review`, do not code or change task content. This is an operator handoff state, so no new Symphony turn should run until a human moves the task to `Rework` or `Merging`.
-2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
+2. Poll for updates as needed, including non-workpad Todoist task comments plus GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the task to `Rework` and follow the rework flow.
 4. If approved, human moves the task to `Merging`.
 5. When the task is in `Merging`, use this fast path:
@@ -344,7 +347,7 @@ Do not run this step while the task is in `Merging`.
 ## Step 4: Rework handling
 
 1. Treat `Rework` as a planning reset, not a license to discard already-accepted implementation.
-2. Re-read the full task description, the latest surviving PR diff, and all human comments; explicitly identify what will be done differently this attempt.
+2. Re-read the full task description, all non-workpad Todoist task comments, the latest surviving PR diff, and all GitHub human comments; explicitly identify what will be done differently this attempt.
 3. Close only PRs that are truly superseded by the new rerun attempt.
    - At most one PR may survive a rerun handoff.
    - Preserve the newest valid open PR once it has the intended diff, passing checks, and no actionable feedback.
@@ -382,6 +385,7 @@ Do not run this step while the task is in `Merging`.
 - If task state is `Backlog`, do not modify it; wait for human to move to `Todo`.
 - Do not edit the task description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad` + `<!-- symphony:workpad -->`) per task, and keep it as a task comment on the active Todoist task.
+- Do not edit or delete human-authored Todoist task comments while managing the workpad. Only the single workpad comment is agent-owned.
 - If comment editing is unavailable in-session, fall back to the Todoist `todoist` tool comment actions; only report blocked if those actions are unavailable for the configured account.
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
 - If out-of-scope improvements are found, create a separate Backlog task rather than expanding current scope.

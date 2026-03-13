@@ -103,6 +103,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 
 - Derive the raw Todoist task id by stripping the `TD-` prefix from `{{ issue.identifier }}`.
 - Fetch the current task with `{"action":"get_task","task_id":"<task-id>"}`.
+- Use `{"action":"list_comments","task_id":"<task-id>"}` to read human-authored Todoist task comments and attached resources. Exclude the `## Codex Workpad` comment from review intake.
 - Manage the persistent task workpad with `{"action":"get_workpad","task_id":"<task-id>"}`, `{"action":"upsert_workpad","task_id":"<task-id>","content":"...","comment_id":"<optional-comment-id>"}`, and `{"action":"delete_workpad","task_id":"<task-id>"}`.
 - Resolve active workflow states by calling `{"action":"list_sections"}` for the configured project and matching by exact section name.
 - Move between active states with `{"action":"move_task","task_id":"<task-id>","section_id":"<section-id>"}` and use `{"action":"close_task","task_id":"<task-id>"}` only after the task is in `Merging` and the workpad links a PR that is actually merged.
@@ -118,6 +119,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - For `Todo`, `In Progress`, and `Rework`, reproduce first: always confirm the current behavior/problem signal before changing code so the fix target is explicit.
 - Treat a single persistent Todoist comment as the source of truth for progress.
 - Keep the workpad on the task itself. Do not fall back to project comments for task execution state.
+- Treat non-workpad Todoist task comments as first-class human review input alongside GitHub PR feedback.
 - Batch workpad rewrites at milestone boundaries instead of rewriting the whole comment after every trivial checklist change.
 - Keep shell invocations atomic. Prefer one command or tool call per step so retries and failure evidence stay readable.
 - When meaningful out-of-scope improvements are discovered during execution, create a separate Todoist task instead of expanding scope.
@@ -167,20 +169,20 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 6. Run the required validation for the task scope.
 7. Commit and push when the task is ready for review.
 8. Open or update a PR, then record the PR URL in the workpad.
-9. Before moving to `Human Review`, sweep PR comments, review threads, and checks until no actionable feedback remains and required validation is green.
+9. Before moving to `Human Review`, sweep non-workpad Todoist task comments, PR comments, review threads, and checks until no actionable feedback remains and required validation is green.
 10. Then move the task to `Human Review`.
 
 ## Step 2: Human review and merge handling
 
 1. In `Human Review`, do not code or change task content.
-2. If review feedback requires changes, move the task to `Rework`.
+2. If review feedback appears in Todoist task comments or GitHub review, move the task to `Rework`.
 3. If approved, a human moves the task to `Merging`.
 4. In `Merging`, run the `land` flow, verify the PR merged, then call guarded `close_task`.
 
 ## Step 3: Rework handling
 
 1. Treat `Rework` as a planning reset, not a fresh start from scratch.
-2. Re-read the task, the workpad, and all PR feedback.
+2. Re-read the task, all non-workpad Todoist task comments, the workpad, and all PR feedback.
 3. Update the existing branch and PR unless there is a strong reason to replace them.
 4. Refresh the workpad with the new plan, validation, and reviewer feedback checklist.
 5. Revalidate, republish, and return the task to `Human Review`.
