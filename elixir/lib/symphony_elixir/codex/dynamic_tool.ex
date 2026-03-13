@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.RuntimeEnv
 
   @github_api_tool "github_api"
   @github_api_base_url_env "SYMPHONY_GITHUB_API_URL"
@@ -352,7 +353,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp github_api_base_url(opts) do
     Keyword.get_lazy(opts, :github_api_base_url, fn ->
       @github_api_base_url_env
-      |> System.get_env()
+      |> RuntimeEnv.get()
       |> case do
         nil -> @github_api_default_base_url
         value -> value |> String.trim() |> String.trim_trailing("/")
@@ -383,7 +384,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp github_token_from_env do
     ["GH_TOKEN", "GITHUB_TOKEN"]
     |> Enum.find_value(:error, fn key ->
-      normalize_github_env_token(System.get_env(key))
+      normalize_github_env_token(RuntimeEnv.get(key))
     end)
   end
 

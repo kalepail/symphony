@@ -2,6 +2,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.RuntimeEnv
 
   test "tool_specs advertises the linear_graphql input contract" do
     specs = DynamicTool.tool_specs(github_api_available?: false)
@@ -360,6 +361,50 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ] = response["contentItems"]
 
     assert Jason.decode!(text) == %{"ok" => true, "labels" => ["symphony"]}
+  end
+
+  test "github_api reads token and base url from workflow-local dotenv files" do
+    test_pid = self()
+    workflow_file = Workflow.workflow_file_path()
+    workflow_dir = Path.dirname(workflow_file)
+    dotenv_path = Path.join(workflow_dir, ".env.local")
+
+    File.write!(
+      dotenv_path,
+      """
+      GH_TOKEN=dotenv-github-token
+      SYMPHONY_GITHUB_API_URL=https://example.test/
+      """
+    )
+
+    original_gh_token = System.get_env("GH_TOKEN")
+    original_github_token = System.get_env("GITHUB_TOKEN")
+    original_api_url = System.get_env("SYMPHONY_GITHUB_API_URL")
+
+    System.delete_env("GH_TOKEN")
+    System.delete_env("GITHUB_TOKEN")
+    System.delete_env("SYMPHONY_GITHUB_API_URL")
+    assert :ok = RuntimeEnv.load_dotenv_for_workflow(workflow_file)
+
+    on_exit(fn ->
+      RuntimeEnv.clear()
+      restore_env("GH_TOKEN", original_gh_token)
+      restore_env("GITHUB_TOKEN", original_github_token)
+      restore_env("SYMPHONY_GITHUB_API_URL", original_api_url)
+    end)
+
+    response =
+      DynamicTool.execute(
+        "github_api",
+        %{"method" => "GET", "path" => "/repos/owner/repo/pulls/14"},
+        github_requester: fn method, path, body, token, base_url ->
+          send(test_pid, {:github_request, method, path, body, token, base_url})
+          {:ok, %{"ok" => true}}
+        end
+      )
+
+    assert_received {:github_request, "GET", "/repos/owner/repo/pulls/14", nil, "dotenv-github-token", "https://example.test"}
+    assert response["success"] == true
   end
 
   test "github_api validates required arguments before calling GitHub" do

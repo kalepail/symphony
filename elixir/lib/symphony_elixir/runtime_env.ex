@@ -5,21 +5,25 @@ defmodule SymphonyElixir.RuntimeEnv do
 
   @spec get(String.t()) :: String.t() | nil
   def get(key) when is_binary(key) do
-    System.get_env(key) || Map.get(Process.get(@overrides_key, %{}), key)
+    System.get_env(key) || Map.get(read_overrides(), key)
   end
 
   @spec load_dotenv_for_workflow(Path.t()) :: :ok | {:error, String.t()}
   def load_dotenv_for_workflow(workflow_path) when is_binary(workflow_path) do
     with {:ok, merged} <- load_directory(Path.dirname(workflow_path)) do
-      Process.put(@overrides_key, merged)
+      :persistent_term.put(@overrides_key, merged)
       :ok
     end
   end
 
   @spec clear() :: :ok
   def clear do
-    Process.delete(@overrides_key)
+    :persistent_term.erase(@overrides_key)
     :ok
+  end
+
+  defp read_overrides do
+    :persistent_term.get(@overrides_key, %{})
   end
 
   defp load_directory(directory) do

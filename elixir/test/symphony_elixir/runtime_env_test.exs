@@ -32,6 +32,27 @@ defmodule SymphonyElixir.RuntimeEnvTest do
     assert System.get_env("LINEAR_API_KEY") == nil
   end
 
+  test "dotenv overrides are visible to other processes" do
+    root = Path.join(System.tmp_dir!(), "runtime-env-test-#{System.unique_integer([:positive])}")
+    workflow_dir = Path.join(root, "workflow")
+    File.mkdir_p!(workflow_dir)
+    workflow_path = Path.join(workflow_dir, "WORKFLOW.md")
+    File.write!(workflow_path, "---\ntracker:\n  kind: linear\n---\n")
+    File.write!(Path.join(workflow_dir, ".env.local"), "LINEAR_API_KEY=shared-token\n")
+
+    assert :ok = RuntimeEnv.load_dotenv_for_workflow(workflow_path)
+
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        send(parent, {:runtime_env_value, RuntimeEnv.get("LINEAR_API_KEY")})
+      end)
+
+    assert is_pid(pid)
+    assert_receive {:runtime_env_value, "shared-token"}
+  end
+
   test "workflow load resolves tracker config through dotenv overlay" do
     root = Path.join(System.tmp_dir!(), "runtime-env-test-#{System.unique_integer([:positive])}")
     workflow_dir = Path.join(root, "workflow")
@@ -125,7 +146,7 @@ defmodule SymphonyElixir.RuntimeEnvTest do
     assert :ok = RuntimeEnv.load_dotenv_for_workflow(workflow_path)
     assert RuntimeEnv.get("LINEAR_API_KEY") == nil
 
-    Process.put({RuntimeEnv, :overrides}, %{"LINEAR_API_KEY" => "overlay-token"})
+    :persistent_term.put({RuntimeEnv, :overrides}, %{"LINEAR_API_KEY" => "overlay-token"})
     assert :ok = RuntimeEnv.clear()
     assert RuntimeEnv.get("LINEAR_API_KEY") == nil
   end
