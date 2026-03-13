@@ -154,7 +154,7 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 
 - Keep this repo disposable. Branch churn, PR churn, and squash merges are expected.
 - Reset the shared smoke environment before a fresh smoke round with `python3 ../scripts/reset_smoke_state.py`.
-  - This restores the smoke repo baseline, deletes disposable smoke branches, removes shared smoke tasks, and deletes disposable Rust Todoist live-E2E projects left behind by aborted runs while skipping any project IDs currently registered as active smoke runs.
+  - This restores the smoke repo baseline, closes open smoke PRs, deletes disposable smoke branches, clears tasks from the configured smoke Todoist project, and deletes disposable Rust Todoist live-E2E projects left behind by aborted runs. To protect active Todoist projects from cleanup, set `SYMPHONY_SMOKE_PROTECT_PROJECT_IDS` to a comma-separated list of project ids before running the reset helper.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
 - Capture `/api/v1/state` and at least one `/api/v1/stream` event payload during full observability parity runs so API, web, and terminal evidence line up.

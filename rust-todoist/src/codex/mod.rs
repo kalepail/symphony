@@ -1213,7 +1213,7 @@ fn absolute_usage(message: &Value) -> Option<Value> {
     ]
     .iter()
     .find_map(|path| lookup_path(message, path))
-    .map(normalize_usage_map)
+    .and_then(normalize_usage_map)
 }
 
 fn turn_completed_usage(message: &Value) -> Option<Value> {
@@ -1224,19 +1224,63 @@ fn turn_completed_usage(message: &Value) -> Option<Value> {
     [&["params", "usage"][..], &["usage"][..]]
         .iter()
         .find_map(|path| lookup_path(message, path))
-        .map(normalize_usage_map)
+        .and_then(normalize_usage_map)
 }
 
 fn extract_rate_limits(message: &Value) -> Option<Value> {
     rate_limits_from_payload(message)
 }
 
-fn normalize_usage_map(value: &Value) -> Value {
-    json!({
-        "input_tokens": extract_integer(value, &["inputTokens", "input_tokens"]).unwrap_or(0),
-        "output_tokens": extract_integer(value, &["outputTokens", "output_tokens"]).unwrap_or(0),
-        "total_tokens": extract_integer(value, &["totalTokens", "total_tokens"]).unwrap_or(0),
-    })
+fn normalize_usage_map(value: &Value) -> Option<Value> {
+    if !integer_token_map(value) {
+        return None;
+    }
+
+    Some(json!({
+        "input_tokens": extract_integer(
+            value,
+            &[
+                "inputTokens",
+                "input_tokens",
+                "promptTokens",
+                "prompt_tokens",
+                "input",
+            ],
+        )
+        .unwrap_or(0),
+        "output_tokens": extract_integer(
+            value,
+            &[
+                "outputTokens",
+                "output_tokens",
+                "completionTokens",
+                "completion_tokens",
+                "output",
+                "completion",
+            ],
+        )
+        .unwrap_or(0),
+        "total_tokens": extract_integer(value, &["totalTokens", "total_tokens", "total"])
+            .unwrap_or(0),
+    }))
+}
+
+fn integer_token_map(value: &Value) -> bool {
+    [
+        "inputTokens",
+        "input_tokens",
+        "promptTokens",
+        "prompt_tokens",
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+        "totalTokens",
+        "total_tokens",
+        "total",
+    ]
+    .iter()
+    .any(|key| extract_integer(value, &[*key]).is_some())
 }
 
 fn extract_integer(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -1246,6 +1290,7 @@ fn extract_integer(value: &Value, keys: &[&str]) -> Option<i64> {
             value
                 .as_i64()
                 .or_else(|| value.as_u64().map(|value| value as i64))
+                .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
         })
 }
 
@@ -1633,6 +1678,70 @@ done
             }
         }));
         assert!(usage.is_none());
+    }
+
+    #[test]
+    fn extracts_stringified_turn_completed_usage_payload() {
+        let usage = extract_usage(&json!({
+            "method": "turn/completed",
+            "params": {
+                "usage": {
+                    "input_tokens": "10",
+                    "output_tokens": 2,
+                    "total_tokens": 12
+                }
+            }
+        }))
+        .expect("usage");
+
+        assert_eq!(
+            usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(10)
+        );
+        assert_eq!(
+            usage
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn extracts_prompt_and_completion_usage_aliases() {
+        let usage = extract_usage(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "total": {
+                        "prompt_tokens": "9",
+                        "completion_tokens": 4,
+                        "total": 13
+                    }
+                }
+            }
+        }))
+        .expect("usage");
+
+        assert_eq!(
+            usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(9)
+        );
+        assert_eq!(
+            usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(4)
+        );
+        assert_eq!(
+            usage
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(13)
+        );
     }
 
     #[test]
