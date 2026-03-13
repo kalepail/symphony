@@ -43,9 +43,11 @@ Prefer these sources in order:
 1. `../../../rust-todoist/src/dynamic_tool.rs`
 2. `../../../rust-todoist/README.md`
 3. `../../../rust-todoist/WORKFLOW.md`
-4. Official Todoist API v1 docs: `https://developer.todoist.com/api/v1/`
+4. `references/api-sources.md`
 
-Use deprecated REST v2 docs only as migration context.
+Use `references/api-sources.md` first when the Todoist version story looks
+confusing. It records the current official source hierarchy and links the exact
+vendor pages.
 
 When you need more examples than this file includes, read
 `references/action-recipes.md`.
@@ -248,3 +250,9 @@ Load `references/action-recipes.md` when you need:
 - reminder actions
 - expanded task move and create examples
 - a fuller action catalog than this core skill includes
+
+Load `references/api-sources.md` when you need:
+
+- the authoritative Todoist doc URLs
+- current version-status guidance
+- deprecated-vs-current API clarification
