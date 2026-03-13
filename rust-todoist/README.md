@@ -88,7 +88,7 @@ workspace:
 observability:
   terminal_enabled: true
   refresh_ms: 1000
-  render_interval_ms: 250
+  render_interval_ms: 16
 hooks:
   after_create: |
     git clone --depth 1 git@github.com:your-org/your-repo.git .
@@ -120,14 +120,15 @@ Notes:
 - The bundled [`WORKFLOW.md`](./WORKFLOW.md) now carries the stronger unattended workflow contract used by Symphony: explicit task-scoped workpad discipline, PR feedback sweeps, Todoist-native rework handling, and a completion bar before the canonical review handoff state `Human Review`.
 - `tracker.kind` supports `todoist` for live runs and `memory` for deterministic local/system tests backed by a fixture file.
 - `tracker.label` is an optional Todoist-native routing filter when one runtime should own only a subset of a shared project.
-- If `tracker.assignee` is configured, the project must support assignment and any explicit assignee id must be a valid Todoist collaborator for that shared project.
+- Personal Todoist projects should usually leave `tracker.assignee` unset. If it is configured on a project that cannot assign tasks, Symphony now treats that project as effectively unassigned instead of failing startup.
+- On shared Todoist projects, `tracker.assignee` opts into assignment-based routing. Any explicit assignee id must be a valid collaborator for that project.
 - When `tracker.label` is configured, `todoist.create_task` automatically inherits that label so follow-up tasks stay inside the same runtime ownership boundary.
 - Top-level `todoist.create_task` calls default into the project's `Todo` section when no `section_id` is supplied. Use `parent_id` only for true subtasks.
 - `tracker.terminal_states` defaults to Todoist-native terminal names for reconciliation, but startup only requires non-`Done` terminal sections when the workflow explicitly configures them as open sections.
 - Todoist comments must be available on the connected account or plan. Symphony validates that at startup because task-scoped workpad comments are part of the core runtime contract.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
-- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs and uses the terminal's alternate screen buffer so dashboard redraws do not pollute normal shell scrollback. The renderer also clips to the current viewport so narrower panes and shorter terminal windows do not wrap or scroll the dashboard unexpectedly. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `250`.
+- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs and uses the terminal's alternate screen buffer so dashboard redraws do not pollute normal shell scrollback. The renderer also clips to the current viewport so narrower panes and shorter terminal windows do not wrap or scroll the dashboard unexpectedly. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `16`.
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
 - `worker.ssh_hosts` enables distributed execution over SSH. When configured, Symphony picks the least-loaded host, applies `worker.max_concurrent_agents_per_host` as a per-host cap when present, preserves host affinity across retries, and sweeps stale remote workspaces during startup. Host strings may include an explicit port, for example `builder-b:2222`.
 - Remote workspace paths preserve the configured `workspace.root` string, including `~`, so operator surfaces and cleanup use the same logical path that remote hooks and Codex sessions receive.
@@ -138,8 +139,8 @@ Notes:
 - `todoist` exposes structured actions such as `get_task`, `list_sections`, `list_comments`, `create_project_comment`, `delete_comment`, `get_workpad`, `upsert_workpad`, `delete_workpad`, `list_tasks`, `list_activities`, `update_task`, `move_task`, and `close_task`, and preserves Todoist HTTP error payloads in tool output so Codex can recover from validation failures.
   Task comment requests use `task_id`, while Todoist comment responses identify those same comments with `item_id`. The default workflow uses the dedicated workpad actions so the persistent `## Codex Workpad` stays on one task comment instead of drifting across multiple comments. Equivalent duplicate workpads are repaired back to one canonical comment, oversized workpads are compacted before they hit Todoist's comment limit, and `close_task` is guarded by Symphony and only succeeds from `Merging` after the linked GitHub PR is verified as merged.
 - Startup now requires the same explicit acknowledgement flag as Elixir: `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
-- Optional web observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now uses live SSE updates, keeps runtime clocks moving client-side, and falls back to `/api/v1/state` polling if the stream is unavailable. The terminal dashboard is enabled independently through `observability.terminal_enabled`.
-- Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. Symphony's own lifecycle targets remain at `info` in the file log even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`.
+- Optional web observability can be enabled via CLI `--port` or `server.port` in `WORKFLOW.md`. `server.host` is also supported; the default bind host remains loopback (`127.0.0.1`). The dashboard now uses live SSE updates, keeps runtime clocks moving client-side, and falls back to `/api/v1/state` polling if the stream is unavailable. The terminal dashboard is enabled independently through `observability.terminal_enabled`. When the snapshot path degrades, `/api/v1/state` returns a structured `503` JSON payload that preserves distinct `snapshot_timeout` and `snapshot_unavailable` error codes, and `/` returns a `503` HTML dashboard shell instead of switching to a raw JSON error page.
+- Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. File logs now include RFC3339 millisecond timestamps, and Symphony's own lifecycle targets remain at `info` even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`. Logging conventions are documented in [`rust-todoist/docs/logging.md`](./docs/logging.md).
 - The sample `before_remove` hook first checks for `./scripts/workspace_before_remove.sh` in the target repo, then falls back to the bundled [`rust-todoist/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) path when the workspace itself is this repository. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
 - [`rust-todoist/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
 - When Symphony exposes the host-side `github_api` tool, prefer it for both PR creation and post-publish metadata writes such as applying the `symphony` label. This avoids the in-session `gh auth token` drift that can appear even when host GitHub auth is healthy.
@@ -147,7 +148,7 @@ Notes:
 
 ## Operator Surface
 
-Rust now covers both observability surfaces that mattered in Elixir and exceeds them on the web path:
+Rust now covers both observability surfaces that mattered in Elixir and is stronger on transport and Todoist-specific runtime detail:
 
 | Surface | Elixir | Rust |
 | --- | --- | --- |

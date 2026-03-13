@@ -281,7 +281,11 @@ async fn execute_todoist(
         .await
         .unwrap_or_else(|_| TrackerCapabilities::full());
     ensure_action_capability(action, capabilities)?;
-    info!(tool = "todoist", action);
+    info!(
+        "tool=todoist status=started action={} {}",
+        action,
+        todoist_log_scope(&args)
+    );
 
     match action {
         "list_projects" => tracker.list_projects(Value::Object(args)).await,
@@ -359,6 +363,38 @@ fn required_id(map: &serde_json::Map<String, Value>, key: &str) -> Result<String
         _ => Err(TrackerError::TrackerOperationUnsupported(format!(
             "`todoist.{key}` is required"
         ))),
+    }
+}
+
+fn todoist_log_scope(args: &serde_json::Map<String, Value>) -> String {
+    const LOG_KEYS: &[&str] = &[
+        "task_id",
+        "project_id",
+        "section_id",
+        "comment_id",
+        "reminder_id",
+        "object_id",
+        "origin_task_id",
+    ];
+
+    let mut parts = Vec::new();
+    for key in LOG_KEYS {
+        if let Some(value) = args.get(*key) {
+            let value = match value {
+                Value::String(text) => text.trim().to_string(),
+                Value::Number(number) => number.to_string(),
+                _ => String::new(),
+            };
+            if !value.is_empty() {
+                parts.push(format!("{key}={value}"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        "scope=none".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 

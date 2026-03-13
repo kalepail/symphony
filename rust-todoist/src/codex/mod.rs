@@ -15,12 +15,13 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::ServiceConfig,
     dynamic_tool,
     issue::Issue,
+    logging,
     tracker::TrackerClient,
     workspace::{
         remote_shell_assign, ssh_args, ssh_executable, validate_workspace_path_for_worker,
@@ -100,9 +101,12 @@ pub struct TurnSession {
 struct TurnContext<'a> {
     pid: Option<u32>,
     worker_host: Option<String>,
+    issue_id: &'a str,
+    issue_identifier: &'a str,
     session_id: &'a str,
     thread_id: String,
     turn_id: &'a str,
+    workspace: String,
     raw: &'a str,
     cancellation: &'a CancellationToken,
 }
@@ -182,7 +186,7 @@ impl AppServerClient {
             .ok_or_else(|| CodexError::Io("child stderr unavailable".to_string()))?;
 
         let stdout_rx = spawn_stdout_task(stdout);
-        spawn_stderr_task(stderr);
+        spawn_stderr_task(stderr, codex_app_server_pid, worker_host.clone());
 
         let mut session = AppServerSession {
             config: self.config.clone(),
@@ -218,6 +222,16 @@ impl AppServerSession {
     where
         F: FnMut(CodexEvent),
     {
+        info!(
+            "codex_turn=status=starting {} worker_host={} workspace={} thread_id={} pid={}",
+            logging::issue_context(issue),
+            logging::worker_host_for_log(self.worker_host.as_deref()),
+            self.workspace.display(),
+            self.thread_id,
+            self.codex_app_server_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
         let request_id = self.take_request_id();
         let payload = json!({
             "id": request_id,
@@ -241,6 +255,14 @@ impl AppServerSession {
             .await_response(request_id, None)
             .await
             .inspect_err(|error| {
+                warn!(
+                    "codex_turn=status=startup_failed {} worker_host={} workspace={} thread_id={} error={}",
+                    logging::issue_context(issue),
+                    logging::worker_host_for_log(self.worker_host.as_deref()),
+                    self.workspace.display(),
+                    self.thread_id,
+                    error,
+                );
                 on_event(event_with(
                     "startup_failed",
                     self.event_identity(),
@@ -259,6 +281,21 @@ impl AppServerSession {
             session_id.clone(),
             self.thread_id.clone(),
             turn_id.clone(),
+        );
+        info!(
+            "codex_turn=status=started {} worker_host={} workspace={} pid={}",
+            logging::codex_session_context(
+                &issue.id,
+                &issue.identifier,
+                &session_id,
+                &self.thread_id,
+                &turn_id,
+            ),
+            logging::worker_host_for_log(self.worker_host.as_deref()),
+            self.workspace.display(),
+            self.codex_app_server_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
         );
         on_event(event_with(
             "session_started",
@@ -295,9 +332,12 @@ impl AppServerSession {
                             let turn = TurnContext {
                                 pid: self.codex_app_server_pid,
                                 worker_host: self.worker_host.clone(),
+                                issue_id: &issue.id,
+                                issue_identifier: &issue.identifier,
                                 session_id: &session_id,
                                 thread_id: self.thread_id.clone(),
                                 turn_id: &turn_id,
+                                workspace: self.workspace.display().to_string(),
                                 raw: &raw,
                                 cancellation,
                             };
@@ -350,7 +390,11 @@ impl AppServerSession {
         {
             Ok(_) => {}
             Err(_) => {
-                warn!("app_server_shutdown=status=timeout pid={pid:?}");
+                warn!(
+                    "app_server_shutdown=status=timeout worker_host={} workspace={} pid={pid:?}",
+                    logging::worker_host_for_log(self.worker_host.as_deref()),
+                    self.workspace.display(),
+                );
                 let _ = self.child.kill().await;
                 let _ = timeout(Duration::from_secs(1), self.child.wait()).await;
             }
@@ -402,6 +446,16 @@ impl AppServerSession {
             .and_then(Value::as_str)
             .ok_or_else(|| CodexError::ResponseError(response.to_string()))?
             .to_string();
+        info!(
+            "codex_thread=status=started thread_id={} worker_host={} workspace={} pid={} dynamic_tools={}",
+            self.thread_id,
+            logging::worker_host_for_log(self.worker_host.as_deref()),
+            self.workspace.display(),
+            self.codex_app_server_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            dynamic_tools.len(),
+        );
         Ok(())
     }
 
@@ -419,6 +473,15 @@ impl AppServerSession {
         let rate_limits = extract_rate_limits(message);
 
         if method == "turn/completed" {
+            info!(
+                "codex_turn=status=completed {} worker_host={} workspace={} pid={}",
+                turn_log_context(turn),
+                logging::worker_host_for_log(turn.worker_host.as_deref()),
+                turn.workspace,
+                turn.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
             on_event(event(
                 turn,
                 "turn_completed",
@@ -431,6 +494,16 @@ impl AppServerSession {
         }
 
         if method == "turn/failed" {
+            warn!(
+                "codex_turn=status=failed {} worker_host={} workspace={} pid={} error={}",
+                turn_log_context(turn),
+                logging::worker_host_for_log(turn.worker_host.as_deref()),
+                turn.workspace,
+                turn.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                inline_log_value(&message.to_string()),
+            );
             on_event(event(
                 turn,
                 "turn_failed",
@@ -443,6 +516,15 @@ impl AppServerSession {
         }
 
         if method == "turn/cancelled" {
+            warn!(
+                "codex_turn=status=cancelled {} worker_host={} workspace={} pid={}",
+                turn_log_context(turn),
+                logging::worker_host_for_log(turn.worker_host.as_deref()),
+                turn.workspace,
+                turn.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
             on_event(event(
                 turn,
                 "turn_cancelled",
@@ -575,6 +657,32 @@ impl AppServerSession {
                 } else {
                     "unsupported_tool_call"
                 };
+                let call_id = params
+                    .get("callId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("n/a");
+                let tool_status = if event_name == "tool_call_completed" {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let success = result
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let error_summary = result
+                    .get("error")
+                    .map(|error| inline_log_value(&error.to_string()))
+                    .unwrap_or_else(|| "none".to_string());
+                info!(
+                    "dynamic_tool_call status={} {} tool={} call_id={} success={} error={}",
+                    tool_status,
+                    turn_log_context(turn),
+                    tool,
+                    call_id,
+                    success,
+                    error_summary,
+                );
                 on_event(event(turn, event_name, None, None, event_payload, None));
                 Ok(None)
             }
@@ -854,7 +962,7 @@ fn spawn_stdout_task(stdout: ChildStdout) -> mpsc::UnboundedReceiver<RawLine> {
     rx
 }
 
-fn spawn_stderr_task(stderr: ChildStderr) {
+fn spawn_stderr_task(stderr: ChildStderr, pid: Option<u32>, worker_host: Option<String>) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -864,12 +972,44 @@ fn spawn_stderr_task(stderr: ChildStderr) {
                 || lowered.contains("failed")
                 || lowered.contains("panic")
             {
-                warn!("codex_stream=stderr line={line}");
+                warn!(
+                    "codex_stream=stderr status=warning pid={} worker_host={} line={}",
+                    pid.map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    logging::worker_host_for_log(worker_host.as_deref()),
+                    line,
+                );
             } else {
-                debug!("codex_stream=stderr line={line}");
+                debug!(
+                    "codex_stream=stderr status=debug pid={} worker_host={} line={}",
+                    pid.map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    logging::worker_host_for_log(worker_host.as_deref()),
+                    line,
+                );
             }
         }
     });
+}
+
+fn turn_log_context(turn: &TurnContext<'_>) -> String {
+    logging::codex_session_context(
+        turn.issue_id,
+        turn.issue_identifier,
+        turn.session_id,
+        &turn.thread_id,
+        turn.turn_id,
+    )
+}
+
+fn inline_log_value(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 fn app_server_shell() -> Option<&'static str> {

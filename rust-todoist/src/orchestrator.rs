@@ -43,7 +43,7 @@ pub struct OrchestratorHandle {
 pub struct Orchestrator {
     tx: mpsc::Sender<Command>,
     updates: watch::Receiver<u64>,
-    join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,7 +401,7 @@ impl Orchestrator {
         Ok(Self {
             tx,
             updates: updates_rx,
-            join,
+            join: Some(join),
         })
     }
 
@@ -412,9 +412,23 @@ impl Orchestrator {
         }
     }
 
-    pub async fn shutdown(self) {
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    pub async fn wait_for_exit(&mut self) -> Result<(), String> {
+        match self.join.take() {
+            Some(join) => match join.await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
         let tx = self.tx;
-        let mut join = self.join;
+        let mut join = self.join.take();
 
         match timeout(
             Duration::from_secs(ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS),
@@ -434,20 +448,24 @@ impl Orchestrator {
             }
         }
 
-        match timeout(
-            Duration::from_secs(ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS),
-            &mut join,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                warn!(
-                    "orchestrator_shutdown=status=join_timeout timeout_secs={}",
-                    ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS
-                );
-                join.abort();
-                let _ = join.await;
+        if let Some(join_handle) = join.as_mut() {
+            match timeout(
+                Duration::from_secs(ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS),
+                join_handle,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!(
+                        "orchestrator_shutdown=status=join_timeout timeout_secs={}",
+                        ORCHESTRATOR_SHUTDOWN_TIMEOUT_SECS
+                    );
+                    if let Some(join_handle) = join.take() {
+                        join_handle.abort();
+                        let _ = join_handle.await;
+                    }
+                }
             }
         }
     }

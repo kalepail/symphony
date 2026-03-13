@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     env,
+    hash::{Hash, Hasher},
     io::{self, IsTerminal, Write},
     iter::Peekable,
     net::SocketAddr,
@@ -13,15 +14,15 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
     task::JoinHandle,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, sleep_until},
 };
 
 use crate::{
     config::ObservabilityConfig,
     issue::Issue,
     orchestrator::{
-        IssueDetail, OrchestratorHandle, PollingSnapshot, RecentEvent, RetrySnapshot, Snapshot,
-        SnapshotCounts, TokenSnapshot,
+        IssueDetail, OrchestratorHandle, OrchestratorHandleError, PollingSnapshot, RecentEvent,
+        RetrySnapshot, Snapshot, SnapshotCounts, TokenSnapshot,
     },
     tracker::TrackerRateBudget,
     workflow::WorkflowStore,
@@ -34,12 +35,14 @@ const SPARKLINE_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "
 const MINIMUM_IDLE_RERENDER_MS: u64 = 1_000;
 const DEFAULT_TERMINAL_COLUMNS: usize = 132;
 const DEFAULT_TERMINAL_ROWS: usize = 24;
+const RUNNING_STATUS_WIDTH: usize = 1;
 const RUNNING_ID_WIDTH: usize = 10;
 const RUNNING_STATE_WIDTH: usize = 14;
 const RUNNING_SESSION_WIDTH: usize = 14;
 const RUNNING_PID_WIDTH: usize = 8;
 const RUNNING_RUNTIME_WIDTH: usize = 14;
 const RUNNING_TOKENS_WIDTH: usize = 10;
+const RUNNING_ROW_CHROME_WIDTH: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalViewport {
@@ -50,6 +53,8 @@ struct TerminalViewport {
 #[derive(Clone, Debug, Serialize)]
 pub struct StatePayload {
     pub generated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorPayload>,
     pub counts: SnapshotCounts,
     pub agent_limits: AgentLimitsPayload,
     pub running: Vec<RunningEntryPayload>,
@@ -61,6 +66,12 @@ pub struct StatePayload {
     pub workflow: WorkflowPayload,
     pub links: LinksPayload,
     pub throughput: ThroughputPayload,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ErrorPayload {
+    pub code: &'static str,
+    pub message: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,6 +241,7 @@ impl Presenter {
 
         StatePayload {
             generated_at: snapshot.generated_at,
+            error: None,
             counts: snapshot.counts,
             agent_limits: AgentLimitsPayload {
                 max_concurrent_agents: effective.config.agent.max_concurrent_agents,
@@ -291,6 +303,84 @@ impl Presenter {
                 dashboard_url,
             },
             throughput: ThroughputPayload { tps_5s, graph_10m },
+        }
+    }
+
+    pub fn present_snapshot_failure(
+        &self,
+        error: OrchestratorHandleError,
+        workflow_store: &WorkflowStore,
+        dashboard_addr: Option<SocketAddr>,
+    ) -> StatePayload {
+        let validation_error = workflow_store.validation_error();
+        let effective = workflow_store.effective();
+        let blocking_reason = validation_error.clone().or_else(|| {
+            effective
+                .config
+                .validate_dispatch_ready()
+                .err()
+                .map(|error| error.to_string())
+        });
+        let project_url = effective
+            .config
+            .tracker
+            .project_id
+            .as_deref()
+            .map(todoist_project_url);
+        let dashboard_url = dashboard_url(
+            effective
+                .config
+                .server
+                .host
+                .as_deref()
+                .unwrap_or("127.0.0.1"),
+            effective.config.server.port,
+            dashboard_addr.map(|addr| addr.port()),
+        );
+
+        StatePayload {
+            generated_at: Utc::now(),
+            error: Some(snapshot_error_payload(error)),
+            counts: SnapshotCounts {
+                running: 0,
+                retrying: 0,
+            },
+            agent_limits: AgentLimitsPayload {
+                max_concurrent_agents: effective.config.agent.max_concurrent_agents,
+            },
+            running: Vec::new(),
+            retrying: Vec::new(),
+            codex_totals: CodexTotalsPayload {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                seconds_running: 0.0,
+            },
+            rate_limits: None,
+            todoist_rate_budget: None,
+            polling: PollingSnapshot {
+                checking: false,
+                next_poll_in_ms: None,
+                poll_interval_ms: effective.config.polling.interval_ms,
+            },
+            workflow: WorkflowPayload {
+                path: workflow_store.path().display().to_string(),
+                dispatch_status: if blocking_reason.is_none() {
+                    "ready"
+                } else {
+                    "blocked"
+                },
+                blocking_reason,
+                using_last_good: validation_error.is_some(),
+            },
+            links: LinksPayload {
+                project_url,
+                dashboard_url,
+            },
+            throughput: ThroughputPayload {
+                tps_5s: self.last_tps_value,
+                graph_10m: String::new(),
+            },
         }
     }
 
@@ -525,6 +615,14 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
                   <div id=\"runtime-status-copy\" class=\"workflow-note\"></div>\
                 </div>\
               </section>\
+              <section id=\"error-card\" class=\"card section error-card\" hidden>\
+                <div class=\"section-head\">\
+                  <div>\
+                    <h2 id=\"error-title\">Observability degraded</h2>\
+                    <p id=\"error-copy\" class=\"muted\"></p>\
+                  </div>\
+                </div>\
+              </section>\
               <section class=\"grid\">\
                 <div class=\"card metric\">\
                   <div class=\"label\">Running</div>\
@@ -620,13 +718,14 @@ fn render_terminal_dashboard(
     });
     let columns = viewport.columns.max(1);
     let running_event_width = columns.saturating_sub(
-        RUNNING_ID_WIDTH
+        RUNNING_STATUS_WIDTH
+            + RUNNING_ID_WIDTH
             + RUNNING_STATE_WIDTH
             + RUNNING_SESSION_WIDTH
             + RUNNING_PID_WIDTH
             + RUNNING_RUNTIME_WIDTH
             + RUNNING_TOKENS_WIDTH
-            + 16,
+            + RUNNING_ROW_CHROME_WIDTH,
     );
 
     let mut lines = vec![
@@ -759,6 +858,15 @@ pub fn render_offline_status() -> String {
     .join("\n")
 }
 
+pub fn render_snapshot_timed_out_status() -> String {
+    [
+        colorize("╭─ SYMPHONY STATUS", ANSI_BOLD),
+        colorize("│ Orchestrator snapshot timed out", ANSI_RED),
+        "╰─".to_string(),
+    ]
+    .join("\n")
+}
+
 pub fn render_snapshot_unavailable_status() -> String {
     [
         colorize("╭─ SYMPHONY STATUS", ANSI_BOLD),
@@ -766,6 +874,87 @@ pub fn render_snapshot_unavailable_status() -> String {
         "╰─".to_string(),
     ]
     .join("\n")
+}
+
+fn render_snapshot_failure_dashboard(
+    error: OrchestratorHandleError,
+    workflow_store: &WorkflowStore,
+    dashboard_addr: Option<SocketAddr>,
+    tps_5s: f64,
+    polling: Option<&PollingSnapshot>,
+) -> String {
+    let effective = workflow_store.effective();
+    let project_url = effective
+        .config
+        .tracker
+        .project_id
+        .as_deref()
+        .map(todoist_project_url);
+    let dashboard_url = dashboard_url(
+        effective
+            .config
+            .server
+            .host
+            .as_deref()
+            .unwrap_or("127.0.0.1"),
+        effective.config.server.port,
+        dashboard_addr.map(|addr| addr.port()),
+    );
+
+    let mut lines = vec![
+        colorize("╭─ SYMPHONY STATUS", ANSI_BOLD),
+        colorize(
+            &format!("│ {}", snapshot_error_payload(error).message),
+            ANSI_RED,
+        ),
+        format!(
+            "{}{}",
+            colorize("│ Throughput: ", ANSI_BOLD),
+            colorize(&format!("{tps_5s:.1} tps"), ANSI_CYAN)
+        ),
+    ];
+
+    if let Some(project_url) = project_url.as_deref() {
+        lines.push(format!(
+            "{}{}",
+            colorize("│ Project: ", ANSI_BOLD),
+            colorize(project_url, ANSI_CYAN)
+        ));
+    }
+    if let Some(dashboard_url) = dashboard_url.as_deref() {
+        lines.push(format!(
+            "{}{}",
+            colorize("│ Dashboard: ", ANSI_BOLD),
+            colorize(dashboard_url, ANSI_CYAN)
+        ));
+    }
+
+    let next_refresh = polling
+        .map(format_polling_status)
+        .unwrap_or_else(|| "n/a".to_string());
+    lines.push(format!(
+        "{}{}",
+        colorize("│ Next refresh: ", ANSI_BOLD),
+        colorize(&next_refresh, ANSI_CYAN)
+    ));
+    lines.push("╰─".to_string());
+    lines.join("\n")
+}
+
+#[cfg(test)]
+fn render_snapshot_unavailable_dashboard(
+    workflow_store: &WorkflowStore,
+    dashboard_addr: Option<SocketAddr>,
+    tps_5s: f64,
+    polling: Option<&PollingSnapshot>,
+) -> String {
+    render_snapshot_failure_dashboard(
+        OrchestratorHandleError::Unavailable,
+        workflow_store,
+        dashboard_addr,
+        tps_5s,
+        polling,
+    )
 }
 
 pub struct TerminalDashboard {
@@ -778,6 +967,16 @@ struct TerminalRenderer {
     init: Arc<dyn Fn() + Send + Sync>,
     render: Arc<dyn Fn(String) + Send + Sync>,
     shutdown: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Default)]
+struct TerminalRenderState {
+    last_snapshot_fingerprint: Option<u64>,
+    last_rendered_content: Option<String>,
+    last_rendered_at: Option<Instant>,
+    pending_content: Option<String>,
+    flush_due_at: Option<Instant>,
+    last_polling: Option<PollingSnapshot>,
 }
 
 impl TerminalDashboard {
@@ -821,11 +1020,7 @@ impl TerminalDashboard {
             let mut updates = orchestrator.subscribe_observability();
             let mut refresh_tick = interval(Duration::from_millis(observability.refresh_ms));
             refresh_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut render_tick = interval(Duration::from_millis(observability.render_interval_ms));
-            render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut dirty = true;
-            let mut last_rendered_content: Option<String> = None;
-            let mut last_rendered_at: Option<Instant> = None;
+            let mut render_state = TerminalRenderState::default();
 
             loop {
                 tokio::select! {
@@ -833,30 +1028,30 @@ impl TerminalDashboard {
                         if changed.is_err() {
                             break;
                         }
-                        dirty = true;
+                        refresh_terminal_dashboard(
+                            &orchestrator,
+                            &workflow_store,
+                            dashboard_addr,
+                            &mut presenter,
+                            &mut render_state,
+                            observability.render_interval_ms,
+                            &task_renderer,
+                        ).await;
                     }
                     _ = refresh_tick.tick() => {
-                        dirty = true;
+                        refresh_terminal_dashboard(
+                            &orchestrator,
+                            &workflow_store,
+                            dashboard_addr,
+                            &mut presenter,
+                            &mut render_state,
+                            observability.render_interval_ms,
+                            &task_renderer,
+                        ).await;
                     }
-                    _ = render_tick.tick() => {
-                        if !dirty && !periodic_rerender_due(last_rendered_at) {
-                            continue;
-                        }
-                        let next = match orchestrator.snapshot().await {
-                            Ok(snapshot) => {
-                                let payload = presenter.present_state(snapshot, &workflow_store, dashboard_addr);
-                                render_terminal_dashboard(&payload, Some(current_terminal_viewport()))
-                            }
-                            Err(_) => render_snapshot_unavailable_status(),
-                        };
-                        dirty = false;
-                        if last_rendered_content.as_deref() != Some(next.as_str())
-                            || periodic_rerender_due(last_rendered_at)
-                        {
-                            task_renderer(next.clone());
-                            last_rendered_content = Some(next);
-                            last_rendered_at = Some(Instant::now());
-                        }
+                    _ = wait_for_terminal_flush(render_state.flush_due_at),
+                        if render_state.flush_due_at.is_some() => {
+                        flush_pending_terminal_frame(&task_renderer, &mut render_state);
                     }
                 }
             }
@@ -887,6 +1082,129 @@ fn periodic_rerender_due(last_rendered_at: Option<Instant>) -> bool {
             last_rendered_at.elapsed().as_millis() as u64 >= MINIMUM_IDLE_RERENDER_MS
         }
     }
+}
+
+async fn refresh_terminal_dashboard(
+    orchestrator: &OrchestratorHandle,
+    workflow_store: &WorkflowStore,
+    dashboard_addr: Option<SocketAddr>,
+    presenter: &mut Presenter,
+    render_state: &mut TerminalRenderState,
+    render_interval_ms: u64,
+    task_renderer: &Arc<dyn Fn(String) + Send + Sync>,
+) {
+    let next = match orchestrator.snapshot().await {
+        Ok(snapshot) => {
+            let payload = presenter.present_state(snapshot, workflow_store, dashboard_addr);
+            render_state.last_polling = Some(payload.polling.clone());
+            render_terminal_dashboard(&payload, Some(current_terminal_viewport()))
+        }
+        Err(error) => render_snapshot_failure_dashboard(
+            error,
+            workflow_store,
+            dashboard_addr,
+            presenter.last_tps_value,
+            render_state.last_polling.as_ref(),
+        ),
+    };
+
+    let fingerprint = fingerprint_terminal_content(&next);
+    let rerender_due = periodic_rerender_due(render_state.last_rendered_at);
+    if render_state.last_snapshot_fingerprint == Some(fingerprint) && !rerender_due {
+        return;
+    }
+
+    maybe_enqueue_terminal_frame(
+        render_state,
+        next,
+        fingerprint,
+        render_interval_ms,
+        task_renderer,
+    );
+}
+
+fn maybe_enqueue_terminal_frame(
+    render_state: &mut TerminalRenderState,
+    content: String,
+    fingerprint: u64,
+    render_interval_ms: u64,
+    task_renderer: &Arc<dyn Fn(String) + Send + Sync>,
+) {
+    render_state.last_snapshot_fingerprint = Some(fingerprint);
+
+    if render_state.last_rendered_content.as_deref() == Some(content.as_str()) {
+        return;
+    }
+
+    let now = Instant::now();
+    if render_now(render_state.last_rendered_at, render_interval_ms, now)
+        && render_state.flush_due_at.is_none()
+    {
+        task_renderer(content.clone());
+        render_state.last_rendered_content = Some(content);
+        render_state.last_rendered_at = Some(now);
+        render_state.pending_content = None;
+        render_state.flush_due_at = None;
+        return;
+    }
+
+    render_state.pending_content = Some(content);
+    if render_state.flush_due_at.is_none() {
+        render_state.flush_due_at = Some(schedule_flush_due_at(
+            render_state.last_rendered_at,
+            render_interval_ms,
+            now,
+        ));
+    }
+}
+
+fn flush_pending_terminal_frame(
+    task_renderer: &Arc<dyn Fn(String) + Send + Sync>,
+    render_state: &mut TerminalRenderState,
+) {
+    render_state.flush_due_at = None;
+    if let Some(content) = render_state.pending_content.take() {
+        task_renderer(content.clone());
+        render_state.last_rendered_content = Some(content);
+        render_state.last_rendered_at = Some(Instant::now());
+    }
+}
+
+fn render_now(last_rendered_at: Option<Instant>, render_interval_ms: u64, now: Instant) -> bool {
+    match last_rendered_at {
+        None => true,
+        Some(last_rendered_at) => {
+            now.duration_since(last_rendered_at).as_millis() as u64 >= render_interval_ms
+        }
+    }
+}
+
+fn schedule_flush_due_at(
+    last_rendered_at: Option<Instant>,
+    render_interval_ms: u64,
+    now: Instant,
+) -> Instant {
+    match last_rendered_at {
+        None => now,
+        Some(last_rendered_at) => {
+            let elapsed_ms = now.duration_since(last_rendered_at).as_millis() as u64;
+            let remaining_ms = render_interval_ms.saturating_sub(elapsed_ms).max(1);
+            now + Duration::from_millis(remaining_ms)
+        }
+    }
+}
+
+async fn wait_for_terminal_flush(flush_due_at: Option<Instant>) {
+    match flush_due_at {
+        Some(flush_due_at) => sleep_until(tokio::time::Instant::from_std(flush_due_at)).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn fingerprint_terminal_content(content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn terminal_renderer() -> TerminalRenderer {
@@ -929,7 +1247,8 @@ fn leave_alternate_screen_into<W: Write>(writer: &mut W) -> io::Result<()> {
 
 fn running_table_header_row(running_event_width: usize) -> String {
     format!(
-        "│ {} {} {} {} {} {} {}",
+        "│ {} {} {} {} {} {} {} {}",
+        format_cell("", RUNNING_STATUS_WIDTH),
         format_cell("TASK", RUNNING_ID_WIDTH),
         format_cell("STATE", RUNNING_STATE_WIDTH),
         format_cell("SESSION", RUNNING_SESSION_WIDTH),
@@ -942,7 +1261,8 @@ fn running_table_header_row(running_event_width: usize) -> String {
 
 fn running_table_separator_row(running_event_width: usize) -> String {
     format!(
-        "│ {} {} {} {} {} {} {}",
+        "│ {} {} {} {} {} {} {} {}",
+        "─".repeat(RUNNING_STATUS_WIDTH),
         "─".repeat(RUNNING_ID_WIDTH),
         "─".repeat(RUNNING_STATE_WIDTH),
         "─".repeat(RUNNING_SESSION_WIDTH),
@@ -954,6 +1274,10 @@ fn running_table_separator_row(running_event_width: usize) -> String {
 }
 
 fn format_running_row(entry: &RunningEntryPayload, running_event_width: usize) -> String {
+    let dot = colorize(
+        &format_cell("●", RUNNING_STATUS_WIDTH),
+        running_row_dot_color(entry),
+    );
     let issue = colorize(
         &format_cell(&entry.issue_identifier, RUNNING_ID_WIDTH),
         ANSI_CYAN,
@@ -1006,8 +1330,8 @@ fn format_running_row(entry: &RunningEntryPayload, running_event_width: usize) -
                 .to_string()
         });
     let event = format_cell(&sanitize_display_text(&event_text), running_event_width);
-    let tokens = format_cell(&format_int(entry.tokens.total_tokens), RUNNING_TOKENS_WIDTH);
-    format!("│ {issue} {state} {session} {pid} {runtime_turns} {event} {tokens}")
+    let tokens = format_cell_right(&format_int(entry.tokens.total_tokens), RUNNING_TOKENS_WIDTH);
+    format!("│ {dot} {issue} {state} {session} {pid} {runtime_turns} {event} {tokens}")
 }
 
 fn format_retry_row(entry: &RetrySnapshot) -> String {
@@ -1033,6 +1357,16 @@ fn state_color(state: &str) -> &'static str {
         "rework" => ANSI_YELLOW,
         "human-review" | "done" => ANSI_MAGENTA,
         _ => ANSI_BLUE,
+    }
+}
+
+fn running_row_dot_color(entry: &RunningEntryPayload) -> &'static str {
+    match entry.last_event.as_deref() {
+        Some("turn_completed") => ANSI_MAGENTA,
+        Some("codex/event/task_started") => ANSI_GREEN,
+        Some("codex/event/token_count") => ANSI_YELLOW,
+        Some(_) => ANSI_BLUE,
+        None => state_color(&entry.state),
     }
 }
 
@@ -1783,9 +2117,21 @@ fn humanize_status(value: &str) -> String {
     value
         .replace(['_', '-'], " ")
         .split_whitespace()
+        .map(title_case_word)
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+}
+
+fn title_case_word(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut rendered = first.to_uppercase().collect::<String>();
+            rendered.push_str(&chars.as_str().to_ascii_lowercase());
+            rendered
+        }
+        None => String::new(),
+    }
 }
 
 fn short_id(value: &str) -> String {
@@ -1799,6 +2145,19 @@ fn short_id(value: &str) -> String {
 
 fn humanize_event_name(event: &str) -> String {
     event.replace('_', " ")
+}
+
+fn snapshot_error_payload(error: OrchestratorHandleError) -> ErrorPayload {
+    match error {
+        OrchestratorHandleError::TimedOut => ErrorPayload {
+            code: "snapshot_timeout",
+            message: "Orchestrator snapshot timed out",
+        },
+        OrchestratorHandleError::Unavailable => ErrorPayload {
+            code: "snapshot_unavailable",
+            message: "Orchestrator snapshot unavailable",
+        },
+    }
 }
 
 fn inline_text(value: &str) -> String {
@@ -1896,13 +2255,16 @@ where
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        value.to_string()
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
     }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+
+    let truncated: String = value.chars().take(max_chars - 3).collect();
+    format!("{truncated}...")
 }
 
 fn parse_integer(value: Option<&Value>) -> Option<u64> {
@@ -2141,6 +2503,14 @@ fn format_polling_status(polling: &PollingSnapshot) -> String {
 }
 
 fn format_cell(value: &str, width: usize) -> String {
+    format_cell_aligned(value, width, false)
+}
+
+fn format_cell_right(value: &str, width: usize) -> String {
+    format_cell_aligned(value, width, true)
+}
+
+fn format_cell_aligned(value: &str, width: usize, right_align: bool) -> String {
     if width == 0 {
         return String::new();
     }
@@ -2148,6 +2518,8 @@ fn format_cell(value: &str, width: usize) -> String {
     let len = truncated.chars().count();
     if len >= width {
         truncated
+    } else if right_align {
+        format!("{truncated:>width$}")
     } else {
         format!("{truncated:<width$}")
     }
@@ -2313,8 +2685,10 @@ body { margin: 0; font-family: "Avenir Next", "Segoe UI", sans-serif; background
 .status-chip-dot { width: 10px; height: 10px; border-radius: 999px; background: currentColor; opacity: 0.85; }
 .status-chip-online { background: var(--accent-soft); color: var(--accent); }
 .status-chip-offline { background: var(--warn-soft); color: var(--warn); }
+.status-chip-degraded { background: #f4e6d6; color: #8f4e17; }
 .status-chip-fallback { background: #ece4d4; color: var(--ink); }
 .status-chip-checking { background: #ece4d4; color: var(--ink); }
+.error-card { border: 1px solid #e6c7a5; background: #fff6ed; }
 .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
 .throughput-grid { grid-template-columns: 1fr 3fr; }
 .metric .value { font-size: 2rem; font-weight: 700; margin: 10px 0 6px; }
@@ -2525,6 +2899,9 @@ const DASHBOARD_JS: &str = r#"
 
   function applyState(payload) {
     currentState = payload;
+    const errorCard = document.getElementById('error-card');
+    const errorTitle = document.getElementById('error-title');
+    const errorCopy = document.getElementById('error-copy');
     document.getElementById('generated-at').textContent = payload.generated_at || 'n/a';
     document.getElementById('metric-running').textContent = payload.counts?.running ?? 0;
     document.getElementById('metric-retrying').textContent = payload.counts?.retrying ?? 0;
@@ -2564,6 +2941,17 @@ const DASHBOARD_JS: &str = r#"
     if (workflowLastGood) {
       workflowLastGood.textContent = `Using last good config: ${payload.workflow?.using_last_good ? 'yes' : 'no'}`;
     }
+    if (errorCard && errorTitle && errorCopy) {
+      if (payload.error) {
+        errorCard.hidden = false;
+        errorTitle.textContent = payload.error.message || 'Observability degraded';
+        errorCopy.textContent = payload.error.code || 'unknown_error';
+      } else {
+        errorCard.hidden = true;
+        errorTitle.textContent = 'Observability degraded';
+        errorCopy.textContent = '';
+      }
+    }
     applyLinks(payload);
     bindCopyButtons();
     updateRuntimeClocks();
@@ -2601,9 +2989,13 @@ const DASHBOARD_JS: &str = r#"
 
   async function fetchState() {
     const response = await fetch('/api/v1/state', { cache: 'no-store' });
-    if (!response.ok) throw new Error(`status ${response.status}`);
     const payload = await response.json();
     applyState(payload);
+    if (payload.error) {
+      updateStatus('degraded', 'Degraded', `${payload.error.message}. Polling /api/v1/state every 5s.`);
+      return;
+    }
+    if (!response.ok) throw new Error(`status ${response.status}`);
     updateStatus('fallback', 'Polling', 'Streaming unavailable. Falling back to /api/v1/state every 5s.');
   }
 
@@ -2626,7 +3018,12 @@ const DASHBOARD_JS: &str = r#"
   }
 
   function handleStreamPayload(event) {
-    applyState(JSON.parse(event.data));
+    const payload = JSON.parse(event.data);
+    applyState(payload);
+    if (payload.error) {
+      updateStatus('degraded', 'Degraded', `${payload.error.message} via /api/v1/stream.`);
+      return;
+    }
     updateStatus('online', 'Live', 'Connected to /api/v1/stream for live updates.');
   }
 
@@ -2670,9 +3067,12 @@ const DASHBOARD_JS: &str = r#"
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
     };
 
     use chrono::{TimeZone, Utc};
@@ -2813,6 +3213,14 @@ mod tests {
         assert!(html.contains("\"workspace_location\":\"/srv/symphony/ABC-456\""));
         assert!(html.contains("Due "));
         assert!(html.contains("Deadline "));
+    }
+
+    #[test]
+    fn dashboard_html_includes_error_card_shell() {
+        let html = render_dashboard_html(&sample_payload());
+        assert!(html.contains("id=\"error-card\""));
+        assert!(html.contains("id=\"error-title\""));
+        assert!(html.contains("id=\"error-copy\""));
     }
 
     #[test]
@@ -3162,7 +3570,8 @@ mod tests {
         let running_event_width = 52;
         let row = super::format_running_row(&entry, running_event_width);
         let plain = super::strip_ansi_sequences(&row);
-        let expected_width = 8
+        let expected_width = 9
+            + super::RUNNING_STATUS_WIDTH
             + super::RUNNING_ID_WIDTH
             + super::RUNNING_STATE_WIDTH
             + super::RUNNING_SESSION_WIDTH
@@ -3247,6 +3656,49 @@ mod tests {
         assert_eq!(
             humanize_blocking_reason("todoist_project_not_found proj-123"),
             "configured Todoist project was not found"
+        );
+    }
+
+    #[test]
+    fn render_snapshot_timeout_status_marks_snapshot_timeout() {
+        assert!(super::render_snapshot_timed_out_status().contains("snapshot timed out"));
+    }
+
+    #[tokio::test]
+    async fn presenter_snapshot_failure_preserves_distinct_error_codes() {
+        let (orchestrator, workflow_store) = test_runtime().await;
+        let presenter = super::Presenter::default();
+        let timeout_payload = presenter.present_snapshot_failure(
+            super::OrchestratorHandleError::TimedOut,
+            &workflow_store,
+            Some("127.0.0.1:4000".parse().expect("addr")),
+        );
+        let unavailable_payload = presenter.present_snapshot_failure(
+            super::OrchestratorHandleError::Unavailable,
+            &workflow_store,
+            Some("127.0.0.1:4000".parse().expect("addr")),
+        );
+
+        orchestrator.shutdown().await;
+
+        assert_eq!(
+            timeout_payload.error.as_ref().map(|error| error.code),
+            Some("snapshot_timeout")
+        );
+        assert_eq!(
+            timeout_payload.error.as_ref().map(|error| error.message),
+            Some("Orchestrator snapshot timed out")
+        );
+        assert_eq!(
+            unavailable_payload.error.as_ref().map(|error| error.code),
+            Some("snapshot_unavailable")
+        );
+        assert_eq!(
+            unavailable_payload
+                .error
+                .as_ref()
+                .map(|error| error.message),
+            Some("Orchestrator snapshot unavailable")
         );
     }
 
@@ -3367,9 +3819,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn degraded_snapshot_dashboard_includes_context() {
+        let (orchestrator, workflow_store) = test_runtime().await;
+        let rendered = super::render_snapshot_unavailable_dashboard(
+            &workflow_store,
+            Some("127.0.0.1:4000".parse().expect("addr")),
+            12.5,
+            Some(&PollingSnapshot {
+                checking: false,
+                next_poll_in_ms: Some(2_000),
+                poll_interval_ms: 5_000,
+            }),
+        );
+
+        orchestrator.shutdown().await;
+        let plain = super::strip_ansi_sequences(&rendered);
+        assert!(plain.contains("Orchestrator snapshot unavailable"));
+        assert!(plain.contains("Throughput: 12.5 tps"));
+        assert!(plain.contains("Project: https://app.todoist.com/app/project/proj"));
+        assert!(plain.contains("Dashboard: http://127.0.0.1:4000/"));
+        assert!(plain.contains("Next refresh: 2s"));
+    }
+
+    #[tokio::test]
+    async fn degraded_snapshot_dashboard_marks_timeout_context() {
+        let (orchestrator, workflow_store) = test_runtime().await;
+        let rendered = super::render_snapshot_failure_dashboard(
+            super::OrchestratorHandleError::TimedOut,
+            &workflow_store,
+            Some("127.0.0.1:4000".parse().expect("addr")),
+            4.2,
+            None,
+        );
+
+        orchestrator.shutdown().await;
+        let plain = super::strip_ansi_sequences(&rendered);
+        assert!(plain.contains("Orchestrator snapshot timed out"));
+        assert!(plain.contains("Throughput: 4.2 tps"));
+        assert!(plain.contains("Next refresh: n/a"));
+    }
+
+    #[test]
+    fn pending_terminal_flush_is_reused_until_fire_time() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let renderer: Arc<dyn Fn(String) + Send + Sync> = {
+            let renders = Arc::clone(&renders);
+            Arc::new(move |_content: String| {
+                renders.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let now = Instant::now();
+        let due_at = now + Duration::from_millis(20);
+        let mut render_state = super::TerminalRenderState {
+            last_rendered_at: Some(now),
+            pending_content: Some("old pending".to_string()),
+            flush_due_at: Some(due_at),
+            ..Default::default()
+        };
+
+        super::maybe_enqueue_terminal_frame(
+            &mut render_state,
+            "new pending".to_string(),
+            42,
+            50,
+            &renderer,
+        );
+
+        assert_eq!(renders.load(Ordering::SeqCst), 0);
+        assert_eq!(render_state.pending_content.as_deref(), Some("new pending"));
+        assert_eq!(render_state.flush_due_at, Some(due_at));
+    }
+
     fn sample_payload() -> StatePayload {
         StatePayload {
             generated_at: Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap(),
+            error: None,
             counts: SnapshotCounts {
                 running: 1,
                 retrying: 1,

@@ -50,7 +50,7 @@ pub struct WorkflowStore {
 }
 
 pub struct WorkflowWatcher {
-    pub join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -172,7 +172,7 @@ impl WorkflowStore {
                 store.reload();
             }
         });
-        WorkflowWatcher { join }
+        WorkflowWatcher { join: Some(join) }
     }
 
     fn update_error(&self, error: WorkflowError) {
@@ -194,6 +194,29 @@ impl WorkflowStore {
         let definition = parse_workflow(&raw)?;
         let config = ServiceConfig::from_map(&definition.config)?;
         Ok(LoadedWorkflow { definition, config })
+    }
+}
+
+impl WorkflowWatcher {
+    pub fn is_finished(&self) -> bool {
+        self.join.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    pub async fn wait_for_exit(&mut self) -> Result<(), String> {
+        match self.join.take() {
+            Some(join) => match join.await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(join) = self.join.take() {
+            join.abort();
+            let _ = join.await;
+        }
     }
 }
 

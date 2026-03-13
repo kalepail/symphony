@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 
 use crate::{
     observability::{Presenter, StatePayload, render_dashboard_html},
-    orchestrator::OrchestratorHandle,
+    orchestrator::{OrchestratorHandle, OrchestratorHandleError},
     workflow::WorkflowStore,
 };
 
@@ -36,7 +36,7 @@ struct AppState {
 }
 
 pub struct HttpServer {
-    join: tokio::task::JoinHandle<()>,
+    join: Option<tokio::task::JoinHandle<Result<(), String>>>,
     local_addr: SocketAddr,
 }
 
@@ -59,17 +59,41 @@ impl HttpServer {
         });
 
         let join = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .map_err(|error| error.to_string())
         });
-        Ok(Self { join, local_addr })
+        Ok(Self {
+            join: Some(join),
+            local_addr,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    pub fn abort(self) {
-        self.join.abort();
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    pub async fn wait_for_exit(&mut self) -> Result<(), String> {
+        match self.join.take() {
+            Some(join) => match join.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(join) = self.join.take() {
+            join.abort();
+            let _ = join.await;
+        }
     }
 }
 
@@ -94,25 +118,17 @@ fn app_router(state: AppState) -> Router {
 }
 
 async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
-    match present_state(&state).await {
-        Some(payload) => Html(render_dashboard_html(&payload)).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": { "code": "snapshot_unavailable", "message": "snapshot unavailable" } })),
-        )
-            .into_response(),
-    }
+    let payload = present_state(&state).await;
+    (
+        state_payload_status(&payload),
+        Html(render_dashboard_html(&payload)),
+    )
+        .into_response()
 }
 
 async fn api_state(State(state): State<AppState>) -> impl IntoResponse {
-    match present_state(&state).await {
-        Some(payload) => Json(payload).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": { "code": "snapshot_unavailable", "message": "snapshot unavailable" } })),
-        )
-            .into_response(),
-    }
+    let payload = present_state(&state).await;
+    (state_payload_status(&payload), Json(payload)).into_response()
 }
 
 async fn api_stream(
@@ -130,7 +146,7 @@ async fn api_stream(
                 sent_initial = true;
             }
 
-            let payload = present_state(&state).await?;
+            let payload = present_state(&state).await;
             let event = Event::default()
                 .event("state")
                 .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()));
@@ -191,13 +207,40 @@ async fn api_not_found() -> impl IntoResponse {
         .into_response()
 }
 
-async fn present_state(state: &AppState) -> Option<StatePayload> {
-    let snapshot = state.orchestrator.snapshot().await.ok()?;
+async fn present_state(state: &AppState) -> StatePayload {
+    let snapshot = state.orchestrator.snapshot().await;
     let mut presenter = state
         .presenter
         .lock()
         .expect("observability presenter poisoned");
-    Some(presenter.present_state(snapshot, &state.workflow_store, Some(state.dashboard_addr)))
+    match snapshot {
+        Ok(snapshot) => {
+            presenter.present_state(snapshot, &state.workflow_store, Some(state.dashboard_addr))
+        }
+        Err(error) => present_snapshot_failure(
+            &mut presenter,
+            &state.workflow_store,
+            state.dashboard_addr,
+            error,
+        ),
+    }
+}
+
+fn present_snapshot_failure(
+    presenter: &mut Presenter,
+    workflow_store: &WorkflowStore,
+    dashboard_addr: SocketAddr,
+    error: OrchestratorHandleError,
+) -> StatePayload {
+    presenter.present_snapshot_failure(error, workflow_store, Some(dashboard_addr))
+}
+
+fn state_payload_status(payload: &StatePayload) -> StatusCode {
+    if payload.error.is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +304,80 @@ mod tests {
         assert!(payload["throughput"]["tps_5s"].is_number());
 
         orchestrator.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn api_state_preserves_snapshot_unavailable_error_payload() {
+        let (orchestrator, workflow_store) = test_runtime(false).await;
+        let handle = orchestrator.handle();
+        orchestrator.shutdown().await;
+        let app = app_router(AppState {
+            orchestrator: handle,
+            workflow_store: workflow_store.clone(),
+            dashboard_addr: "127.0.0.1:4000".parse().expect("addr"),
+            presenter: Arc::new(Mutex::new(Presenter::default())),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["error"]["code"], "snapshot_unavailable");
+        assert_eq!(
+            payload["error"]["message"],
+            "Orchestrator snapshot unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_renders_html_shell_when_snapshot_is_unavailable() {
+        let (orchestrator, workflow_store) = test_runtime(false).await;
+        let handle = orchestrator.handle();
+        orchestrator.shutdown().await;
+        let app = app_router(AppState {
+            orchestrator: handle,
+            workflow_store: workflow_store.clone(),
+            dashboard_addr: "127.0.0.1:4000".parse().expect("addr"),
+            presenter: Arc::new(Mutex::new(Presenter::default())),
+        });
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(html.contains("id=\"error-card\""));
+        assert!(html.contains("snapshot_unavailable"));
+        assert!(html.contains("Todoist Operations Dashboard"));
     }
 
     #[tokio::test]

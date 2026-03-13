@@ -8,7 +8,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tracing_subscriber::{EnvFilter, fmt};
+use chrono::{SecondsFormat, Utc};
+use tracing_subscriber::{EnvFilter, fmt, fmt::time::FormatTime};
+
+use crate::issue::Issue;
 
 const DEFAULT_LOG_RELATIVE_PATH: &str = "log/symphony.log";
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -31,13 +34,44 @@ pub fn init(logs_root: Option<&Path>) -> Result<PathBuf, String> {
     fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
+        .with_timer(UtcRfc3339Millis)
         .with_ansi(false)
         .with_writer(move || sink.writer())
         .try_init()
         .map_err(|error| error.to_string())?;
 
     Ok(log_file)
+}
+
+pub fn issue_context(issue: &Issue) -> String {
+    issue_identity(&issue.id, &issue.identifier)
+}
+
+pub fn issue_identity(issue_id: &str, issue_identifier: &str) -> String {
+    format!(
+        "issue_id={} issue_identifier={}",
+        issue_id, issue_identifier
+    )
+}
+
+pub fn codex_session_context(
+    issue_id: &str,
+    issue_identifier: &str,
+    session_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> String {
+    format!(
+        "{} session_id={} thread_id={} turn_id={}",
+        issue_identity(issue_id, issue_identifier),
+        session_id,
+        thread_id,
+        turn_id
+    )
+}
+
+pub fn worker_host_for_log(worker_host: Option<&str>) -> &str {
+    worker_host.unwrap_or("local")
 }
 
 pub fn default_log_file(logs_root: &Path) -> PathBuf {
@@ -212,13 +246,28 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct UtcRfc3339Millis;
+
+impl FormatTime for UtcRfc3339Millis {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let mut timestamp = String::with_capacity(32);
+        timestamp.push_str(&Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
+        w.write_str(&timestamp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io::Write, path::Path};
 
     use tempfile::tempdir;
+    use tracing_subscriber::fmt::time::FormatTime;
 
-    use super::{RotatingFileSink, build_filter_spec, default_log_file};
+    use super::{
+        RotatingFileSink, UtcRfc3339Millis, build_filter_spec, default_log_file,
+        worker_host_for_log,
+    };
 
     #[test]
     fn default_log_file_uses_log_subdirectory() {
@@ -292,5 +341,23 @@ mod tests {
             build_filter_spec(Some("warn,symphony=trace,symphony_rust=debug")),
             "warn,symphony=trace,symphony_rust=debug"
         );
+    }
+
+    #[test]
+    fn worker_host_for_log_normalizes_local_runs() {
+        assert_eq!(worker_host_for_log(None), "local");
+        assert_eq!(worker_host_for_log(Some("builder-1")), "builder-1");
+    }
+
+    #[test]
+    fn utc_timer_emits_rfc3339_millis() {
+        let mut output = String::new();
+        let mut writer = tracing_subscriber::fmt::format::Writer::new(&mut output);
+        UtcRfc3339Millis
+            .format_time(&mut writer)
+            .expect("timestamp");
+        assert!(output.ends_with('Z'));
+        assert!(output.contains('T'));
+        assert!(output.contains('.'));
     }
 }

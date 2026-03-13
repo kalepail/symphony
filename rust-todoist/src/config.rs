@@ -273,7 +273,7 @@ fn parse_observability_config(value: Option<&Value>) -> Result<ObservabilityConf
             map.get("render_interval_ms"),
             "observability.render_interval_ms",
         )?
-        .unwrap_or(250),
+        .unwrap_or(16),
     })
 }
 
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(config.codex.stall_timeout_ms, 300_000);
         assert!(config.observability.terminal_enabled);
         assert_eq!(config.observability.refresh_ms, 1_000);
-        assert_eq!(config.observability.render_interval_ms, 250);
+        assert_eq!(config.observability.render_interval_ms, 16);
     }
 
     #[test]

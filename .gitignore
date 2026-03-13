@@ -1,0 +1,8 @@
+/log/
+/tmp/
+/.env
+/.env.local
+/.secrets
+/.credentials
+/WORKFLOW.local.md
+/.DS_Store
