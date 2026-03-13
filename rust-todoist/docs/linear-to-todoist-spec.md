@@ -525,6 +525,7 @@ Supported tracker kinds in `rust-todoist/`:
 - `tracker.base_url` defaults to `https://api.todoist.com/api/v1`
 - `tracker.api_key` falls back to `TODOIST_API_TOKEN`
 - `tracker.assignee` may also fall back to `TODOIST_ASSIGNEE`
+- for personal projects, the default is to leave `tracker.assignee` unset and treat tasks as unassigned
 - `active_states` and `terminal_states` continue to accept YAML lists or comma-separated strings
 - `observability.terminal_enabled`, `observability.refresh_ms`, and
   `observability.render_interval_ms` preserve the current Rust defaults and meaning

@@ -147,6 +147,7 @@ The final spec now locks the implementation choice:
   `section_id` is supplied
 - due dates, deadlines, and reminders are planning metadata that should be surfaced when available
 - assignment and collaborators define ownership in shared projects
+- personal projects should default to unassigned tasks; labels remain available for categorization or runtime partitioning
 
 Operator recommendation:
 
@@ -269,7 +270,8 @@ Required replacement:
 ### Assignment
 
 `tracker.assignee` must be validated against Todoist current-user and collaborator data because
-assignee semantics differ on shared vs non-shared projects.
+assignee semantics differ on shared vs non-shared projects. On non-shared projects that do not
+support assignment, the runtime should treat configured assignee routing as effectively unset.
 
 ### Dynamic Tool
 
