@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::PathBuf,
     process::Command as StdCommand,
     time::{Duration, Instant},
@@ -17,14 +18,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    codex::{AppServerClient, CodexEvent},
+    codex::{AppServerClient, CodexError, CodexEvent},
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
     prompt,
-    tracker::{TrackerClient, TrackerRateBudget, build_tracker_client},
+    tracker::{TrackerClient, TrackerError, TrackerRateBudget, build_tracker_client},
     workflow::WorkflowStore,
     workspace::{
-        Workspace, sanitize_identifier, ssh_args, ssh_executable,
+        Workspace, WorkspaceError, sanitize_identifier, ssh_args, ssh_executable,
         workspace_path_for_identifier_on_host,
     },
 };
@@ -58,6 +59,7 @@ struct State {
     max_concurrent_agents: usize,
     max_retry_backoff_ms: u64,
     worker_runtime: WorkerRuntimeConfig,
+    validated_startup_config: Option<ServiceConfig>,
     next_poll_due_at: Option<Instant>,
     poll_check_in_progress: bool,
     running: BTreeMap<String, RunningEntry>,
@@ -103,6 +105,8 @@ struct RetryEntry {
     worker_host: Option<String>,
     workspace_location: Option<String>,
     error: Option<String>,
+    error_stage: Option<String>,
+    error_kind: Option<String>,
     cancel: CancellationToken,
 }
 
@@ -114,6 +118,8 @@ struct RetryRequest {
     worker_host: Option<String>,
     workspace_location: Option<String>,
     error: Option<String>,
+    error_stage: Option<String>,
+    error_kind: Option<String>,
     continuation: bool,
 }
 
@@ -142,6 +148,137 @@ enum WorkerDisposition {
     Continue { issue: Issue },
     Quiesced { issue: Option<Issue> },
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerErrorStage {
+    Startup,
+    WorkspaceCreate,
+    BeforeRun,
+    TrackerBuild,
+    SessionStart,
+    TurnRun,
+    StateRefresh,
+    Cleanup,
+}
+
+impl WorkerErrorStage {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::WorkspaceCreate => "workspace_create",
+            Self::BeforeRun => "before_run",
+            Self::TrackerBuild => "tracker_build",
+            Self::SessionStart => "session_start",
+            Self::TurnRun => "turn_run",
+            Self::StateRefresh => "state_refresh",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerErrorKind {
+    StartupFailoverExhausted,
+    WorkspaceFailure,
+    HookFailure,
+    TrackerFailure,
+    SessionFailure,
+    TurnFailure,
+    ApprovalRequired,
+    InputRequired,
+    Cancellation,
+}
+
+impl WorkerErrorKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartupFailoverExhausted => "startup_failover_exhausted",
+            Self::WorkspaceFailure => "workspace_failure",
+            Self::HookFailure => "hook_failure",
+            Self::TrackerFailure => "tracker_failure",
+            Self::SessionFailure => "session_failure",
+            Self::TurnFailure => "turn_failure",
+            Self::ApprovalRequired => "approval_required",
+            Self::InputRequired => "input_required",
+            Self::Cancellation => "cancellation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerError {
+    stage: WorkerErrorStage,
+    kind: WorkerErrorKind,
+    worker_host: Option<String>,
+    message: String,
+}
+
+impl WorkerError {
+    fn new(
+        stage: WorkerErrorStage,
+        kind: WorkerErrorKind,
+        worker_host: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            kind,
+            worker_host,
+            message: message.into(),
+        }
+    }
+
+    fn startup_failover_eligible(&self) -> bool {
+        matches!(
+            self.stage,
+            WorkerErrorStage::WorkspaceCreate
+                | WorkerErrorStage::BeforeRun
+                | WorkerErrorStage::SessionStart
+        )
+    }
+
+    fn stage_name(&self) -> String {
+        self.stage.as_str().to_string()
+    }
+
+    fn kind_name(&self) -> String {
+        self.kind.as_str().to_string()
+    }
+
+    fn startup_failover_exhausted(errors: Vec<Self>) -> Self {
+        let worker_host = errors.last().and_then(|error| error.worker_host.clone());
+        let message = errors
+            .iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Self::new(
+            WorkerErrorStage::Startup,
+            WorkerErrorKind::StartupFailoverExhausted,
+            worker_host,
+            if message.is_empty() {
+                "all worker startup attempts failed".to_string()
+            } else {
+                format!("all worker startup attempts failed: {message}")
+            },
+        )
+    }
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "worker_stage={} worker_kind={} worker_host={} {}",
+            self.stage.as_str(),
+            self.kind.as_str(),
+            self.worker_host.as_deref().unwrap_or("local"),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for WorkerError {}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -193,6 +330,8 @@ pub struct RetrySnapshot {
     pub worker_host: Option<String>,
     pub workspace_location: Option<String>,
     pub error: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,6 +368,8 @@ pub struct IssueDetail {
     pub retry: Option<RetryDetail>,
     pub recent_events: Vec<RecentEvent>,
     pub last_error: Option<String>,
+    pub last_error_stage: Option<String>,
+    pub last_error_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -264,6 +405,8 @@ pub struct RetryDetail {
     pub worker_host: Option<String>,
     pub workspace_location: Option<String>,
     pub error: Option<String>,
+    pub error_stage: Option<String>,
+    pub error_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -275,13 +418,19 @@ pub struct RecentEvent {
 
 enum Command {
     Tick,
+    WorkerRuntimeInfo {
+        issue_id: String,
+        worker_host: Option<String>,
+        workspace_path: PathBuf,
+        workspace_location: String,
+    },
     WorkerUpdate {
         issue_id: String,
         event: Box<CodexEvent>,
     },
     WorkerExit {
         issue_id: String,
-        result: Box<Result<WorkerDisposition, String>>,
+        result: Box<Result<WorkerDisposition, WorkerError>>,
     },
     RetryIssue {
         issue_id: String,
@@ -331,6 +480,7 @@ impl Orchestrator {
                 max_concurrent_agents: effective.config.agent.max_concurrent_agents,
                 max_retry_backoff_ms: effective.config.agent.max_retry_backoff_ms,
                 todoist_rate_budget: initial_todoist_rate_budget,
+                validated_startup_config: Some(effective.config.clone()),
                 ..State::default()
             };
             let mut update_version = 0u64;
@@ -353,6 +503,21 @@ impl Orchestrator {
                             &mut update_version,
                         )
                         .await;
+                    }
+                    Command::WorkerRuntimeInfo {
+                        issue_id,
+                        worker_host,
+                        workspace_path,
+                        workspace_location,
+                    } => {
+                        integrate_worker_runtime_info(
+                            &mut state,
+                            &issue_id,
+                            worker_host,
+                            workspace_path,
+                            workspace_location,
+                        );
+                        notify_observers(&updates_tx, &mut update_version);
                     }
                     Command::WorkerUpdate { issue_id, event } => {
                         integrate_worker_update(&mut state, &issue_id, *event);
@@ -561,14 +726,17 @@ async fn run_tick(
                             return;
                         }
                     };
-                    let validate_result = tracker.validate_startup().await;
-                    capture_tracker_rate_budget(state, tracker.as_ref()).await;
-                    if let Err(error) = validate_result {
-                        error!("dispatch=status=blocked reason={error}");
-                        schedule_next_tick(tx, state);
-                        state.poll_check_in_progress = false;
-                        notify_observers(updates, update_version);
-                        return;
+                    if startup_validation_needed(state, &effective.config) {
+                        let validate_result = tracker.validate_startup().await;
+                        capture_tracker_rate_budget(state, tracker.as_ref()).await;
+                        if let Err(error) = validate_result {
+                            error!("dispatch=status=blocked reason={error}");
+                            schedule_next_tick(tx, state);
+                            state.poll_check_in_progress = false;
+                            notify_observers(updates, update_version);
+                            return;
+                        }
+                        mark_startup_validated(state, &effective.config);
                     }
                     let issues_result = tracker.fetch_candidate_issues().await;
                     capture_tracker_rate_budget(state, tracker.as_ref()).await;
@@ -640,6 +808,14 @@ fn refresh_runtime_config(workflow_store: &WorkflowStore, state: &mut State) {
 
 async fn capture_tracker_rate_budget(state: &mut State, tracker: &dyn TrackerClient) {
     state.todoist_rate_budget = tracker.rate_budget().await;
+}
+
+fn startup_validation_needed(state: &State, config: &ServiceConfig) -> bool {
+    state.validated_startup_config.as_ref() != Some(config)
+}
+
+fn mark_startup_validated(state: &mut State, config: &ServiceConfig) {
+    state.validated_startup_config = Some(config.clone());
 }
 
 fn worker_runtime_from_config(config: &ServiceConfig) -> WorkerRuntimeConfig {
@@ -944,6 +1120,8 @@ async fn reconcile_stalled_runs(
                     worker_host,
                     workspace_location: Some(workspace_location),
                     error: Some(format!("stalled for {elapsed_ms}ms without codex activity")),
+                    error_stage: None,
+                    error_kind: None,
                     continuation: false,
                 },
             );
@@ -1259,7 +1437,7 @@ fn handle_worker_exit(
     state: &mut State,
     tx: &mpsc::Sender<Command>,
     issue_id: &str,
-    result: Result<WorkerDisposition, String>,
+    result: Result<WorkerDisposition, WorkerError>,
 ) {
     let Some(running) = state.running.remove(issue_id) else {
         return;
@@ -1283,6 +1461,8 @@ fn handle_worker_exit(
                     worker_host: running.worker_host.clone(),
                     workspace_location: Some(running.workspace_location.clone()),
                     error: None,
+                    error_stage: None,
+                    error_kind: None,
                     continuation: true,
                 },
             );
@@ -1321,7 +1501,9 @@ fn handle_worker_exit(
                     tracked_issue: Some(running.issue.clone()),
                     worker_host: running.worker_host.clone(),
                     workspace_location: Some(running.workspace_location.clone()),
-                    error: Some(error.clone()),
+                    error: Some(error.to_string()),
+                    error_stage: Some(error.stage_name()),
+                    error_kind: Some(error.kind_name()),
                     continuation: false,
                 },
             );
@@ -1414,6 +1596,8 @@ async fn handle_retry_issue_with_tracker(
                                 worker_host: retry_entry.worker_host.clone(),
                                 workspace_location: retry_entry.workspace_location.clone(),
                                 error: Some("no available orchestrator slots".to_string()),
+                                error_stage: retry_entry.error_stage.clone(),
+                                error_kind: retry_entry.error_kind.clone(),
                                 continuation: false,
                             },
                         );
@@ -1437,6 +1621,8 @@ async fn handle_retry_issue_with_tracker(
                     worker_host: retry_entry.worker_host.clone(),
                     workspace_location: retry_entry.workspace_location.clone(),
                     error: Some(format!("retry poll failed: {error}")),
+                    error_stage: retry_entry.error_stage.clone(),
+                    error_kind: retry_entry.error_kind.clone(),
                     continuation: false,
                 },
             );
@@ -1507,6 +1693,8 @@ fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryR
         worker_host,
         workspace_location,
         error,
+        error_stage,
+        error_kind,
         continuation,
     } = request;
     if let Some(existing) = state.retry_attempts.remove(&issue_id) {
@@ -1547,6 +1735,8 @@ fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryR
             worker_host: worker_host.clone(),
             workspace_location,
             error: error.clone(),
+            error_stage: error_stage.clone(),
+            error_kind: error_kind.clone(),
             cancel,
         },
     );
@@ -1559,6 +1749,21 @@ fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryR
         worker_host.as_deref().unwrap_or("local"),
         error.unwrap_or_else(|| "none".to_string())
     );
+}
+
+fn integrate_worker_runtime_info(
+    state: &mut State,
+    issue_id: &str,
+    worker_host: Option<String>,
+    workspace_path: PathBuf,
+    workspace_location: String,
+) {
+    let Some(running) = state.running.get_mut(issue_id) else {
+        return;
+    };
+    running.worker_host = worker_host;
+    running.workspace_path = workspace_path;
+    running.workspace_location = workspace_location;
 }
 
 fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent) {
@@ -1750,6 +1955,8 @@ fn build_snapshot(state: &State) -> Snapshot {
                 worker_host: retry.worker_host.clone(),
                 workspace_location: retry.workspace_location.clone(),
                 error: retry.error.clone(),
+                error_stage: retry.error_stage.clone(),
+                error_kind: retry.error_kind.clone(),
             })
             .collect(),
         codex_totals: SnapshotTotals {
@@ -1862,11 +2069,15 @@ fn build_issue_detail(
             worker_host: retry.worker_host.clone(),
             workspace_location: retry.workspace_location.clone(),
             error: retry.error.clone(),
+            error_stage: retry.error_stage.clone(),
+            error_kind: retry.error_kind.clone(),
         }),
         recent_events: running
             .map(|running| running.recent_events.clone())
             .unwrap_or_default(),
         last_error: retry.and_then(|retry| retry.error.clone()),
+        last_error_stage: retry.and_then(|retry| retry.error_stage.clone()),
+        last_error_kind: retry.and_then(|retry| retry.error_kind.clone()),
     })
 }
 
@@ -1927,6 +2138,125 @@ fn shutdown_retries(entries: Vec<RetryEntry>) {
     }
 }
 
+fn candidate_worker_hosts(
+    config: &ServiceConfig,
+    preferred_worker_host: Option<&str>,
+) -> Vec<Option<String>> {
+    let mut seen = BTreeSet::new();
+    let hosts = config
+        .worker
+        .ssh_hosts
+        .iter()
+        .map(|host| host.trim())
+        .filter(|host| !host.is_empty())
+        .filter(|host| seen.insert((*host).to_string()))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    match preferred_worker_host
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        Some(preferred) => {
+            let mut candidates = vec![Some(preferred.to_string())];
+            for host in hosts {
+                if host != preferred {
+                    candidates.push(Some(host));
+                }
+            }
+            candidates
+        }
+        None if hosts.is_empty() => vec![None],
+        None => hosts.into_iter().map(Some).collect(),
+    }
+}
+
+fn workspace_worker_error(
+    stage: WorkerErrorStage,
+    worker_host: Option<&str>,
+    error: WorkspaceError,
+) -> WorkerError {
+    let kind = match stage {
+        WorkerErrorStage::BeforeRun => WorkerErrorKind::HookFailure,
+        _ => WorkerErrorKind::WorkspaceFailure,
+    };
+    WorkerError::new(
+        stage,
+        kind,
+        worker_host.map(ToOwned::to_owned),
+        error.to_string(),
+    )
+}
+
+fn tracker_worker_error(
+    stage: WorkerErrorStage,
+    worker_host: Option<&str>,
+    error: TrackerError,
+) -> WorkerError {
+    WorkerError::new(
+        stage,
+        WorkerErrorKind::TrackerFailure,
+        worker_host.map(ToOwned::to_owned),
+        error.to_string(),
+    )
+}
+
+fn codex_worker_error(
+    stage: WorkerErrorStage,
+    worker_host: Option<&str>,
+    error: CodexError,
+) -> WorkerError {
+    let kind = match error {
+        CodexError::ApprovalRequired(_) => WorkerErrorKind::ApprovalRequired,
+        CodexError::TurnInputRequired(_) => WorkerErrorKind::InputRequired,
+        CodexError::TurnCancelled(_) => WorkerErrorKind::Cancellation,
+        CodexError::TurnFailed(_) => WorkerErrorKind::TurnFailure,
+        _ if stage == WorkerErrorStage::TurnRun => WorkerErrorKind::TurnFailure,
+        _ => WorkerErrorKind::SessionFailure,
+    };
+    WorkerError::new(
+        stage,
+        kind,
+        worker_host.map(ToOwned::to_owned),
+        error.to_string(),
+    )
+}
+
+async fn start_worker_on_candidate_hosts<T, F, Fut>(
+    candidate_hosts: Vec<Option<String>>,
+    mut start: F,
+) -> Result<(Option<String>, T), WorkerError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<T, WorkerError>>,
+{
+    let total_hosts = candidate_hosts.len();
+    let mut startup_failures = Vec::new();
+
+    for worker_host in candidate_hosts {
+        match start(worker_host.clone()).await {
+            Ok(started) => return Ok((worker_host, started)),
+            Err(error)
+                if error.startup_failover_eligible()
+                    && startup_failures.len() + 1 < total_hosts =>
+            {
+                warn!(
+                    "worker_startup=status=failed worker_host={} error={}; trying next worker host",
+                    worker_host.as_deref().unwrap_or("local"),
+                    error
+                );
+                startup_failures.push(error);
+            }
+            Err(error) => {
+                startup_failures.push(error);
+                return Err(WorkerError::startup_failover_exhausted(startup_failures));
+            }
+        }
+    }
+
+    Err(WorkerError::startup_failover_exhausted(startup_failures))
+}
+
 async fn run_worker(
     workflow_store: WorkflowStore,
     issue: Issue,
@@ -1934,7 +2264,7 @@ async fn run_worker(
     worker_host: Option<String>,
     cancellation: CancellationToken,
     tx: mpsc::Sender<Command>,
-) -> Result<WorkerDisposition, String> {
+) -> Result<WorkerDisposition, WorkerError> {
     let effective = workflow_store.effective();
     info!(
         "worker=status=starting issue_id={} issue_identifier={} worker_host={}",
@@ -1942,28 +2272,67 @@ async fn run_worker(
         issue.identifier,
         worker_host.as_deref().unwrap_or("local")
     );
-    let workspace =
-        Workspace::create_for_issue_on_host(&effective.config, &issue, worker_host.as_deref())
-            .await
-            .map_err(|error| error.to_string())?;
-    if let Err(error) = workspace.run_before_run(&effective.config, &issue).await {
-        workspace.run_after_run(&effective.config, &issue).await;
-        return Err(error.to_string());
-    }
 
-    let tracker =
-        build_tracker_client(effective.config.clone()).map_err(|error| error.to_string())?;
+    let tracker = build_tracker_client(effective.config.clone())
+        .map_err(|error| tracker_worker_error(WorkerErrorStage::TrackerBuild, None, error))?;
     let app = AppServerClient::new(effective.config.clone(), tracker.clone());
-    let mut session = match app
-        .start_session_on_host(&workspace.path, worker_host.as_deref())
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            workspace.run_after_run(&effective.config, &issue).await;
-            return Err(error.to_string());
-        }
-    };
+    let mut refresh_tracker = tracker.clone();
+    let mut refresh_tracker_config = effective.config.clone();
+    let candidate_hosts = candidate_worker_hosts(&effective.config, worker_host.as_deref());
+    let (worker_host, (workspace, mut session)) =
+        start_worker_on_candidate_hosts(candidate_hosts, |candidate_worker_host| {
+            let app = &app;
+            let config = &effective.config;
+            let issue = &issue;
+            async move {
+                let workspace = Workspace::create_for_issue_on_host(
+                    config,
+                    issue,
+                    candidate_worker_host.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    workspace_worker_error(
+                        WorkerErrorStage::WorkspaceCreate,
+                        candidate_worker_host.as_deref(),
+                        error,
+                    )
+                })?;
+                if let Err(error) = workspace.run_before_run(config, issue).await {
+                    workspace.run_after_run(config, issue).await;
+                    return Err(workspace_worker_error(
+                        WorkerErrorStage::BeforeRun,
+                        candidate_worker_host.as_deref(),
+                        error,
+                    ));
+                }
+
+                match app
+                    .start_session_on_host(&workspace.path, candidate_worker_host.as_deref())
+                    .await
+                {
+                    Ok(session) => Ok((workspace, session)),
+                    Err(error) => {
+                        workspace.run_after_run(config, issue).await;
+                        Err(codex_worker_error(
+                            WorkerErrorStage::SessionStart,
+                            candidate_worker_host.as_deref(),
+                            error,
+                        ))
+                    }
+                }
+            }
+        })
+        .await?;
+
+    let _ = tx
+        .send(Command::WorkerRuntimeInfo {
+            issue_id: issue.id.clone(),
+            worker_host: worker_host.clone(),
+            workspace_path: workspace.path.clone(),
+            workspace_location: workspace.path.display().to_string(),
+        })
+        .await;
 
     let worker_result = async {
         let mut current_issue = issue.clone();
@@ -1972,12 +2341,25 @@ async fn run_worker(
         let mut guarded_close_observed = false;
         for turn_number in 1..=max_turns {
             if cancellation.is_cancelled() {
-                return Err("cancelled by orchestrator".to_string());
+                return Err(WorkerError::new(
+                    WorkerErrorStage::TurnRun,
+                    WorkerErrorKind::Cancellation,
+                    worker_host.clone(),
+                    "cancelled by orchestrator",
+                ));
             }
             let workflow = workflow_store.effective();
             let prompt = if turn_number == 1 {
-                prompt::build_issue_prompt(&workflow.definition, &current_issue, attempt)
-                    .map_err(|error| error.to_string())?
+                prompt::build_issue_prompt(&workflow.definition, &current_issue, attempt).map_err(
+                    |error| {
+                        WorkerError::new(
+                            WorkerErrorStage::TurnRun,
+                            WorkerErrorKind::TurnFailure,
+                            worker_host.clone(),
+                            error.to_string(),
+                        )
+                    },
+                )?
             } else {
                 prompt::continuation_guidance(turn_number, max_turns)
             };
@@ -2003,16 +2385,34 @@ async fn run_worker(
                     });
                 })
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    codex_worker_error(WorkerErrorStage::TurnRun, worker_host.as_deref(), error)
+                })?;
             guarded_close_observed |=
                 guarded_close_for_turn.load(std::sync::atomic::Ordering::Relaxed);
 
-            let tracker = build_tracker_client(workflow_store.effective().config.clone())
-                .map_err(|error| error.to_string())?;
-            let refreshed = tracker
+            let refresh_config = workflow_store.effective().config.clone();
+            if refresh_config != refresh_tracker_config {
+                refresh_tracker =
+                    build_tracker_client(refresh_config.clone()).map_err(|error| {
+                        tracker_worker_error(
+                            WorkerErrorStage::TrackerBuild,
+                            worker_host.as_deref(),
+                            error,
+                        )
+                    })?;
+                refresh_tracker_config = refresh_config;
+            }
+            let refreshed = refresh_tracker
                 .fetch_issue_states_by_ids(std::slice::from_ref(&current_issue.id))
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    tracker_worker_error(
+                        WorkerErrorStage::StateRefresh,
+                        worker_host.as_deref(),
+                        error,
+                    )
+                })?;
             if let Some(next_issue) = refreshed.into_iter().next() {
                 current_issue = next_issue;
             } else if should_cleanup_terminal_workspace_after_guarded_close(
@@ -2068,23 +2468,35 @@ async fn run_worker(
             worker_host.as_deref(),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            workspace_worker_error(WorkerErrorStage::Cleanup, worker_host.as_deref(), error)
+        })?;
     }
     worker_result.map(|(result, _)| result)
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        Json, Router,
+        extract::{Path, Query, State as AxumState},
+        routing::{get, post},
+    };
     use chrono::{Duration as ChronoDuration, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
     use tokio::{
+        net::TcpListener,
         sync::{oneshot, watch},
         task::JoinHandle,
     };
@@ -2094,8 +2506,9 @@ mod tests {
 
     use super::{
         Orchestrator, OrchestratorHandle, OrchestratorHandleError, RetryEntry, RunningEntry, State,
-        WorkerDisposition, WorkerRuntimeConfig, WorkerSelection, build_snapshot, candidate_issue,
-        dispatch_issue, guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
+        WorkerDisposition, WorkerError, WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig,
+        WorkerSelection, build_snapshot, candidate_issue, dispatch_issue,
+        guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
         handle_worker_exit, run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
@@ -2247,6 +2660,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_worker_hosts_prefers_affinity_then_remaining_hosts() {
+        let workflow_store = sample_workflow_store_with_worker_hosts(
+            std::env::temp_dir().join("symphony-workers").as_path(),
+            &["ssh-a", "ssh-b", "ssh-a"],
+        );
+        let config = workflow_store.effective().config;
+
+        assert_eq!(
+            super::candidate_worker_hosts(&config, Some("ssh-b")),
+            vec![Some("ssh-b".to_string()), Some("ssh-a".to_string())]
+        );
+        assert_eq!(
+            super::candidate_worker_hosts(&config, None),
+            vec![Some("ssh-a".to_string()), Some("ssh-b".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_host_failover_tries_next_worker_host() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let calls = attempts.clone();
+        let result = super::start_worker_on_candidate_hosts(
+            vec![Some("ssh-a".to_string()), Some("ssh-b".to_string())],
+            move |worker_host| {
+                let calls = calls.clone();
+                async move {
+                    calls
+                        .lock()
+                        .expect("attempts")
+                        .push(worker_host.as_deref().unwrap_or("local").to_string());
+                    if worker_host.as_deref() == Some("ssh-a") {
+                        Err(WorkerError::new(
+                            WorkerErrorStage::SessionStart,
+                            WorkerErrorKind::SessionFailure,
+                            Some("ssh-a".to_string()),
+                            "ssh-a unavailable",
+                        ))
+                    } else {
+                        Ok("started")
+                    }
+                }
+            },
+        )
+        .await
+        .expect("fallback should succeed");
+
+        assert_eq!(result.0.as_deref(), Some("ssh-b"));
+        assert_eq!(
+            attempts.lock().expect("attempts").as_slice(),
+            ["ssh-a".to_string(), "ssh-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn integrate_worker_runtime_info_updates_host_and_workspace() {
+        let mut state = State::default();
+        state.running.insert(
+            "issue-1".to_string(),
+            RunningEntry {
+                issue: Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "one".to_string(),
+                    state: "In Progress".to_string(),
+                    ..Issue::default()
+                },
+                identifier: "ABC-1".to_string(),
+                workspace_path: PathBuf::from("/tmp/original"),
+                workspace_location: "/tmp/original".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: None,
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 0,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+
+        super::integrate_worker_runtime_info(
+            &mut state,
+            "issue-1",
+            Some("ssh-b".to_string()),
+            PathBuf::from("/srv/symphony/ABC-1"),
+            "/srv/symphony/ABC-1".to_string(),
+        );
+
+        let running = state.running.get("issue-1").expect("running entry");
+        assert_eq!(running.worker_host.as_deref(), Some("ssh-b"));
+        assert_eq!(running.workspace_path, PathBuf::from("/srv/symphony/ABC-1"));
+        assert_eq!(running.workspace_location, "/srv/symphony/ABC-1");
+    }
+
     #[tokio::test]
     async fn snapshot_includes_worker_host_and_workspace_affinity() {
         let mut state = State::default();
@@ -2294,6 +2813,8 @@ mod tests {
                 worker_host: Some("ssh-b".to_string()),
                 workspace_location: Some("/srv/symphony/ABC-2".to_string()),
                 error: Some("boom".to_string()),
+                error_stage: None,
+                error_kind: None,
                 cancel: CancellationToken::new(),
             },
         );
@@ -2468,6 +2989,8 @@ mod tests {
                 worker_host: None,
                 workspace_location: Some(workspace_path.display().to_string()),
                 error: None,
+                error_stage: None,
+                error_kind: None,
                 cancel: CancellationToken::new(),
             },
         );
@@ -2516,6 +3039,8 @@ mod tests {
                 worker_host: Some("ssh-a".to_string()),
                 workspace_location: Some("/srv/symphony/ABC-1".to_string()),
                 error: Some("boom".to_string()),
+                error_stage: Some("session_start".to_string()),
+                error_kind: Some("session_failure".to_string()),
                 cancel: CancellationToken::new(),
             },
         );
@@ -2531,6 +3056,8 @@ mod tests {
         );
         assert_eq!(detail.workspace.worker_host.as_deref(), Some("ssh-a"));
         assert_eq!(detail.workspace.path, "/srv/symphony/ABC-1");
+        assert_eq!(detail.last_error_stage.as_deref(), Some("session_start"));
+        assert_eq!(detail.last_error_kind.as_deref(), Some("session_failure"));
     }
 
     #[tokio::test]
@@ -2683,6 +3210,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_failure_retry_captures_structured_error_fields() {
+        let issue = Issue {
+            id: "issue-1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Retry me".to_string(),
+            state: "In Progress".to_string(),
+            assigned_to_worker: true,
+            ..Issue::default()
+        };
+        let mut state = State {
+            max_retry_backoff_ms: 60_000,
+            ..State::default()
+        };
+        state.running.insert(
+            issue.id.clone(),
+            RunningEntry {
+                issue: issue.clone(),
+                identifier: issue.identifier.clone(),
+                workspace_path: PathBuf::from("/tmp/workspace"),
+                workspace_location: "/tmp/workspace".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: Some("session-1".to_string()),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 1,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        handle_worker_exit(
+            &mut state,
+            &tx,
+            &issue.id,
+            Err(WorkerError::new(
+                WorkerErrorStage::SessionStart,
+                WorkerErrorKind::SessionFailure,
+                Some("ssh-a".to_string()),
+                "ssh died",
+            )),
+        );
+
+        let retry = state
+            .retry_attempts
+            .get(&issue.id)
+            .expect("retry should be queued");
+        assert_eq!(retry.error_stage.as_deref(), Some("session_start"));
+        assert_eq!(retry.error_kind.as_deref(), Some("session_failure"));
+        assert!(
+            retry
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("ssh died"))
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_issue_clears_claim_when_revalidate_fails_before_start() {
         let dir = tempdir().expect("tempdir");
         let workflow_path = dir.path().join("WORKFLOW.md");
@@ -2821,6 +3418,231 @@ test
         .await;
 
         assert!(workspace_path.exists());
+    }
+
+    #[derive(Default)]
+    struct TodoistTickCounts {
+        project: AtomicUsize,
+        sections: AtomicUsize,
+        plan_limits: AtomicUsize,
+        tasks: AtomicUsize,
+    }
+
+    struct TodoistTickServer {
+        base_url: String,
+        join: JoinHandle<()>,
+    }
+
+    impl Drop for TodoistTickServer {
+        fn drop(&mut self) {
+            self.join.abort();
+        }
+    }
+
+    async fn spawn_counting_todoist_tick_server(
+        counts: Arc<TodoistTickCounts>,
+    ) -> TodoistTickServer {
+        async fn get_project(
+            AxumState(counts): AxumState<Arc<TodoistTickCounts>>,
+            Path(_project_id): Path<String>,
+        ) -> Json<Value> {
+            counts.project.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }))
+        }
+
+        async fn list_sections(
+            AxumState(counts): AxumState<Arc<TodoistTickCounts>>,
+            Query(_query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            counts.sections.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": [
+                    {"id": "sec-todo", "project_id": "proj", "name": "Todo"},
+                    {"id": "sec-progress", "project_id": "proj", "name": "In Progress"}
+                ],
+                "next_cursor": null
+            }))
+        }
+
+        async fn sync(AxumState(counts): AxumState<Arc<TodoistTickCounts>>) -> Json<Value> {
+            counts.plan_limits.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "user_plan_limits": {
+                    "current": {
+                        "comments": true
+                    }
+                }
+            }))
+        }
+
+        async fn list_tasks(
+            AxumState(counts): AxumState<Arc<TodoistTickCounts>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            counts.tasks.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "results": if !query.contains_key("label") {
+                    vec![json!({
+                        "id": "task-1",
+                        "content": "Cache me",
+                        "project_id": "proj",
+                        "section_id": "sec-todo",
+                        "labels": []
+                    })]
+                } else {
+                    Vec::new()
+                },
+                "next_cursor": null
+            }))
+        }
+
+        let app = Router::new()
+            .route("/projects/{project_id}", get(get_project))
+            .route("/sections", get(list_sections))
+            .route("/sync", post(sync))
+            .route("/tasks", get(list_tasks))
+            .with_state(counts);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        TodoistTickServer {
+            base_url: format!("http://{address}"),
+            join,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tick_reuses_startup_validation_and_shared_tracker_metadata_when_config_is_unchanged()
+     {
+        let counts = Arc::new(TodoistTickCounts::default());
+        let server = spawn_counting_todoist_tick_server(counts.clone()).await;
+        let dir = tempdir().expect("tempdir");
+        let workflow_store = todoist_workflow_store_with_base_url(dir.path(), &server.base_url);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let mut state = State::default();
+        let mut version = 0u64;
+
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.validated_startup_config.as_ref(),
+            Some(&workflow_store.effective().config)
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_reload_updates_validated_config_without_refetching_unrelated_metadata() {
+        let counts = Arc::new(TodoistTickCounts::default());
+        let server = spawn_counting_todoist_tick_server(counts.clone()).await;
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        write_todoist_workflow_with_base_url_label_and_api_key(
+            &workflow_path,
+            dir.path(),
+            &server.base_url,
+            "runtime-owned",
+            "token",
+        );
+        let workflow_store = WorkflowStore::new(workflow_path.clone()).expect("workflow store");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let mut state = State::default();
+        let mut version = 0u64;
+
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+
+        write_todoist_workflow_with_base_url_label_and_api_key(
+            &workflow_path,
+            dir.path(),
+            &server.base_url,
+            "runtime-owned-v2",
+            "token",
+        );
+        workflow_store.reload();
+
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            state.validated_startup_config.as_ref(),
+            Some(&workflow_store.effective().config)
+        );
+        assert_eq!(
+            workflow_store.effective().config.tracker.label.as_deref(),
+            Some("runtime-owned-v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_reload_refetches_tracker_metadata_when_cache_key_changes() {
+        let counts = Arc::new(TodoistTickCounts::default());
+        let server = spawn_counting_todoist_tick_server(counts.clone()).await;
+        let dir = tempdir().expect("tempdir");
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        write_todoist_workflow_with_base_url_label_and_api_key(
+            &workflow_path,
+            dir.path(),
+            &server.base_url,
+            "runtime-owned",
+            "token-a",
+        );
+        let workflow_store = WorkflowStore::new(workflow_path.clone()).expect("workflow store");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (updates_tx, _updates_rx) = watch::channel(0u64);
+        let mut state = State::default();
+        let mut version = 0u64;
+
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+
+        write_todoist_workflow_with_base_url_label_and_api_key(
+            &workflow_path,
+            dir.path(),
+            &server.base_url,
+            "runtime-owned",
+            "token-b",
+        );
+        workflow_store.reload();
+
+        super::run_tick(&workflow_store, &tx, &mut state, &updates_tx, &mut version).await;
+
+        assert_eq!(counts.project.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            state.validated_startup_config.as_ref(),
+            Some(&workflow_store.effective().config)
+        );
+        assert_eq!(
+            workflow_store.effective().config.tracker.label.as_deref(),
+            Some("runtime-owned")
+        );
     }
 
     struct StaticTracker {
@@ -2969,6 +3791,57 @@ test
         .expect("write workflow");
         let persisted = temp_workflow_path(&path);
         WorkflowStore::new(persisted).expect("workflow store")
+    }
+
+    fn todoist_workflow_store_with_base_url(
+        root: &std::path::Path,
+        base_url: &str,
+    ) -> WorkflowStore {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("WORKFLOW.md");
+        write_todoist_workflow_with_base_url_label_and_api_key(
+            &path,
+            root,
+            base_url,
+            "runtime-owned",
+            "token",
+        );
+        let persisted = temp_workflow_path(&path);
+        WorkflowStore::new(persisted).expect("workflow store")
+    }
+
+    fn write_todoist_workflow_with_base_url_label_and_api_key(
+        path: &std::path::Path,
+        root: &std::path::Path,
+        base_url: &str,
+        label: &str,
+        api_key: &str,
+    ) {
+        fs::write(
+            path,
+            format!(
+                r#"---
+tracker:
+  kind: todoist
+  base_url: {base_url}
+  api_key: {api_key}
+  project_id: proj
+  label: {label}
+  active_states:
+    - Todo
+    - In Progress
+  terminal_states:
+    - Done
+workspace:
+  root: {}
+---
+
+test
+"#,
+                root.display()
+            ),
+        )
+        .expect("write workflow");
     }
 
     fn parked_join_handle() -> (JoinHandle<()>, oneshot::Sender<()>) {

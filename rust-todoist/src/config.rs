@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::runtime_env;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub tracker: TrackerConfig,
     pub polling: PollingConfig,
@@ -23,7 +23,7 @@ pub struct ServiceConfig {
     pub server: ServerConfig,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackerConfig {
     pub kind: Option<String>,
     pub base_url: String,
@@ -38,31 +38,31 @@ pub struct TrackerConfig {
     pub terminal_states_explicit: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PollingConfig {
     pub interval_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     pub terminal_enabled: bool,
     pub refresh_ms: u64,
     pub render_interval_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub root_raw: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkerConfig {
     pub ssh_hosts: Vec<String>,
     pub max_concurrent_agents_per_host: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HookConfig {
     pub after_create: Option<String>,
     pub before_run: Option<String>,
@@ -71,7 +71,7 @@ pub struct HookConfig {
     pub timeout_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub max_concurrent_agents: usize,
     pub max_turns: usize,
@@ -79,7 +79,7 @@ pub struct AgentConfig {
     pub max_concurrent_agents_by_state: BTreeMap<String, usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CodexConfig {
     pub command: String,
     pub approval_policy: Value,
@@ -90,7 +90,7 @@ pub struct CodexConfig {
     pub stall_timeout_ms: i64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: Option<String>,
     pub port: Option<u16>,

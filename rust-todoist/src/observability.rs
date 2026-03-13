@@ -3253,6 +3253,8 @@ mod tests {
             retry: None,
             recent_events: Vec::new(),
             last_error: None,
+            last_error_stage: None,
+            last_error_kind: None,
         });
 
         assert_eq!(payload.tracked["title"], "Ship Todoist-native dashboard");
@@ -3936,6 +3938,8 @@ mod tests {
                 worker_host: Some("ssh-b".to_string()),
                 workspace_location: Some("/srv/symphony/ABC-456".to_string()),
                 error: Some("boom".to_string()),
+                error_stage: None,
+                error_kind: None,
             }],
             codex_totals: CodexTotalsPayload {
                 input_tokens: 11,

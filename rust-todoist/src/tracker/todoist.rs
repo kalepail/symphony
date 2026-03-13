@@ -460,6 +460,39 @@ fn todoist_rate_state(config: &ServiceConfig) -> Arc<Mutex<TodoistRateState>> {
         .clone()
 }
 
+fn todoist_metadata_cache_registry()
+-> &'static Mutex<HashMap<String, Arc<Mutex<TodoistMetadataCache>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<TodoistMetadataCache>>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn todoist_metadata_cache(config: &ServiceConfig) -> Arc<Mutex<TodoistMetadataCache>> {
+    let key = format!(
+        "{}::{}::{}::{}",
+        config.tracker.base_url.trim_end_matches('/'),
+        config.tracker.api_key.as_deref().unwrap_or_default().trim(),
+        config
+            .tracker
+            .project_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim(),
+        config
+            .tracker
+            .assignee
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+    );
+    let registry = todoist_metadata_cache_registry();
+    let mut registry = registry.lock().expect("todoist metadata registry poisoned");
+    registry
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(TodoistMetadataCache::default())))
+        .clone()
+}
+
 fn seconds_until(now: DateTime<Utc>, target: DateTime<Utc>) -> Option<u64> {
     let millis = target.signed_duration_since(now).num_milliseconds();
     (millis > 0).then(|| ((millis + 999) / 1_000) as u64)
@@ -515,11 +548,12 @@ impl TodoistTracker {
             .build()
             .expect("reqwest client");
         let rate_state = todoist_rate_state(&config);
+        let metadata_cache = todoist_metadata_cache(&config);
         Self {
             client,
             config,
             rate_state,
-            metadata_cache: Arc::new(Mutex::new(TodoistMetadataCache::default())),
+            metadata_cache,
         }
     }
 
@@ -3465,6 +3499,54 @@ mod tests {
         assert_eq!(counts.collaborators.load(Ordering::SeqCst), 1);
         assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
         assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.current_user.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_is_shared_across_tracker_instances() {
+        let counts = Arc::new(MetadataRequestCounts::default());
+        let server = spawn_counting_mock_todoist(CountingMockTodoistState {
+            inner: MockTodoistState {
+                project: json!({
+                    "id": "proj",
+                    "is_shared": true,
+                    "can_assign_tasks": true
+                }),
+                sections: vec![
+                    json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                    json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+                ],
+                collaborators: vec![json!({"id": "user-1", "project_id": "proj"})],
+                current_user: json!({"id": "user-1"}),
+                plan_limits: json!({"comments": true}),
+            },
+            tasks: vec![json!({
+                "id": "task-1",
+                "content": "Ship cache",
+                "project_id": "proj",
+                "section_id": "sec-todo",
+                "assignee_id": "user-1"
+            })],
+            counts: counts.clone(),
+        })
+        .await;
+
+        let config = tracker_config(&server.base_url, Some("user-1"));
+        let tracker = TodoistTracker::new(config.clone());
+        tracker.validate_startup().await.expect("startup valid");
+
+        let sibling = TodoistTracker::new(config);
+        let issues = sibling
+            .fetch_candidate_issues()
+            .await
+            .expect("candidate fetch on sibling tracker");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(counts.project.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.collaborators.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.plan_limits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 1);
         assert_eq!(counts.current_user.load(Ordering::SeqCst), 0);
     }
 
