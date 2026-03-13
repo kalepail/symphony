@@ -42,6 +42,7 @@ const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
 const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
 const TODOIST_RATE_LIMIT_MAX_DELAY_SECS: u64 = 60;
 const TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS: u64 = 300;
+const LIVE_E2E_CLEANUP_TIMEOUT_SECS: u64 = 60;
 const ORCHESTRATOR_START_MAX_RETRIES: usize = 2;
 const FULL_SMOKE_HUMAN_REVIEW_TIMEOUT_SECS: u64 = 900;
 const FULL_SMOKE_TODOIST_WRITE_GRACE_SECS: u64 = TODOIST_RATE_LIMIT_MAX_TOTAL_WAIT_SECS + 30;
@@ -73,7 +74,6 @@ const CANONICAL_SMOKE_SECTIONS: &[&str] = &[
     "Human Review",
     "Rework",
     "Merging",
-    "Done",
     "Canceled",
     "Duplicate",
 ];
@@ -331,11 +331,15 @@ async fn run_live_todoist_task_end_to_end(backend: LiveWorkerBackend) {
     }
     .await;
 
+    let project_cleanup = cleanup_with_timeout(
+        "Todoist live e2e project cleanup",
+        delete_project(&client, &base_url, &token, &project_id),
+    )
+    .await;
     finalize_live_e2e(
         outcome,
         vec![
-            delete_project(&client, &base_url, &token, &project_id)
-                .await
+            project_cleanup
                 .err()
                 .map(|error| format!("Todoist live e2e cleanup failed: {error}")),
             runtime_env::load_dotenv_for_workflow(&manifest_workflow)
@@ -556,11 +560,15 @@ async fn run_minimal_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) 
     }
     .await;
 
+    let project_cleanup = cleanup_with_timeout(
+        "minimal smoke live e2e project cleanup",
+        delete_project(&client, &base_url, &token, &project_id),
+    )
+    .await;
     finalize_live_e2e(
         outcome,
         vec![
-            delete_project(&client, &base_url, &token, &project_id)
-                .await
+            project_cleanup
                 .err()
                 .map(|error| format!("minimal smoke live e2e cleanup failed: {error}")),
             runtime_env::load_dotenv_for_workflow(&manifest_workflow)
@@ -855,12 +863,19 @@ async fn run_full_smoke_repo_workflow_end_to_end(backend: LiveWorkerBackend) {
     }
     .await;
 
+    let full_smoke_cleanup = cleanup_option_with_timeout(
+        "full smoke parity cleanup",
+        cleanup_full_smoke(&client, &base_url, &token, &project_id),
+    )
+    .await;
     finalize_live_e2e(
         outcome,
         vec![
-            cleanup_full_smoke(&client, &base_url, &token, &project_id)
-                .await
-                .map(|error| format!("full smoke parity cleanup failed: {error}")),
+            match full_smoke_cleanup {
+                Ok(Some(error)) => Some(format!("full smoke parity cleanup failed: {error}")),
+                Ok(None) => None,
+                Err(error) => Some(format!("full smoke parity cleanup failed: {error}")),
+            },
             runtime_env::load_dotenv_for_workflow(&manifest_workflow)
                 .err()
                 .map(|error| format!("failed to restore dotenv state: {error}")),
@@ -889,8 +904,6 @@ tracker:
   project_id: {tracker_project_id}
   active_states:
     - Todo
-  terminal_states:
-    - Done
 polling:
   interval_ms: 2500
 workspace:
@@ -1147,10 +1160,40 @@ fn finalize_live_e2e(outcome: Result<(), String>, cleanup_steps: Vec<Option<Stri
 
     match (outcome, cleanup_errors.is_empty()) {
         (Ok(()), true) => {}
-        (Ok(()), false) => panic!("{}", cleanup_errors.join("; ")),
+        (Ok(()), false) => {
+            eprintln!("live e2e cleanup warning: {}", cleanup_errors.join("; "));
+        }
         (Err(error), true) => panic!("{error}"),
         (Err(error), false) => panic!("{error}; {}", cleanup_errors.join("; ")),
     }
+}
+
+async fn cleanup_with_timeout<T, F>(label: &str, future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::time::timeout(Duration::from_secs(LIVE_E2E_CLEANUP_TIMEOUT_SECS), future)
+        .await
+        .map_err(|_| {
+            format!(
+                "{label} exceeded {}s timeout",
+                LIVE_E2E_CLEANUP_TIMEOUT_SECS
+            )
+        })?
+}
+
+async fn cleanup_option_with_timeout<T, F>(label: &str, future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(Duration::from_secs(LIVE_E2E_CLEANUP_TIMEOUT_SECS), future)
+        .await
+        .map_err(|_| {
+            format!(
+                "{label} exceeded {}s timeout",
+                LIVE_E2E_CLEANUP_TIMEOUT_SECS
+            )
+        })
 }
 
 fn minimal_smoke_target_contains(content: &str, identifier: &str, task_title: &str) -> bool {

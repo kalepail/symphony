@@ -180,12 +180,21 @@ impl ServiceConfig {
     }
 
     pub fn terminal_state_set(&self) -> BTreeSet<String> {
-        self.tracker
+        let mut states: BTreeSet<String> = self
+            .tracker
             .terminal_states
             .iter()
             .map(|value| normalize_state_key(value))
             .filter(|value| !value.is_empty())
-            .collect()
+            .collect();
+
+        // Todoist completion is always normalized to `Done` after `close_task`, even when the
+        // workflow does not expose a `Done` board column.
+        if matches!(self.tracker.kind.as_deref(), Some("todoist" | "memory")) {
+            states.insert("done".to_string());
+        }
+
+        states
     }
 
     pub fn max_concurrent_agents_for_state(&self, state: &str) -> usize {
@@ -245,7 +254,7 @@ fn parse_tracker_config(value: Option<&Value>) -> Result<TrackerConfig, ConfigEr
         terminal_states: parse_string_list(
             map.get("terminal_states"),
             "tracker.terminal_states",
-            &["Cancelled", "Canceled", "Duplicate", "Done"],
+            &["Cancelled", "Canceled", "Duplicate"],
         )?,
         terminal_states_explicit: map.contains_key("terminal_states"),
     })
@@ -692,6 +701,11 @@ mod tests {
 
         assert_eq!(config.polling.interval_ms, 30_000);
         assert_eq!(config.tracker.label.as_deref(), Some("symphony-full-smoke"));
+        assert_eq!(
+            config.tracker.terminal_states,
+            vec!["Cancelled", "Canceled", "Duplicate"]
+        );
+        assert!(config.terminal_state_set().contains("done"));
         assert_eq!(config.max_concurrent_agents_for_state("in progress"), 2);
         assert_eq!(config.max_concurrent_agents_for_state("review"), 3);
         assert_eq!(config.worker.ssh_hosts, vec!["builder-1", "builder-2"]);

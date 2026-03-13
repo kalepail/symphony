@@ -1320,18 +1320,16 @@ fn failure_payload(body: Value) -> Value {
 }
 
 fn github_api_available() -> bool {
-    github_token_from_env().is_some() || gh_cli_available()
+    github_token_from_env().is_some() || gh_auth_available()
 }
 
-fn gh_cli_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        StdCommand::new("gh")
-            .arg("--version")
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    })
+fn gh_auth_available() -> bool {
+    match StdCommand::new("gh").args(["auth", "token"]).output() {
+        Ok(output) if output.status.success() => {
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn github_api_base_url() -> String {
@@ -1785,8 +1783,8 @@ mod tests {
     };
 
     use super::{
-        TODOIST_TOOL, compact_workpad_content, execute, extract_github_pr_url, tool_specs,
-        tool_specs_with_tracker,
+        GITHUB_API_TOOL, TODOIST_TOOL, compact_workpad_content, execute, extract_github_pr_url,
+        tool_specs, tool_specs_with_tracker,
     };
 
     #[derive(Clone, Default)]
@@ -2232,6 +2230,51 @@ mod tests {
         assert!(description.contains("get_workpad"));
         assert!(!description.contains("create_reminder"));
         assert!(!description.contains("list_activities"));
+    }
+
+    #[test]
+    fn tool_specs_hide_github_api_when_gh_is_installed_but_unauthenticated() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempdir().expect("tempdir");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let gh_path = bin_dir.join("gh");
+        fs::write(
+            &gh_path,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ]; then\n  printf 'not logged in\\n' >&2\n  exit 1\nfi\nif [ \"$1\" = \"--version\" ]; then\n  printf 'gh version test\\n'\n  exit 0\nfi\nprintf 'unsupported gh call\\n' >&2\nexit 1\n",
+        )
+        .expect("fake gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&gh_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&gh_path, permissions).expect("chmod");
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        let original_gh_token = env::var("GH_TOKEN").ok();
+        let original_github_token = env::var("GITHUB_TOKEN").ok();
+        set_env_var("PATH", &format!("{}:{}", bin_dir.display(), original_path));
+        remove_env_var("GH_TOKEN");
+        remove_env_var("GITHUB_TOKEN");
+
+        let specs = tool_specs(&test_config());
+
+        set_env_var("PATH", &original_path);
+        match original_gh_token {
+            Some(value) => set_env_var("GH_TOKEN", &value),
+            None => remove_env_var("GH_TOKEN"),
+        }
+        match original_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", &value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+
+        assert!(specs.iter().all(|spec| spec["name"] != GITHUB_API_TOOL));
     }
 
     #[tokio::test]

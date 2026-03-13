@@ -143,4 +143,29 @@ Deadline: {% if issue.deadline is defined and issue.deadline %}{{ issue.deadline
         assert!(prompt.contains("Due: none"));
         assert!(prompt.contains("Deadline: none"));
     }
+
+    #[test]
+    fn renders_preloaded_todoist_comments_when_present() {
+        let workflow = WorkflowDefinition {
+            config: json!({}).as_object().expect("object").clone(),
+            prompt_template:
+                "{% for comment in issue.todoist_comments %}{{ comment.author_id }}={{ comment.content }}\n{% endfor %}".to_string(),
+        };
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Title".to_string(),
+            state: "Rework".to_string(),
+            todoist_comments: vec![crate::issue::IssueComment {
+                id: "comment-1".to_string(),
+                author_id: Some("user-1".to_string()),
+                content: "Please keep the original diff and add docs.".to_string(),
+                ..crate::issue::IssueComment::default()
+            }],
+            ..Issue::default()
+        };
+
+        let prompt = build_issue_prompt(&workflow, &issue, None).expect("render prompt");
+        assert!(prompt.contains("user-1=Please keep the original diff and add docs."));
+    }
 }

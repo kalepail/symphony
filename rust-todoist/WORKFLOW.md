@@ -15,10 +15,11 @@ tracker:
     - In Progress
     - Merging
     - Rework
+  # Open-task terminal buckets only. Todoist completion is still normalized to `Done` after
+  # `close_task`, but there is no `Done` section on the board.
   terminal_states:
     - Canceled
     - Duplicate
-    - Done
 polling:
   interval_ms: 5000
 workspace:
@@ -81,6 +82,20 @@ Description:
 No description provided.
 {% endif %}
 
+Todoist review comments:
+{% if issue.todoist_comments is defined and issue.todoist_comments %}
+{% for comment in issue.todoist_comments %}
+- {% if comment.posted_at %}[{{ comment.posted_at }}] {% endif %}{% if comment.author_id %}{{ comment.author_id }}{% else %}unknown author{% endif %}
+  {{ comment.content }}
+  {% if comment.attachment_name or comment.attachment_url %}Attachment: {% if comment.attachment_name %}{{ comment.attachment_name }}{% else %}resource{% endif %}{% if comment.attachment_url %} ({{ comment.attachment_url }}){% endif %}{% endif %}
+{% endfor %}
+{% if issue.todoist_comments_truncated is defined and issue.todoist_comments_truncated %}
+Some older or oversized Todoist comments were compacted before prompt rendering. Use `todoist.list_comments` if full history is needed.
+{% endif %}
+{% else %}
+No Todoist task comments provided.
+{% endif %}
+
 Instructions:
 
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
@@ -91,7 +106,7 @@ Work only in the provided repository copy. Do not touch any other path.
 
 ## Critical completion rule
 
-- Do not call `close_task` or move the task to `Done` directly from `Todo`, `In Progress`, `Human Review`, or `Rework`.
+- Do not complete the task directly from `Todo`, `In Progress`, `Human Review`, or `Rework`.
 - Task completion is allowed only after the task has reached `Merging` and the associated PR merge has actually completed.
 - If publish, review, or merge work is incomplete, keep the task active and record status in the workpad instead of closing it.
 
@@ -161,7 +176,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
-- `Done` -> terminal state; no further action required.
+- `Done` (implicit after `close_task`) -> terminal completed state; no further action required.
 
 ## Step 0: Determine current task state and route
 
@@ -336,8 +351,11 @@ Do not run this step while the task is in `Merging`.
 4. If approved, human moves the task to `Merging`.
 5. When the task is in `Merging`, use this fast path:
    - identify the single surviving PR from the current workpad, branch, or task-linked metadata without doing a full execution bootstrap.
-   - confirm the PR is still open, checks are green, and there are no unresolved actionable human or bot comments.
-   - if any of those checks fail, record only the minimum blocker evidence needed in the workpad and keep the task active.
+   - refresh non-workpad Todoist task comments with `{"action":"list_comments","task_id":"<task-id>"}` instead of relying only on the initial prompt snapshot.
+   - treat actionable non-workpad Todoist task comments the same way as actionable non-bot GitHub feedback during merge preflight.
+   - confirm the PR is still open, checks are green, and there are no unresolved actionable human comments from Todoist or GitHub. Bot comments may provide helpful merge-time signal, but they are advisory unless a human comment or explicit workflow instruction says otherwise.
+   - if fresh human review feedback appears and code or docs must change, move the task to `Rework` instead of merging.
+   - if merge readiness is blocked for another reason, record only the minimum blocker evidence needed in the workpad and keep the task active.
 6. Once the surviving PR is confirmed merge-ready, run the `land` skill in a loop until the PR is merged. If the checkout does not contain the skill file, use the runtime-provided `land` skill guidance instead of a repo-local path. Do not call `gh pr merge` directly.
 7. After merge is complete, do at most one final workpad refresh if the merged PR URL or blocker resolution evidence is missing, then immediately call `{"action":"close_task","task_id":"<task-id>"}` for the current task while it is still in `Merging`.
    - If the pre-merge workpad already linked the surviving PR and the merge outcome is otherwise clear from the current turn, do not block completion on a cosmetic post-merge workpad rewrite.
@@ -347,7 +365,7 @@ Do not run this step while the task is in `Merging`.
 ## Step 4: Rework handling
 
 1. Treat `Rework` as a planning reset, not a license to discard already-accepted implementation.
-2. Re-read the full task description, all non-workpad Todoist task comments, the latest surviving PR diff, and all GitHub human comments; explicitly identify what will be done differently this attempt.
+2. Re-read the full task description, refresh all non-workpad Todoist task comments with `{"action":"list_comments","task_id":"<task-id>"}`, review the latest surviving PR diff, and gather all GitHub human comments; treat the Todoist comments as the same class of human review input as non-bot GitHub feedback, then explicitly identify what will be done differently this attempt.
 3. Close only PRs that are truly superseded by the new rerun attempt.
    - At most one PR may survive a rerun handoff.
    - Preserve the newest valid open PR once it has the intended diff, passing checks, and no actionable feedback.
@@ -395,7 +413,7 @@ Do not run this step while the task is in `Merging`.
 - Todoist has no native `related` or `blockedBy` graph in v1, so record dependency notes in the task description instead of inventing structured relation fields.
 - Do not move to `Human Review` unless the `Completion bar before review handoff` is satisfied.
 - In `Human Review`, do not make changes. A human must move the task to `Rework` or `Merging` before Symphony runs again.
-- If state is terminal (`Done`), do nothing and shut down.
+- If state is terminal (including implicit completed state `Done`), do nothing and shut down.
 - Keep task text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.
 

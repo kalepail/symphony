@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     config::ServiceConfig,
-    issue::{Issue, normalize_state_name},
+    issue::{Issue, normalize_state_name, todoist_review_comments_from_values},
     tracker::{
         TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
         TrackerRateBudget,
@@ -204,6 +204,22 @@ impl MemoryTracker {
                 issue.assigned_to_worker = assignee_filter
                     .as_ref()
                     .is_none_or(|filter| issue.assignee_id.as_deref() == Some(filter.as_str()));
+                let comments = state
+                    .comments
+                    .iter()
+                    .filter(|comment| {
+                        comment
+                            .get("item_id")
+                            .and_then(json_id_from_value)
+                            .as_deref()
+                            == Some(issue.id.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (todoist_comments, todoist_comments_truncated) =
+                    todoist_review_comments_from_values(&comments);
+                issue.todoist_comments = todoist_comments;
+                issue.todoist_comments_truncated = todoist_comments_truncated;
                 issue
             })
             .collect())
@@ -2191,6 +2207,59 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].id, "1");
         assert_eq!(issues[0].labels, vec!["backend"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_by_ids_preloads_non_workpad_todoist_comments() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r###"{
+  "tasks": [
+    {"id":"task-1","content":"Parent","project_id":"proj","section_id":"sec-review","labels":[]}
+  ],
+  "sections": [
+    {"id":"sec-review","project_id":"proj","name":"Rework"}
+  ],
+  "comments": [
+    {"id":"comment-human","item_id":"task-1","posted_uid":"user-1","content":"Please keep the original diff and attach the benchmark.","file_attachment":{"file_name":"bench.txt","file_url":"https://files.example/bench.txt"}},
+    {"id":"comment-workpad","item_id":"task-1","content":"## Codex Workpad\n\n<!-- symphony:workpad -->\n\nPlan"}
+  ],
+  "user_plan_limits": {"comments": true}
+}"###,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let issues = tracker
+            .fetch_issue_states_by_ids(&["task-1".to_string()])
+            .await
+            .expect("issues");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].todoist_comments.len(), 1);
+        assert_eq!(
+            issues[0].todoist_comments[0].content,
+            "Please keep the original diff and attach the benchmark."
+        );
+        assert_eq!(
+            issues[0].todoist_comments[0].attachment_name.as_deref(),
+            Some("bench.txt")
+        );
     }
 
     #[tokio::test]

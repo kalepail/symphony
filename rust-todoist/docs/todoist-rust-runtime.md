@@ -174,7 +174,6 @@ tracker:
   terminal_states:
     - Canceled
     - Duplicate
-    - Done
 worker:
   ssh_hosts:
     - builder-a
@@ -185,7 +184,7 @@ worker:
 ### State Model
 
 - active workflow states -> Todoist section names
-- `Done` -> close task
+- `Done` -> implicit completed-task state after `close_task`
 - `Canceled` / `Duplicate` -> explicit open-task sections
 - orchestrator dispatch targets top-level tasks by default, not subtasks
 - non-`Done` terminal sections are only required at startup when the workflow explicitly configures

@@ -10,10 +10,11 @@ tracker:
     - In Progress
     - Merging
     - Rework
+  # Open-task terminal buckets only. Todoist completion is still normalized to `Done` after
+  # `close_task`, but there is no `Done` section on the board.
   terminal_states:
     - Canceled
     - Duplicate
-    - Done
 polling:
   interval_ms: 5000
 workspace:
@@ -67,6 +68,19 @@ Description:
 No description provided.
 {% endif %}
 
+Todoist review comments:
+{% if issue.todoist_comments is defined and issue.todoist_comments %}
+{% for comment in issue.todoist_comments %}
+- {% if comment.posted_at %}[{{ comment.posted_at }}] {% endif %}{% if comment.author_id %}{{ comment.author_id }}{% else %}unknown author{% endif %}: {{ comment.content }}
+  {% if comment.attachment_name or comment.attachment_url %}Attachment: {% if comment.attachment_name %}{{ comment.attachment_name }}{% else %}resource{% endif %}{% if comment.attachment_url %} ({{ comment.attachment_url }}){% endif %}{% endif %}
+{% endfor %}
+{% if issue.todoist_comments_truncated is defined and issue.todoist_comments_truncated %}
+Some older or oversized Todoist comments were compacted before prompt rendering. Use `todoist.list_comments` if full history is needed.
+{% endif %}
+{% else %}
+No Todoist task comments provided.
+{% endif %}
+
 Instructions:
 
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
@@ -83,7 +97,7 @@ Work only in the provided repository copy. Do not touch any other path.
 
 ## Critical completion rule
 
-- Do not call `close_task` or move the task to `Done` directly from `Todo`, `In Progress`, `Human Review`, or `Rework`.
+- Do not complete the task directly from `Todo`, `In Progress`, `Human Review`, or `Rework`.
 - Task completion is allowed only after the task has reached `Merging` and the associated PR merge has actually completed.
 - If publish, review, or merge work is incomplete, keep the task active and record status in the workpad instead of closing it.
 
@@ -141,7 +155,7 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
-- `Done` -> terminal state; no further action required.
+- `Done` (implicit after `close_task`) -> terminal completed state; no further action required.
 
 ## Step 0: Determine current task state and route
 
@@ -177,12 +191,14 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 1. In `Human Review`, do not code or change task content.
 2. If review feedback appears in Todoist task comments or GitHub review, move the task to `Rework`.
 3. If approved, a human moves the task to `Merging`.
-4. In `Merging`, run the `land` flow, verify the PR merged, then call guarded `close_task`.
+4. In `Merging`, refresh non-workpad Todoist task comments with `{"action":"list_comments","task_id":"<task-id>"}` and treat actionable human Todoist comments the same way as actionable non-bot GitHub review feedback.
+5. If fresh human review feedback appears, move the task to `Rework` instead of merging.
+6. Otherwise run the `land` flow, verify the PR merged, then call guarded `close_task`.
 
 ## Step 3: Rework handling
 
 1. Treat `Rework` as a planning reset, not a fresh start from scratch.
-2. Re-read the task, all non-workpad Todoist task comments, the workpad, and all PR feedback.
+2. Re-read the task, refresh all non-workpad Todoist task comments with `{"action":"list_comments","task_id":"<task-id>"}`, re-read the workpad, and gather all PR feedback. Treat Todoist comments as the same class of human review input as non-bot GitHub feedback.
 3. Update the existing branch and PR unless there is a strong reason to replace them.
 4. Refresh the workpad with the new plan, validation, and reviewer feedback checklist.
 5. Revalidate, republish, and return the task to `Human Review`.

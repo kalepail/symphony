@@ -535,8 +535,7 @@ mod tests {
   "tasks": [],
   "sections": [
     {"id":"sec-todo","project_id":"proj","name":"Todo"},
-    {"id":"sec-in-progress","project_id":"proj","name":"In Progress"},
-    {"id":"sec-done","project_id":"proj","name":"Done"}
+    {"id":"sec-in-progress","project_id":"proj","name":"In Progress"}
   ],
   "user_plan_limits": {"comments": true}
 }"#,
@@ -554,8 +553,6 @@ tracker:
   active_states:
     - Todo
     - In Progress
-  terminal_states:
-    - Done
 workspace:
   root: /tmp/symphony-http-tests
 ---

@@ -682,7 +682,7 @@ mod tests {
                     "label": "symphony-live",
                     "assignee": "user-1",
                     "active_states": ["Todo", "In Progress"],
-                    "terminal_states": ["Done", "Canceled"]
+                    "terminal_states": ["Canceled"]
                 },
                 "polling": {
                     "interval_ms": 15000
@@ -715,7 +715,7 @@ mod tests {
         assert!(summary.contains("tracker_project_id=proj-1"));
         assert!(summary.contains("tracker_label=symphony-live"));
         assert!(summary.contains("active_states=Todo|In Progress"));
-        assert!(summary.contains("terminal_states=Done|Canceled"));
+        assert!(summary.contains("terminal_states=Canceled"));
         assert!(summary.contains("worker_hosts=worker-a|worker-b"));
         assert!(summary.contains("port=3000"));
     }

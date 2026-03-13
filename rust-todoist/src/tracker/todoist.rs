@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     config::ServiceConfig,
-    issue::{Issue, normalize_state_name},
+    issue::{Issue, normalize_state_name, todoist_review_comments_from_values},
     tracker::{
         TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
         TrackerRateBudget,
@@ -893,6 +893,50 @@ impl TodoistTracker {
             .await
     }
 
+    async fn fetch_all_task_comments(&self, task_id: &str) -> Result<Vec<Value>, TrackerError> {
+        let mut comments = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut query = vec![
+                ("task_id".to_string(), task_id.to_string()),
+                ("limit".to_string(), MAX_PAGE_SIZE.to_string()),
+            ];
+            if let Some(cursor_value) = cursor.as_deref() {
+                query.push(("cursor".to_string(), cursor_value.to_string()));
+            }
+
+            let page = self.get_comments_page(&query).await?;
+            let page_results = page
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or(TrackerError::TodoistUnknownPayload)?;
+            comments.extend(page_results);
+
+            cursor = page
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(comments)
+    }
+
+    async fn hydrate_issue_comments(&self, issue: &mut Issue) -> Result<(), TrackerError> {
+        let comments = self.fetch_all_task_comments(&issue.id).await?;
+        let (todoist_comments, todoist_comments_truncated) =
+            todoist_review_comments_from_values(&comments);
+        issue.todoist_comments = todoist_comments;
+        issue.todoist_comments_truncated = todoist_comments_truncated;
+        Ok(())
+    }
+
     async fn get_collaborators_page(
         &self,
         project_id: &str,
@@ -1585,15 +1629,19 @@ impl TrackerClient for TodoistTracker {
                 .cloned()
                 .collect()
         };
+        let hydrate_comments = unique_ids.len() == 1;
 
         let mut by_id = HashMap::new();
         for (task_id, task) in self.fetch_tasks_by_ids(&unique_ids).await? {
-            if let Some(issue) = normalize_task(
+            if let Some(mut issue) = normalize_task(
                 &task,
                 &sections_by_id,
                 assignee_filter.as_ref(),
                 completed_state.as_str(),
             ) {
+                if hydrate_comments {
+                    self.hydrate_issue_comments(&mut issue).await?;
+                }
                 by_id.insert(task_id, issue);
             }
         }
@@ -2158,6 +2206,8 @@ pub(crate) fn normalize_task(
         deadline: task.get("deadline").cloned(),
         assignee_id,
         assigned_to_worker,
+        todoist_comments: Vec::new(),
+        todoist_comments_truncated: false,
     })
 }
 

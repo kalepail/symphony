@@ -22,6 +22,7 @@ This document defines the live smoke matrix for the Rust runtime against the ded
 - If `tracker.assignee` will be set, a Todoist project that supports assignment and exposes the intended assignee as a collaborator
 - GitHub CLI authenticated with `repo` scope and `gh auth setup-git` already applied on the host
 - For the direct GitHub REST fallback, either `GH_TOKEN` / `GITHUB_TOKEN` is exported or `gh auth token` succeeds on the host
+- Prefer `gh auth login` or a classic PAT with `repo` scope over a fine-grained PAT. Symphony publish/merge flows read check runs and mutate PR metadata, and smoke helpers also update repository contents and refs.
 - File logs are written to `log/symphony.log` or the chosen `--logs-root`; Symphony lifecycle lines stay visible there even if the shell exports `RUST_LOG=warn`
 
 `SYMPHONY_SMOKE_PROJECT_ID` should point at a dedicated Todoist project reserved for Symphony smoke runs.
@@ -34,7 +35,11 @@ Todoist comments must be available on the connected account or plan because the 
 For exact parity with the original Elixir workflow and [SPEC.md](../SPEC.md), the dedicated smoke Todoist setup now uses this section organization:
 
 - Visible columns: `Backlog`, `Todo`, `In Progress`, `Human Review`
-- Hidden columns: `Rework`, `Merging`, `Done`, `Canceled`, `Duplicate`
+- Hidden columns: `Rework`, `Merging`, `Canceled`, `Duplicate`
+
+There is no `Done` section in the canonical Todoist board. A completed task disappears from the
+active board and remains associated with the section it was completed from when operators choose to
+show completed tasks.
 
 Smoke parity runs and production workflows should use the canonical names above directly.
 `Human Review` is a human handoff column, not an active dispatch state. Symphony resumes only after a human moves the task to `Rework` or `Merging`.

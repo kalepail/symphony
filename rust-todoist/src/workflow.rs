@@ -375,6 +375,7 @@ mod tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for relative_path in [
             "WORKFLOW.md",
+            "WORKFLOW.live.md",
             "WORKFLOW.smoke.full.md",
             "WORKFLOW.smoke.minimal.md",
         ] {
@@ -403,10 +404,12 @@ mod tests {
             env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
             env::set_var("SYMPHONY_TODOIST_PROJECT_ID", "todoist-proj");
             env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
+            env::set_var("SYMPHONY_LIVE_PROJECT_ID", "live-proj");
         }
 
         for relative_path in [
             "WORKFLOW.md",
+            "WORKFLOW.live.md",
             "WORKFLOW.smoke.full.md",
             "WORKFLOW.smoke.minimal.md",
         ] {
@@ -430,6 +433,55 @@ mod tests {
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
             env::remove_var("SYMPHONY_TODOIST_PROJECT_ID");
             env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
+            env::remove_var("SYMPHONY_LIVE_PROJECT_ID");
+        }
+    }
+
+    #[test]
+    fn bundled_todoist_workflows_do_not_expose_done_as_board_terminal_state() {
+        let _guard = crate::runtime_env::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let workspace_root = tempdir().expect("tempdir");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        unsafe {
+            env::set_var("TODOIST_API_TOKEN", "token");
+            env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
+            env::set_var("SYMPHONY_TODOIST_PROJECT_ID", "todoist-proj");
+            env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
+            env::set_var("SYMPHONY_LIVE_PROJECT_ID", "live-proj");
+        }
+
+        for relative_path in ["WORKFLOW.md", "WORKFLOW.live.md", "WORKFLOW.smoke.full.md"] {
+            let workflow_path = manifest_dir.join(relative_path);
+            let loaded = super::WorkflowStore::load_path(&workflow_path).unwrap_or_else(|error| {
+                panic!("failed to load {}: {error}", workflow_path.display())
+            });
+
+            assert!(
+                !loaded
+                    .config
+                    .tracker
+                    .terminal_states
+                    .iter()
+                    .any(|state| state.eq_ignore_ascii_case("done")),
+                "workflow {} should not configure `Done` as an explicit Todoist board terminal state",
+                workflow_path.display()
+            );
+            assert!(
+                loaded.config.terminal_state_set().contains("done"),
+                "workflow {} should still treat completed Todoist tasks as terminal",
+                workflow_path.display()
+            );
+        }
+
+        unsafe {
+            env::remove_var("TODOIST_API_TOKEN");
+            env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+            env::remove_var("SYMPHONY_TODOIST_PROJECT_ID");
+            env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
+            env::remove_var("SYMPHONY_LIVE_PROJECT_ID");
         }
     }
 }

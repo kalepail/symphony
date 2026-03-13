@@ -85,8 +85,7 @@ async fn spawn_todoist_bench_server(tasks: BenchTaskSet) -> TodoistBenchServer {
         Json(json!({
             "results": [
                 {"id": "sec-todo", "project_id": "proj", "name": "Todo"},
-                {"id": "sec-progress", "project_id": "proj", "name": "In Progress"},
-                {"id": "sec-done", "project_id": "proj", "name": "Done"}
+                {"id": "sec-progress", "project_id": "proj", "name": "In Progress"}
             ],
             "next_cursor": null
         }))
@@ -153,8 +152,6 @@ tracker:
   active_states:
     - Todo
     - In Progress
-  terminal_states:
-    - Done
 workspace:
   root: {}
 ---

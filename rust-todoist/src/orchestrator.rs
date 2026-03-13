@@ -2335,7 +2335,20 @@ async fn run_worker(
         .await;
 
     let worker_result = async {
-        let mut current_issue = issue.clone();
+        let mut current_issue = tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .await
+            .map_err(|error| {
+                WorkerError::new(
+                    WorkerErrorStage::StateRefresh,
+                    WorkerErrorKind::TrackerFailure,
+                    worker_host.clone(),
+                    error.to_string(),
+                )
+            })?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| issue.clone());
         let max_turns = workflow_store.effective().config.agent.max_turns;
         let terminal_states = workflow_store.effective().config.terminal_state_set();
         let mut guarded_close_observed = false;
@@ -3775,7 +3788,6 @@ tracker:
     - Todo
     - In Progress
   terminal_states:
-    - Done
     - Cancelled
 workspace:
   root: {}
@@ -3830,8 +3842,6 @@ tracker:
   active_states:
     - Todo
     - In Progress
-  terminal_states:
-    - Done
 workspace:
   root: {}
 ---
