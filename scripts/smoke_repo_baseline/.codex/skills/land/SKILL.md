@@ -35,15 +35,20 @@ description:
    the updated branch.
 6. Ensure Codex review comments (if present) are acknowledged and any required
    fixes are handled before merging.
+   - In tracker-backed workflows, refresh human tracker comments before merge
+     preflight and treat actionable human tracker feedback the same way as
+     actionable non-bot GitHub feedback.
+   - This helper only polls GitHub surfaces directly.
 7. Watch checks until complete.
 8. If checks fail, pull logs, fix the issue, commit with the `commit` skill,
    push with the `push` skill, and re-run checks.
 9. When all checks are green and review feedback is addressed, squash-merge and
    delete the branch using the PR title/body for the merge subject/body.
-10. If the session also exposes a guarded Todoist `todoist` tool and the
-    current tracker task is already in `Merging`, do not stop at a merged PR.
-    Re-read the task workpad if needed and call
-    `{"action":"close_task","task_id":"<task-id>"}` before ending the turn.
+10. If the session also exposes a guarded tracker close tool and the current
+    tracker item is already in `Merging`, do not stop at a merged PR.
+    Re-read the task workpad if needed and call the guarded tracker close
+    action (for example `{"action":"close_task","task_id":"<task-id>"}`)
+    before ending the turn.
 11. **Context guard:** Before implementing review feedback, confirm it does not
     conflict with the user’s stated intent or task context. If it conflicts,
     respond inline with a justification and ask the user before changing code.
@@ -166,6 +171,9 @@ Exit codes:
   acknowledged before merge.
 - Human review comments are blocking and must be addressed (responded to and
   resolved) before requesting a new review or merging.
+- Bot review comments are advisory by default. Consider them during merge
+  preflight, but do not block solely on bot feedback unless a human comment or
+  workflow-specific rule promotes that feedback to blocking status.
 - If multiple reviewers comment in the same thread, respond to each comment
   (batching is fine) before closing the thread.
 - Fetch review comments via `gh api` and reply with a prefixed comment.
