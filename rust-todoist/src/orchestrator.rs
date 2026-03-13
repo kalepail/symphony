@@ -1286,7 +1286,7 @@ async fn reconcile_stalled_runs(
     state: &mut State,
 ) {
     let stall_timeout_ms = workflow_store.effective().config.codex.stall_timeout_ms;
-    if stall_timeout_ms <= 0 {
+    if stall_timeout_ms == 0 {
         return;
     }
     let now = Utc::now();
@@ -1295,7 +1295,10 @@ async fn reconcile_stalled_runs(
         .iter()
         .filter_map(|(issue_id, running)| {
             let last_activity = running.last_codex_timestamp.unwrap_or(running.started_at);
-            let elapsed = now.signed_duration_since(last_activity).num_milliseconds();
+            let elapsed = now
+                .signed_duration_since(last_activity)
+                .num_milliseconds()
+                .max(0) as u64;
             if elapsed > stall_timeout_ms {
                 Some(issue_id.clone())
             } else {

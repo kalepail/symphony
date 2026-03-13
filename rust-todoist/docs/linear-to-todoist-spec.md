@@ -527,8 +527,9 @@ Supported tracker kinds in `rust-todoist/`:
 - `tracker.assignee` may also fall back to `TODOIST_ASSIGNEE`
 - for personal projects, the default is to leave `tracker.assignee` unset and treat tasks as unassigned
 - `active_states` and `terminal_states` continue to accept YAML lists or comma-separated strings
-- `observability.terminal_enabled`, `observability.refresh_ms`, and
-  `observability.render_interval_ms` preserve the current Rust defaults and meaning
+- `observability.dashboard_enabled` is the preferred name for the terminal dashboard toggle, with
+  `observability.terminal_enabled` retained as a backward-compatible alias; `observability.refresh_ms`
+  and `observability.render_interval_ms` preserve the current Rust behavior
 - `workspace.root`, hook semantics, approval behavior, and sandbox passthrough preserve the
   current Rust behavior
 

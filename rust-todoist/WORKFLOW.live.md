@@ -30,10 +30,10 @@ hooks:
       sh rust-todoist/scripts/workspace_before_remove.sh --repo kalepail/symphony-smoke-lab
     fi
 agent:
-  max_concurrent_agents: 3
+  max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: ${CODEX_BIN:-codex} --config shell_environment_policy.inherit=core --config model_reasoning_effort=high --model gpt-5.4 app-server
+  command: ${CODEX_BIN:-codex} --config shell_environment_policy.inherit=core --config model_reasoning_effort=medium --model gpt-5.4 app-server
   approval_policy: never
   thread_sandbox: workspace-write
 server:

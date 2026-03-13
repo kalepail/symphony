@@ -96,7 +96,7 @@ pub struct CodexConfig {
     pub turn_sandbox_policy: Value,
     pub turn_timeout_ms: u64,
     pub read_timeout_ms: u64,
-    pub stall_timeout_ms: i64,
+    pub stall_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -281,18 +281,14 @@ fn parse_polling_config(value: Option<&Value>) -> Result<PollingConfig, ConfigEr
 fn parse_observability_config(value: Option<&Value>) -> Result<ObservabilityConfig, ConfigError> {
     let map = as_object(value, "observability")?;
     Ok(ObservabilityConfig {
-        terminal_enabled: parse_bool(
-            map.get("terminal_enabled"),
-            "observability.terminal_enabled",
-        )?
-        .unwrap_or(true),
+        terminal_enabled: parse_observability_enabled(map)?,
         refresh_ms: parse_positive_u64(map.get("refresh_ms"), "observability.refresh_ms")?
             .unwrap_or(1_000),
         render_interval_ms: parse_positive_u64(
             map.get("render_interval_ms"),
             "observability.render_interval_ms",
         )?
-        .unwrap_or(100),
+        .unwrap_or(16),
     })
 }
 
@@ -387,9 +383,24 @@ fn parse_codex_config(
             .unwrap_or(3_600_000),
         read_timeout_ms: parse_positive_u64(map.get("read_timeout_ms"), "codex.read_timeout_ms")?
             .unwrap_or(5_000),
-        stall_timeout_ms: parse_i64(map.get("stall_timeout_ms"), "codex.stall_timeout_ms")?
-            .unwrap_or(300_000),
+        stall_timeout_ms: parse_non_negative_u64(
+            map.get("stall_timeout_ms"),
+            "codex.stall_timeout_ms",
+        )?
+        .unwrap_or(300_000),
     })
+}
+
+fn parse_observability_enabled(map: &Map<String, Value>) -> Result<bool, ConfigError> {
+    if let Some(value) = map.get("dashboard_enabled") {
+        return Ok(parse_bool(Some(value), "observability.dashboard_enabled")?.unwrap_or(true));
+    }
+
+    Ok(parse_bool(
+        map.get("terminal_enabled"),
+        "observability.terminal_enabled",
+    )?
+    .unwrap_or(true))
 }
 
 fn parse_server_config(value: Option<&Value>) -> Result<ServerConfig, ConfigError> {
@@ -544,22 +555,6 @@ fn parse_non_negative_u64(value: Option<&Value>, field: &str) -> Result<Option<u
         _ => Err(ConfigError::Invalid(format!(
             "{field} must be a non-negative integer"
         ))),
-    }
-}
-
-fn parse_i64(value: Option<&Value>, field: &str) -> Result<Option<i64>, ConfigError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(number)) => number
-            .as_i64()
-            .ok_or_else(|| ConfigError::Invalid(format!("{field} must be an integer")))
-            .map(Some),
-        Some(Value::String(text)) => text
-            .trim()
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|_| ConfigError::Invalid(format!("{field} must be an integer"))),
-        _ => Err(ConfigError::Invalid(format!("{field} must be an integer"))),
     }
 }
 
@@ -858,7 +853,7 @@ mod tests {
         assert_eq!(config.codex.stall_timeout_ms, 300_000);
         assert!(config.observability.terminal_enabled);
         assert_eq!(config.observability.refresh_ms, 1_000);
-        assert_eq!(config.observability.render_interval_ms, 100);
+        assert_eq!(config.observability.render_interval_ms, 16);
     }
 
     #[test]
@@ -884,6 +879,51 @@ mod tests {
         assert!(!config.observability.terminal_enabled);
         assert_eq!(config.observability.refresh_ms, 2_500);
         assert_eq!(config.observability.render_interval_ms, 500);
+    }
+
+    #[test]
+    fn accepts_dashboard_enabled_as_observability_alias() {
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "observability": {
+                    "dashboard_enabled": false
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        assert!(!config.observability.terminal_enabled);
+    }
+
+    #[test]
+    fn rejects_negative_stall_timeout() {
+        let error = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj"
+                },
+                "codex": {
+                    "stall_timeout_ms": -1
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid_workflow_config codex.stall_timeout_ms must be a non-negative integer"
+        );
     }
 
     #[test]
