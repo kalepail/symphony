@@ -29,6 +29,7 @@ const MAX_PAGE_SIZE: usize = 200;
 const MAX_ACTIVITY_PAGE_SIZE: usize = 100;
 const DEFAULT_TOOL_PAGE_SIZE: usize = 50;
 const REFRESH_CONCURRENCY: usize = 10;
+const TODOIST_ID_LOOKUP_BATCH_SIZE: usize = 100;
 const TODOIST_RATE_LIMIT_MAX_RETRIES: usize = 4;
 const TODOIST_RATE_LIMIT_DEFAULT_DELAY_SECS: u64 = 2;
 const TODOIST_RATE_LIMIT_MAX_DELAY_SECS: u64 = 60;
@@ -1132,17 +1133,6 @@ impl TodoistTracker {
         Ok(tasks)
     }
 
-    async fn get_task_internal(&self, task_id: &str) -> Result<Option<Value>, TrackerError> {
-        match self
-            .request_json(Method::GET, &format!("/tasks/{task_id}"), None, None)
-            .await
-        {
-            Ok(task) => Ok(Some(task)),
-            Err(TrackerError::TodoistApiStatus { status: 404, .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
     async fn issues_from_tasks(
         &self,
         tasks: Vec<Value>,
@@ -1193,6 +1183,43 @@ impl TodoistTracker {
             .into_iter()
             .find(|(_, name)| normalize_state_name(name) == "todo")
             .map(|(section_id, _)| section_id))
+    }
+
+    async fn fetch_tasks_by_ids(
+        &self,
+        task_ids: &[String],
+    ) -> Result<HashMap<String, Value>, TrackerError> {
+        let batches: Vec<Vec<String>> = task_ids
+            .chunks(TODOIST_ID_LOOKUP_BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let fetched_batches = stream::iter(batches.into_iter())
+            .map(|batch| async move {
+                let page = self
+                    .get_tasks_page(
+                        None,
+                        batch.len().min(MAX_PAGE_SIZE),
+                        &[("ids".to_string(), batch.join(","))],
+                    )
+                    .await?;
+                page.get("results")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .ok_or(TrackerError::TodoistUnknownPayload)
+            })
+            .buffer_unordered(REFRESH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut tasks_by_id = HashMap::new();
+        for batch in fetched_batches {
+            for task in batch? {
+                if let Some(task_id) = json_id(task.get("id")) {
+                    tasks_by_id.insert(task_id, task);
+                }
+            }
+        }
+        Ok(tasks_by_id)
     }
 
     async fn ensure_comments_available(&self) -> Result<(), TrackerError> {
@@ -1525,22 +1552,14 @@ impl TrackerClient for TodoistTracker {
                 .collect()
         };
 
-        let fetched = stream::iter(unique_ids.iter().cloned())
-            .map(|task_id| async move { (task_id.clone(), self.get_task_internal(&task_id).await) })
-            .buffer_unordered(REFRESH_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-
         let mut by_id = HashMap::new();
-        for (task_id, result) in fetched {
-            if let Some(task) = result?
-                && let Some(issue) = normalize_task(
-                    &task,
-                    &sections_by_id,
-                    assignee_filter.as_ref(),
-                    completed_state.as_str(),
-                )
-            {
+        for (task_id, task) in self.fetch_tasks_by_ids(&unique_ids).await? {
+            if let Some(issue) = normalize_task(
+                &task,
+                &sections_by_id,
+                assignee_filter.as_ref(),
+                completed_state.as_str(),
+            ) {
                 by_id.insert(task_id, issue);
             }
         }
@@ -2658,7 +2677,7 @@ fn map_todoist_status(status: StatusCode, retry_after: Option<u64>, text: &str) 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -2845,11 +2864,32 @@ mod tests {
 
         async fn list_tasks(
             State(state): State<Arc<CountingMockTodoistState>>,
-            Query(_query): Query<HashMap<String, String>>,
+            Query(query): Query<HashMap<String, String>>,
         ) -> Json<Value> {
             state.counts.tasks.fetch_add(1, Ordering::SeqCst);
+            let requested_ids = query
+                .get("ids")
+                .map(|ids| {
+                    ids.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let results = state
+                .tasks
+                .iter()
+                .filter(|task| {
+                    requested_ids.is_empty()
+                        || task
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|task_id| requested_ids.contains(task_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             Json(json!({
-                "results": state.tasks,
+                "results": results,
                 "next_cursor": null
             }))
         }
@@ -3429,7 +3469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_issue_states_reuses_cached_current_user_lookup() {
+    async fn fetch_issue_states_batches_requests_and_reuses_cached_current_user_lookup() {
         let counts = Arc::new(MetadataRequestCounts::default());
         let server = spawn_counting_mock_todoist(CountingMockTodoistState {
             inner: MockTodoistState {
@@ -3448,17 +3488,17 @@ mod tests {
             },
             tasks: vec![
                 json!({
-                    "id": "task-1",
-                    "content": "Ship cache",
-                    "project_id": "proj",
-                    "section_id": "sec-todo",
-                    "assignee_id": "user-1"
-                }),
-                json!({
                     "id": "task-2",
                     "content": "Review cache",
                     "project_id": "proj",
                     "section_id": "sec-progress",
+                    "assignee_id": "user-1"
+                }),
+                json!({
+                    "id": "task-1",
+                    "content": "Ship cache",
+                    "project_id": "proj",
+                    "section_id": "sec-todo",
                     "assignee_id": "user-1"
                 }),
             ],
@@ -3467,7 +3507,11 @@ mod tests {
         .await;
 
         let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
-        let issue_ids = vec!["task-1".to_string(), "task-2".to_string()];
+        let issue_ids = vec![
+            "task-1".to_string(),
+            "task-2".to_string(),
+            "task-1".to_string(),
+        ];
 
         let first = tracker
             .fetch_issue_states_by_ids(&issue_ids)
@@ -3478,13 +3522,26 @@ mod tests {
             .await
             .expect("second state refresh");
 
-        assert_eq!(first.len(), 2);
-        assert_eq!(second.len(), 2);
+        assert_eq!(
+            first
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-1", "task-2", "task-1"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-1", "task-2", "task-1"]
+        );
         assert_eq!(counts.project.load(Ordering::SeqCst), 1);
         assert_eq!(counts.sections.load(Ordering::SeqCst), 1);
         assert_eq!(counts.current_user.load(Ordering::SeqCst), 1);
         assert_eq!(counts.collaborators.load(Ordering::SeqCst), 0);
-        assert_eq!(counts.task_details.load(Ordering::SeqCst), 4);
+        assert_eq!(counts.tasks.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.task_details.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
