@@ -1,0 +1,58 @@
+name: rust-todoist-ci
+
+on:
+  pull_request:
+    paths:
+      - "rust-todoist/**"
+      - ".github/workflows/rust-todoist-ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "rust-todoist/**"
+      - ".github/workflows/rust-todoist-ci.yml"
+
+jobs:
+  rust-todoist-ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-todoist
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-todoist
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit -q
+
+      - name: Validate workspace cleanup hook syntax
+        run: sh -n scripts/workspace_before_remove.sh
+
+      - name: Validate GitHub publish preflight hook syntax
+        run: sh -n scripts/github_publish_preflight.sh

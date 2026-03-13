@@ -1262,7 +1262,7 @@ fn running_table_header_row(running_event_width: usize) -> String {
 fn running_table_separator_row(running_event_width: usize) -> String {
     format!(
         "│ {} {} {} {} {} {} {} {}",
-        "─".repeat(RUNNING_STATUS_WIDTH),
+        "─",
         "─".repeat(RUNNING_ID_WIDTH),
         "─".repeat(RUNNING_STATE_WIDTH),
         "─".repeat(RUNNING_SESSION_WIDTH),

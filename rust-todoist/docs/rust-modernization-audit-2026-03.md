@@ -9,25 +9,35 @@ Audit date: 2026-03-13
 The main gaps are not "Rust fundamentals are broken." The gaps are project-policy and scaling gaps:
 
 1. `rust-todoist` is effectively outside the repository's Rust CI enforcement path.
-2. The crate has no explicit toolchain/MSRV/lint/release-profile policy checked into the package.
-3. Supply-chain verification is currently ad hoc rather than encoded in CI and config files.
-4. The Todoist control plane does extra metadata work on every poll/refresh cycle that will consume rate budget unnecessarily as task volume grows.
+2. The Todoist control plane does extra metadata work on every poll/refresh cycle that will consume rate budget unnecessarily as task volume grows.
+3. The crate has no explicit toolchain/MSRV/lint/release-profile policy checked into the package.
+4. Supply-chain verification is currently ad hoc rather than encoded in CI and config files.
 5. Several core files are too large and too `serde_json::Value`-heavy for long-term maintainability.
 
-If the goal is "secure, performant, well-structured" by modern Rust standards, the next implementation pass should focus on policy automation first, then control-plane performance, then module decomposition.
+Given the current implementation priority, the next pass should focus on control-plane performance first, then CI/toolchain baseline, then module decomposition. Security work should stay close to the upstream repo baseline rather than introducing a lot of package-local policy machinery.
+
+## Implementation Progress
+
+This document is now also the implementation tracker for the follow-on work.
+
+- Done on 2026-03-13: the Todoist tracker now caches configured-project metadata in `src/tracker/todoist.rs` with bounded TTLs for project details, section maps, assignee resolution, collaborator IDs, current-user lookup, and plan limits.
+- Done on 2026-03-13: added request-count tests proving repeated poll and refresh paths reuse cached metadata instead of re-hitting Todoist control-plane endpoints.
+- Done on 2026-03-13: added a dedicated `rust-todoist` CI workflow plus `rust-toolchain.toml`, `rust-version`, conservative lint policy, and an explicit thin-LTO release profile.
+- Next: split the largest modules and add fixture-backed performance measurement for the Todoist poll/refresh paths.
+- Deferred unless upstream practice changes: `cargo-deny` or `cargo-vet` rollout. `cargo audit` in CI is sufficient for now.
 
 ## What I Verified
 
 Local checks run during this audit:
 
 - `cargo test`: passed
-  - 211 unit/integration tests in `src`
+  - 219 unit/integration tests in `src`
   - 17 non-ignored tests in `tests/live_e2e.rs`
   - 6 live end-to-end tests remain intentionally ignored unless credentials are provided
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed
 - `cargo audit -q`: clean on 2026-03-13
 - `cargo build --release`: succeeded
-  - local build time: about 26s on this machine
+  - local build time: about 31s on this machine after enabling thin LTO
   - output binary: about 13 MB at `target/release/symphony-todoist`
   - current release build is warning-clean
 
@@ -86,6 +96,10 @@ Success criteria:
 
 - Any PR touching `rust-todoist/**` automatically runs Rust checks for this package.
 
+Implementation progress:
+
+- Implemented on 2026-03-13 via `.github/workflows/rust-todoist-ci.yml`.
+
 ### P1. Toolchain and crate policy are underspecified
 
 Why it matters:
@@ -116,6 +130,10 @@ Notes:
 
 - This crate already behaves like a service binary, not a published compatibility library. That argues for pinning aggressively rather than optimizing for broad compiler compatibility.
 
+Implementation progress:
+
+- Implemented on 2026-03-13 with `rust-version = "1.85"`, a stable toolchain file, conservative lint gates, and `profile.release.lto = "thin"`.
+
 ### P1. Supply-chain verification is not encoded in the repo
 
 Why it matters:
@@ -132,16 +150,12 @@ Evidence:
 Recommendation:
 
 - Add `cargo audit` to CI immediately.
-- Add `cargo-deny` with a checked-in `deny.toml` for:
-  - advisories
-  - bans/duplicate policy
-  - allowed registries/sources
-  - license policy
-- Consider `cargo vet` if this runtime is expected to remain a long-lived internal service with sensitive credentials and GitHub/Todoist automation authority.
+- Keep the security baseline close to the rest of the repository for now.
+- Defer `cargo-deny` and `cargo-vet` unless the upstream repo adopts them broadly or the dependency surface becomes materially riskier.
 
 Success criteria:
 
-- Advisory, source, and license checks run automatically on every `rust-todoist` PR.
+- `cargo audit` runs automatically on every `rust-todoist` PR.
 
 ### P1. The Todoist control plane repeats avoidable metadata work
 
@@ -164,7 +178,7 @@ What is happening now:
 
 Recommendation:
 
-- Introduce a small metadata cache keyed by `(base_url, api_key, project_id)` with explicit TTLs and invalidation on workflow reload.
+- Introduce a small metadata cache for the configured Todoist project with explicit TTLs.
 - Good cache candidates:
   - project resource
   - section map
@@ -172,6 +186,12 @@ Recommendation:
   - collaborator IDs
   - user-plan limits
 - Keep task fetches live; cache only the relatively stable control-plane metadata.
+
+Implementation progress:
+
+- Implemented on 2026-03-13 in `src/tracker/todoist.rs`.
+- Current shape is intentionally narrow: per-tracker-instance cache with short TTLs, which means cache invalidation naturally happens when config reload constructs a new tracker.
+- Added targeted tests that assert repeated poll/refresh flows only hit Todoist metadata endpoints once while still fetching live task payloads each time.
 
 Target outcome:
 
@@ -278,7 +298,18 @@ Recommendation:
 
 ## Recommended Implementation Order
 
-### Phase 1: Policy and CI
+### Phase 1: Control-plane performance
+
+- Add metadata cache for project/section/assignee/plan-limit lookups
+- Add request-count instrumentation or tests around Todoist control-plane calls
+- Verify reduced API pressure against representative fixtures
+
+Status:
+
+- Metadata cache and request-count tests are done.
+- Wider performance measurement and fixture-based benchmarking still remain.
+
+### Phase 2: CI and crate policy
 
 - Put `rust-todoist` under mandatory CI
 - Add `rust-toolchain.toml`
@@ -287,24 +318,17 @@ Recommendation:
 - Add release-build CI
 - Make release builds warning-clean
 
-### Phase 2: Supply chain
-
-- Add `cargo audit` to CI
-- Add `cargo-deny` and `deny.toml`
-- Decide whether to adopt `cargo vet`
-
-### Phase 3: Control-plane performance
-
-- Add metadata cache for project/section/assignee/plan-limit lookups
-- Add request-count instrumentation around Todoist control-plane calls
-- Verify reduced API pressure against representative fixtures
-
-### Phase 4: Structural decomposition
+### Phase 3: Structural decomposition
 
 - Split `tracker/todoist.rs`
 - Split `dynamic_tool.rs`
 - Split `observability.rs`
 - Type the hot-path DTOs
+
+### Phase 4: Minimal security baseline
+
+- Add `cargo audit` to CI
+- Keep additional dependency policy aligned with upstream repo-wide practice
 
 ### Phase 5: Operability polish
 
