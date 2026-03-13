@@ -976,6 +976,7 @@ struct TerminalRenderState {
     last_rendered_at: Option<Instant>,
     pending_content: Option<String>,
     flush_due_at: Option<Instant>,
+    snapshot_due_at: Option<Instant>,
     last_polling: Option<PollingSnapshot>,
 }
 
@@ -1028,17 +1029,22 @@ impl TerminalDashboard {
                         if changed.is_err() {
                             break;
                         }
-                        refresh_terminal_dashboard(
-                            &orchestrator,
-                            &workflow_store,
-                            dashboard_addr,
-                            &mut presenter,
+                        schedule_terminal_snapshot(
                             &mut render_state,
                             observability.render_interval_ms,
-                            &task_renderer,
-                        ).await;
+                            false,
+                        );
                     }
                     _ = refresh_tick.tick() => {
+                        schedule_terminal_snapshot(
+                            &mut render_state,
+                            observability.render_interval_ms,
+                            false,
+                        );
+                    }
+                    _ = wait_for_terminal_snapshot(render_state.snapshot_due_at),
+                        if render_state.snapshot_due_at.is_some() => {
+                        render_state.snapshot_due_at = None;
                         refresh_terminal_dashboard(
                             &orchestrator,
                             &workflow_store,
@@ -1082,6 +1088,26 @@ fn periodic_rerender_due(last_rendered_at: Option<Instant>) -> bool {
             last_rendered_at.elapsed().as_millis() as u64 >= MINIMUM_IDLE_RERENDER_MS
         }
     }
+}
+
+fn schedule_terminal_snapshot(
+    render_state: &mut TerminalRenderState,
+    render_interval_ms: u64,
+    force_now: bool,
+) {
+    let now = Instant::now();
+    let due_at = if force_now || render_now(render_state.last_rendered_at, render_interval_ms, now)
+    {
+        now
+    } else {
+        schedule_flush_due_at(render_state.last_rendered_at, render_interval_ms, now)
+    };
+
+    render_state.snapshot_due_at = Some(
+        render_state
+            .snapshot_due_at
+            .map_or(due_at, |existing| existing.min(due_at)),
+    );
 }
 
 async fn refresh_terminal_dashboard(
@@ -1201,6 +1227,13 @@ async fn wait_for_terminal_flush(flush_due_at: Option<Instant>) {
     }
 }
 
+async fn wait_for_terminal_snapshot(snapshot_due_at: Option<Instant>) {
+    match snapshot_due_at {
+        Some(snapshot_due_at) => sleep_until(tokio::time::Instant::from_std(snapshot_due_at)).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn fingerprint_terminal_content(content: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
@@ -1231,12 +1264,28 @@ fn default_alternate_terminal_shutdown() {
 }
 
 fn render_terminal_frame_into<W: Write>(writer: &mut W, content: &str) -> io::Result<()> {
-    writer.write_all(format!("{}{}{}", ANSI_HOME, ANSI_CLEAR, content).as_bytes())?;
+    writer.write_all(ANSI_HOME.as_bytes())?;
+    if !content.is_empty() {
+        for (index, line) in content.split('\n').enumerate() {
+            if index > 0 {
+                writer.write_all(b"\n")?;
+            }
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(ANSI_CLEAR_TO_EOL.as_bytes())?;
+        }
+    }
+    writer.write_all(ANSI_CLEAR_DOWN.as_bytes())?;
     writer.flush()
 }
 
 fn enter_alternate_screen_into<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(format!("{}{}", ANSI_ENTER_ALTERNATE_SCREEN, ANSI_HIDE_CURSOR).as_bytes())?;
+    writer.write_all(
+        format!(
+            "{}{}{}{}",
+            ANSI_ENTER_ALTERNATE_SCREEN, ANSI_HIDE_CURSOR, ANSI_HOME, ANSI_CLEAR_DOWN
+        )
+        .as_bytes(),
+    )?;
     writer.flush()
 }
 
@@ -2526,7 +2575,8 @@ fn format_cell_aligned(value: &str, width: usize, right_align: bool) -> String {
 }
 
 const ANSI_HOME: &str = "\u{1b}[H";
-const ANSI_CLEAR: &str = "\u{1b}[2J";
+const ANSI_CLEAR_TO_EOL: &str = "\u{1b}[K";
+const ANSI_CLEAR_DOWN: &str = "\u{1b}[J";
 const ANSI_ENTER_ALTERNATE_SCREEN: &str = "\u{1b}[?1049h";
 const ANSI_LEAVE_ALTERNATE_SCREEN: &str = "\u{1b}[?1049l";
 const ANSI_HIDE_CURSOR: &str = "\u{1b}[?25l";
@@ -3788,8 +3838,10 @@ mod tests {
         let rendered = String::from_utf8(bytes).expect("utf8");
         assert!(rendered.starts_with(super::ANSI_HOME));
         assert!(rendered.contains(super::ANSI_HOME));
-        assert!(rendered.contains(super::ANSI_CLEAR));
-        assert!(rendered.contains("line 1\nline 2"));
+        assert!(rendered.contains("line 1"));
+        assert!(rendered.contains("line 2"));
+        assert!(rendered.contains(super::ANSI_CLEAR_TO_EOL));
+        assert!(rendered.ends_with(super::ANSI_CLEAR_DOWN));
         assert!(!rendered.ends_with("\n"));
     }
 
@@ -3806,9 +3858,11 @@ mod tests {
         assert_eq!(
             init,
             format!(
-                "{}{}",
+                "{}{}{}{}",
                 super::ANSI_ENTER_ALTERNATE_SCREEN,
-                super::ANSI_HIDE_CURSOR
+                super::ANSI_HIDE_CURSOR,
+                super::ANSI_HOME,
+                super::ANSI_CLEAR_DOWN
             )
         );
         assert_eq!(
@@ -3891,6 +3945,35 @@ mod tests {
         assert_eq!(renders.load(Ordering::SeqCst), 0);
         assert_eq!(render_state.pending_content.as_deref(), Some("new pending"));
         assert_eq!(render_state.flush_due_at, Some(due_at));
+    }
+
+    #[test]
+    fn terminal_snapshot_schedule_reuses_earliest_due_time() {
+        let now = Instant::now();
+        let existing_due_at = now + Duration::from_millis(20);
+        let mut render_state = super::TerminalRenderState {
+            last_rendered_at: Some(now),
+            snapshot_due_at: Some(existing_due_at),
+            ..Default::default()
+        };
+
+        super::schedule_terminal_snapshot(&mut render_state, 50, false);
+
+        assert_eq!(render_state.snapshot_due_at, Some(existing_due_at));
+    }
+
+    #[test]
+    fn terminal_snapshot_schedule_forces_immediate_refresh_when_requested() {
+        let now = Instant::now();
+        let mut render_state = super::TerminalRenderState {
+            last_rendered_at: Some(now),
+            ..Default::default()
+        };
+
+        super::schedule_terminal_snapshot(&mut render_state, 50, true);
+
+        assert!(render_state.snapshot_due_at.is_some());
+        assert!(render_state.snapshot_due_at.expect("due_at") <= Instant::now());
     }
 
     fn sample_payload() -> StatePayload {

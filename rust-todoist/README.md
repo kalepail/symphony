@@ -88,7 +88,7 @@ workspace:
 observability:
   terminal_enabled: true
   refresh_ms: 1000
-  render_interval_ms: 16
+  render_interval_ms: 100
 hooks:
   after_create: |
     git clone --depth 1 git@github.com:your-org/your-repo.git .
@@ -128,7 +128,7 @@ Notes:
 - Todoist comments must be available on the connected account or plan. Symphony validates that at startup because task-scoped workpad comments are part of the core runtime contract.
 - `tracker.active_states` and `tracker.terminal_states` accept either YAML lists or comma-separated strings.
 - `tracker.fixture_path` is used when `tracker.kind: memory` and may point to either JSON or YAML containing an issue array or `{ issues: [...] }` envelope.
-- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs and uses the terminal's alternate screen buffer so dashboard redraws do not pollute normal shell scrollback. The renderer also clips to the current viewport so narrower panes and shorter terminal windows do not wrap or scroll the dashboard unexpectedly. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `16`.
+- `observability.terminal_enabled` defaults to `true`, while terminal rendering only activates on interactive TTYs and uses the terminal's alternate screen buffer so dashboard redraws do not pollute normal shell scrollback. The renderer also clips to the current viewport so narrower panes and shorter terminal windows do not wrap or scroll the dashboard unexpectedly. `observability.refresh_ms` defaults to `1000` and `observability.render_interval_ms` defaults to `100`.
 - `workspace.root` supports `~` and `$VAR`. Bare path names such as `workspaces` remain relative.
 - `worker.ssh_hosts` enables distributed execution over SSH. When configured, Symphony picks the least-loaded host, applies `worker.max_concurrent_agents_per_host` as a per-host cap when present, preserves host affinity across retries, and sweeps stale remote workspaces during startup. Host strings may include an explicit port, for example `builder-b:2222`.
 - Remote workspace paths preserve the configured `workspace.root` string, including `~`, so operator surfaces and cleanup use the same logical path that remote hooks and Codex sessions receive.
@@ -200,6 +200,7 @@ For parity with the original Elixir implementation and the root [SPEC.md](../SPE
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo bench --bench todoist_hot_paths -- --noplot --sample-size 10
 cargo test --test live_e2e -- --ignored --nocapture
 sh -n scripts/workspace_before_remove.sh
 sh -n scripts/github_publish_preflight.sh
