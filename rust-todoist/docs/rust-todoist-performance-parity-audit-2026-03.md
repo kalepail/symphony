@@ -35,7 +35,7 @@ The main runtime issues called out below were addressed on the current branch:
 3. Worker failures now preserve stage/kind structure through retries and issue detail reporting.
 4. The test suite now covers the specific cross-tick cache and startup failover behaviors that were previously missing.
 
-The main open item after this pass is measurement depth: request-count regression coverage exists for the hot paths that mattered most, but there is still no dedicated `benches/` harness.
+The main open item after this pass is measurement breadth: request-count regression coverage exists for the hot paths that mattered most, and there is now a dedicated `benches/` harness for warm Todoist tracker paths, but the benchmark surface is still intentionally narrow.
 
 ## Implementation Update
 
@@ -51,11 +51,12 @@ Implemented on this branch:
   - unrelated workflow reloads that preserve cached metadata
   - cache-key-changing workflow reloads that force metadata refetch
   - startup failover and structured error reporting surfaces
+- a dedicated `benches/todoist_hot_paths.rs` harness for warm `fetch_candidate_issues()` and `fetch_issue_states_by_ids()` paths
 
 Still open by design:
 
-- no dedicated `benches/` tree yet
-- no wall-time benchmark suite beyond targeted request-count regression tests
+- benchmark coverage is still narrow and focused on Todoist tracker hot paths
+- there is still no broader orchestrator wall-time benchmark suite
 
 ## Sources Reviewed
 
@@ -86,14 +87,18 @@ Validation run on the current branch state:
 - `cargo test -- --list`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo build --release`
+- `cargo bench --bench todoist_hot_paths -- --noplot --sample-size 10`
+- `cd elixir && make MIX='mise exec -- mix' all`
 
 Observed result on March 13, 2026 after implementation work:
 
-- `226` local unit/system tests passed
+- `230` local unit/system tests passed
 - `17` non-ignored helper tests in `tests/live_e2e.rs` passed
 - `6` env-gated live end-to-end tests remained ignored as expected
 - `cargo clippy` passed with `-D warnings`
 - `cargo build --release` passed
+- `cargo bench` passed for the warm Todoist hot-path harness
+- `make MIX='mise exec -- mix' all` passed in `elixir/`
 
 ## Parity Verdict
 
@@ -256,16 +261,16 @@ Rust is already ahead on degraded error presentation once the orchestrator handl
 
 The gap is specifically the worker bootstrap path, not the observability layer as a whole.
 
-### P2. The performance audit still lacks a measurement harness
+### P2. The performance audit still needs broader measurement, not first measurement
 
-Status on current branch: partially addressed.
+Status on current branch: meaningfully addressed, but still incomplete.
 
-The repo now has better control-plane behavior than it did a day ago, but it still has no benchmark harness or fixture-backed steady-state performance suite.
+The repo now has both request-count regression coverage and a dedicated benchmark harness, but the measurement surface is still narrower than the full runtime.
 
 Evidence:
 
-- `cargo test -- --list` reports `0 benchmarks`
-- there is still no `benches/` tree in `rust-todoist/`
+- `cargo bench --bench todoist_hot_paths -- --noplot --sample-size 10` runs successfully
+- `rust-todoist/benches/todoist_hot_paths.rs` now benchmarks warm `fetch_candidate_issues()` and `fetch_issue_states_by_ids()` paths
 
 Why this matters:
 
@@ -276,7 +281,8 @@ Why this matters:
 Current state:
 
 - request-count regression coverage now exists for the hot paths that were most at risk
-- there is still no `benches/` tree or wall-time benchmark harness
+- a dedicated `benches/` tree now exists for the highest-value Todoist tracker hot paths
+- there is still no broader orchestrator wall-time benchmark harness
 
 Recommendation:
 
@@ -333,11 +339,11 @@ Treat any next test additions as targeted parity/performance tests, not generic 
 2. worker continuation-turn performance coverage with direct request-count assertions
 3. optional wall-time benchmark coverage once request-count regressions stop finding issues
 
-### P3. One parity doc is now stale enough to be misleading
+### P3. One parity doc was stale enough to be misleading
 
-`PLAN-rust-todoist-parity.md` still says the biggest gap is "no SSH remote worker support or distributed execution parity with Elixir."
+Status on current branch: addressed.
 
-That is no longer true.
+`PLAN-rust-todoist-parity.md` previously said the biggest gap was "no SSH remote worker support or distributed execution parity with Elixir."
 
 Current Rust Todoist already has:
 
@@ -348,15 +354,11 @@ Current Rust Todoist already has:
 - remote workspace operations
 - SSH-backed live smoke coverage
 
-This matters because stale parity docs waste implementation time on already-closed gaps.
+This mattered because stale parity docs waste implementation time on already-closed gaps.
 
-Recommendation:
+Implemented on this branch:
 
-- update the parity plan so the top open items match this audit:
-  - tracker reuse across hot paths
-  - same-attempt worker-host failover
-  - typed worker failure reporting
-  - performance regression harnesses
+- the parity plan now reflects the current runtime and points at hot-path performance, recovery confidence, and regression coverage instead of SSH enablement
 
 ## SPEC Alignment
 
