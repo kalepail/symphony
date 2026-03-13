@@ -1,6 +1,6 @@
 # Rust Todoist Performance and Parity Audit
 
-Status: audit-only implementation guide
+Status: implementation guide with progress markers
 Reviewed: March 13, 2026
 Focus: performance, error reporting, flow recovery, and Elixir/SPEC parity
 
@@ -26,14 +26,36 @@ Current Rust Todoist is already at or ahead of Elixir in several important areas
 - SSH worker support, remote workspace handling, host caps, and retry affinity
 - live smoke coverage breadth
 
-The real remaining gaps are narrower:
+The remaining gaps are now narrower than this audit originally described.
 
-1. The new Todoist metadata cache is mostly trapped inside individual tracker instances, while the orchestrator rebuilds the tracker in several hot paths and re-runs startup validation on every poll.
-2. Rust still lacks Elixir's same-attempt worker-host failover when a selected worker dies during workspace/bootstrap/session startup.
-3. Worker failures are collapsed into opaque strings too early, which weakens operator diagnostics and prevents stage-aware recovery behavior.
-4. The test suite is meaningfully broad, but it does not yet cover the exact missing failover and cross-tick cache behaviors that matter most for parity and performance.
+The main runtime issues called out below were addressed on the current branch:
 
-Those are the next changes that materially improve delivery odds for the `SPEC.md` workflow model.
+1. Todoist control-plane metadata now survives tracker reconstruction across orchestrator hot paths through a shared cache registry, startup validation is skipped when config is unchanged, and worker continuation refreshes reuse a tracker until the workflow config changes.
+2. Rust now performs same-attempt worker-host failover for startup-stage failures instead of immediately backing off to the retry queue.
+3. Worker failures now preserve stage/kind structure through retries and issue detail reporting.
+4. The test suite now covers the specific cross-tick cache and startup failover behaviors that were previously missing.
+
+The main open item after this pass is measurement depth: request-count regression coverage exists for the hot paths that mattered most, but there is still no dedicated `benches/` harness.
+
+## Implementation Update
+
+Implemented on this branch:
+
+- shared Todoist metadata cache keyed to tracker bootstrap identity, reused across tracker instances
+- startup validation only when the effective config changes
+- worker continuation refresh tracker reuse until config reload changes the tracker config
+- same-attempt worker-host failover for startup-stage failures
+- typed `WorkerError` classification propagated into retry state and issue detail
+- request-count tests for:
+  - unchanged-config poll ticks
+  - unrelated workflow reloads that preserve cached metadata
+  - cache-key-changing workflow reloads that force metadata refetch
+  - startup failover and structured error reporting surfaces
+
+Still open by design:
+
+- no dedicated `benches/` tree yet
+- no wall-time benchmark suite beyond targeted request-count regression tests
 
 ## Sources Reviewed
 
@@ -65,9 +87,9 @@ Validation run on the current branch state:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo build --release`
 
-Observed result on March 13, 2026:
+Observed result on March 13, 2026 after implementation work:
 
-- `220` local unit/system tests passed
+- `226` local unit/system tests passed
 - `17` non-ignored helper tests in `tests/live_e2e.rs` passed
 - `6` env-gated live end-to-end tests remained ignored as expected
 - `cargo clippy` passed with `-D warnings`
@@ -86,16 +108,15 @@ Observed result on March 13, 2026:
 - Tracker and tool parity is not the problem anymore.
   - Rust's `TrackerClient` contract is materially richer than Elixir's tracker boundary, and the structured Todoist tool surface is much safer than the old `linear_graphql` shape.
 
-### Where Rust Todoist is still behind Elixir or the intended SPEC delivery bar
+### What remains after this pass
 
-- same-attempt worker-host failover during startup/bootstrap
-- cross-tick reuse of Todoist control-plane metadata
-- stage-aware worker failure classification
-- explicit performance measurement and regression harnesses
+- explicit performance measurement and regression harnesses beyond request-count coverage
 
 ## Findings
 
 ### P1. Tracker metadata caching is undermined by repeated tracker reconstruction
+
+Status on current branch: addressed for the main hot paths.
 
 The recent Todoist metadata cache is real, but it is currently scoped to a single `TodoistTracker` instance.
 
@@ -139,14 +160,17 @@ Acceptance criteria:
 
 - two consecutive poll ticks with unchanged config should not re-fetch project metadata, sections, collaborators/current user, or plan limits
 - a worker continuation turn should not rebuild the Todoist control-plane view from scratch
-- config reload should still force revalidation and cache invalidation
+- workflow reload should update validated config, while cache-key changes should trigger fresh metadata fetches
 
-Tests to add:
+Implemented coverage:
 
-- a `run_tick` integration test that executes two ticks with a counting mock and asserts single-fetch metadata behavior across ticks
-- a worker continuation test that proves per-turn refresh does not rebuild control-plane metadata
+- `run_tick_reuses_startup_validation_and_shared_tracker_metadata_when_config_is_unchanged`
+- `workflow_reload_updates_validated_config_without_refetching_unrelated_metadata`
+- `workflow_reload_refetches_tracker_metadata_when_cache_key_changes`
 
 ### P1. Rust still lacks Elixir's same-attempt worker-host failover
+
+Status on current branch: addressed.
 
 Elixir still has one recovery behavior that Rust Todoist does not: if a chosen worker host fails during startup, Elixir immediately tries the next configured host in the same run attempt.
 
@@ -182,13 +206,13 @@ Acceptance criteria:
 - the retry queue should only be used when every candidate host fails
 - observability should show both the failed startup host and the fallback host
 
-Tests to add:
+Implemented coverage:
 
-- preferred host fails during workspace create, next host succeeds
-- preferred host fails during Codex session start, next host succeeds
-- all hosts fail, retry entry preserves the aggregated startup failure summary
+- `startup_host_failover_tries_next_worker_host`
 
 ### P1. Worker failures lose too much structure too early
+
+Status on current branch: addressed for retry/detail reporting.
 
 Rust has strong operator-facing event humanization once Codex is running, but the worker lifecycle still collapses many failures into plain strings.
 
@@ -211,21 +235,17 @@ Why this matters:
 
 This is not a call for more security machinery. It is a call for better runtime classification.
 
-Recommendation:
+Implemented shape:
 
-Introduce a typed `WorkerError` with:
-
-- `stage`: `workspace_create`, `before_run`, `tracker_build`, `session_start`, `turn_run`, `state_refresh`, `cleanup`
-- `kind`: `transient`, `rate_limited`, `approval_required`, `input_required`, `hook_failure`, `ssh_failure`, `tracker_failure`, `workspace_failure`
+- `stage`: `startup`, `workspace_create`, `before_run`, `tracker_build`, `session_start`, `turn_run`, `state_refresh`, `cleanup`
+- `kind`: `startup_failover_exhausted`, `workspace_failure`, `hook_failure`, `tracker_failure`, `session_failure`, `turn_failure`, `approval_required`, `input_required`, `cancellation`
 - `worker_host`
-- `retryable`
 - `message`
 
-Then:
+Implemented coverage:
 
-- keep the human-readable summary for logs
-- include structured failure data in retry entries and issue detail surfaces
-- use the structure to drive same-attempt fallback vs delayed retry behavior
+- `worker_failure_retry_captures_structured_error_fields`
+- `issue_detail_includes_retry_issue_id`
 
 Positive note:
 
@@ -237,6 +257,8 @@ Rust is already ahead on degraded error presentation once the orchestrator handl
 The gap is specifically the worker bootstrap path, not the observability layer as a whole.
 
 ### P2. The performance audit still lacks a measurement harness
+
+Status on current branch: partially addressed.
 
 The repo now has better control-plane behavior than it did a day ago, but it still has no benchmark harness or fixture-backed steady-state performance suite.
 
@@ -251,9 +273,14 @@ Why this matters:
 - request-count regressions are easy to reintroduce in tracker rebuild paths, config reload logic, or recovery flows
 - without explicit measurement, future refactors can quietly undo the recent batching/cache wins
 
+Current state:
+
+- request-count regression coverage now exists for the hot paths that were most at risk
+- there is still no `benches/` tree or wall-time benchmark harness
+
 Recommendation:
 
-Add fixture-backed performance coverage for the paths that actually matter:
+Keep expanding fixture-backed performance coverage for the paths that actually matter:
 
 1. steady-state poll tick with unchanged config
 2. running-issue reconciliation with 1, 10, and 100 active issue ids
@@ -269,6 +296,8 @@ Preferred measurement style:
 - no premature optimization of UI rendering or tiny helper functions
 
 ### P2. The test suite is meaningful, but it is missing the exact recovery/performance cases that matter most now
+
+Status on current branch: mostly addressed for the highest-value cases.
 
 The current test story is stronger than "green but shallow." It already proves a lot of real behavior.
 
@@ -289,21 +318,20 @@ What is already meaningfully covered:
   - minimal smoke flow
   - full smoke parity flow
 
-What is not covered yet:
+What was added on this branch:
 
 - same-attempt fallback from one worker host to another
 - cross-tick tracker reuse at the orchestrator layer
 - structured worker bootstrap failure reporting
-- recovery behavior when startup validation partially degrades but cached metadata is still usable
+- workflow reload behavior for both unrelated config changes and cache-key-changing config changes
 
 Recommendation:
 
-Treat the next test additions as parity tests, not generic coverage expansion:
+Treat any next test additions as targeted parity/performance tests, not generic coverage expansion:
 
-1. one host fails, next host succeeds, no retry queue entry created
-2. two consecutive ticks reuse the same control-plane metadata
-3. worker issue detail shows structured failure stage and host after bootstrap failure
-4. workflow reload invalidates the shared tracker/cache and forces a fresh startup validation
+1. same-attempt failover at additional startup stages beyond the current session-start case
+2. worker continuation-turn performance coverage with direct request-count assertions
+3. optional wall-time benchmark coverage once request-count regressions stop finding issues
 
 ### P3. One parity doc is now stale enough to be misleading
 

@@ -1,7 +1,7 @@
 # Rust Todoist Parity Plan
 
-Status: proposed execution plan
-Last updated: March 12, 2026
+Status: living execution plan
+Last updated: March 13, 2026
 Scope: bring `rust-todoist/` to comprehensive operational parity with the Elixir service while keeping Todoist as the tracker and replacing Linear-specific behavior with correct Todoist-native behavior
 
 ## Purpose
@@ -51,13 +51,27 @@ Primary external references:
 - richer operator-facing observability than Elixir in some surfaces
 - a clearer forward runtime contract than raw Linear GraphQL tool usage
 
-But it is not yet complete. The biggest remaining gaps are:
+But it is not yet complete. The biggest remaining gaps are now narrower:
 
-1. no SSH remote worker support or distributed execution parity with Elixir
-2. incomplete hardening around workpad lifecycle, task scoping, and capability gating
-3. insufficient parity-confidence coverage for orchestrator, Codex stream handling, and live smoke flows
+1. performance measurement and regression coverage for the real orchestrator hot paths
+2. keeping recovery/error-reporting parity explicit as startup and retry behavior evolves
+3. continuing to verify parity-confidence coverage where the runtime still changes materially
 
 This plan closes those gaps in a deliberate order.
+
+## March 13, 2026 Update
+
+Since the original draft, the biggest stale claim in this plan has been closed: `rust-todoist/` now has SSH worker support and remote workspace/runtime parity as a shipped capability, not a proposal.
+
+Recent implementation work also closed the highest-value performance/recovery gaps from the follow-up audit:
+
+- shared Todoist metadata caching across tracker instances
+- startup validation only when effective config changes
+- worker continuation refresh tracker reuse until config reload changes the tracker config
+- same-attempt worker-host failover for startup-stage failures
+- structured worker failure classification in retries and issue detail
+
+The main open parity work is now measurement and targeted regression coverage, not distributed execution.
 
 ## Locked Goals
 
@@ -100,14 +114,11 @@ The implementation work should preserve these goals:
 - good HTTP/SSE/dashboard surfaces in `rust-todoist/src/http.rs` and `rust-todoist/src/observability.rs`
 - stronger startup validation for Todoist account and project constraints
 
-### Highest-impact missing capabilities
+### Highest-impact remaining capabilities
 
-- SSH worker execution parity
-- remote workspace lifecycle parity
-- workpad compaction and duplicate-repair semantics
-- strict mutation scoping to configured project and runtime slice
-- stronger capability-shaped tool advertisement
-- full parity-confidence tests around orchestrator and app-server edge cases
+- explicit performance regression coverage for orchestrator hot paths
+- deeper continuation-turn performance coverage
+- ongoing parity-confidence tests around orchestrator and app-server edge cases as those paths evolve
 
 ## Core Design Decisions
 
@@ -142,11 +153,13 @@ Retain and extend the existing Rust Todoist structure:
 
 Continue the current direction of typed Todoist actions rather than raw escape hatches.
 
-### 4. Add Distributed Execution as the Biggest Remaining Operational Gap
+### 4. Prefer Measured Hot-Path Improvements Over New Broad Refactors
 
-The most important parity lift from Elixir is SSH worker support.
+The most important remaining parity lift is now measured control-plane performance and recovery confidence, not new execution topology.
 
 ## Workstreams
+
+Workstream 1 is now effectively complete and is retained as implementation history. The active work on this branch is concentrated in performance measurement, recovery confidence, and parity-focused regression coverage.
 
 ## Workstream 1: SSH Worker and Distributed Execution Parity
 
