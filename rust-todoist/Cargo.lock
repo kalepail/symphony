@@ -1524,6 +1524,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "http-body-util",
+ "libc",
  "minijinja",
  "notify",
  "regex",

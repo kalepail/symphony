@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    env,
     io::{self, IsTerminal, Write},
     iter::Peekable,
     net::SocketAddr,
@@ -32,12 +33,19 @@ const THROUGHPUT_GRAPH_COLUMNS: usize = 24;
 const SPARKLINE_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 const MINIMUM_IDLE_RERENDER_MS: u64 = 1_000;
 const DEFAULT_TERMINAL_COLUMNS: usize = 132;
+const DEFAULT_TERMINAL_ROWS: usize = 24;
 const RUNNING_ID_WIDTH: usize = 10;
 const RUNNING_STATE_WIDTH: usize = 14;
 const RUNNING_SESSION_WIDTH: usize = 14;
 const RUNNING_PID_WIDTH: usize = 8;
 const RUNNING_RUNTIME_WIDTH: usize = 14;
 const RUNNING_TOKENS_WIDTH: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalViewport {
+    columns: usize,
+    rows: usize,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StatePayload {
@@ -602,11 +610,15 @@ pub fn render_dashboard_html(payload: &StatePayload) -> String {
     )
 }
 
-pub fn render_terminal_dashboard(
+fn render_terminal_dashboard(
     payload: &StatePayload,
-    terminal_columns: Option<usize>,
+    terminal_viewport: Option<TerminalViewport>,
 ) -> String {
-    let columns = terminal_columns.unwrap_or(DEFAULT_TERMINAL_COLUMNS).max(96);
+    let viewport = terminal_viewport.unwrap_or(TerminalViewport {
+        columns: DEFAULT_TERMINAL_COLUMNS,
+        rows: DEFAULT_TERMINAL_ROWS,
+    });
+    let columns = viewport.columns.max(1);
     let running_event_width = columns.saturating_sub(
         RUNNING_ID_WIDTH
             + RUNNING_STATE_WIDTH
@@ -735,7 +747,7 @@ pub fn render_terminal_dashboard(
         }
     }
     lines.push("╰─".to_string());
-    lines.join("\n")
+    fit_terminal_frame(lines, viewport).join("\n")
 }
 
 pub fn render_offline_status() -> String {
@@ -758,8 +770,14 @@ pub fn render_snapshot_unavailable_status() -> String {
 
 pub struct TerminalDashboard {
     enabled: bool,
-    renderer: Arc<dyn Fn(String) + Send + Sync>,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
     join: Option<JoinHandle<()>>,
+}
+
+struct TerminalRenderer {
+    init: Arc<dyn Fn() + Send + Sync>,
+    render: Arc<dyn Fn(String) + Send + Sync>,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl TerminalDashboard {
@@ -769,33 +787,35 @@ impl TerminalDashboard {
         observability: ObservabilityConfig,
         dashboard_addr: Option<SocketAddr>,
     ) -> Self {
+        let renderer = terminal_renderer();
         Self::start_with_renderer(
             orchestrator,
             workflow_store,
             observability,
             dashboard_addr,
-            Arc::new(default_terminal_renderer),
+            renderer,
             io::stdout().is_terminal(),
         )
     }
 
-    pub fn start_with_renderer(
+    fn start_with_renderer(
         orchestrator: OrchestratorHandle,
         workflow_store: WorkflowStore,
         observability: ObservabilityConfig,
         dashboard_addr: Option<SocketAddr>,
-        renderer: Arc<dyn Fn(String) + Send + Sync>,
+        renderer: TerminalRenderer,
         interactive_terminal: bool,
     ) -> Self {
         if !observability.terminal_enabled || !interactive_terminal {
             return Self {
                 enabled: false,
-                renderer,
+                shutdown: renderer.shutdown,
                 join: None,
             };
         }
 
-        let task_renderer = Arc::clone(&renderer);
+        (renderer.init)();
+        let task_renderer = Arc::clone(&renderer.render);
         let join = tokio::spawn(async move {
             let mut presenter = Presenter::default();
             let mut updates = orchestrator.subscribe_observability();
@@ -825,7 +845,7 @@ impl TerminalDashboard {
                         let next = match orchestrator.snapshot().await {
                             Ok(snapshot) => {
                                 let payload = presenter.present_state(snapshot, &workflow_store, dashboard_addr);
-                                render_terminal_dashboard(&payload, None)
+                                render_terminal_dashboard(&payload, Some(current_terminal_viewport()))
                             }
                             Err(_) => render_snapshot_unavailable_status(),
                         };
@@ -844,14 +864,14 @@ impl TerminalDashboard {
 
         Self {
             enabled: true,
-            renderer,
+            shutdown: renderer.shutdown,
             join: Some(join),
         }
     }
 
     pub async fn shutdown(mut self) {
         if self.enabled {
-            (self.renderer)(render_offline_status());
+            (self.shutdown)();
         }
         if let Some(join) = self.join.take() {
             join.abort();
@@ -869,15 +889,42 @@ fn periodic_rerender_due(last_rendered_at: Option<Instant>) -> bool {
     }
 }
 
-fn default_terminal_renderer(content: String) {
-    let normalized = normalize_status_lines(&content);
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(format!("{}{}\n", ANSI_HOME, normalized).as_bytes());
-    let _ = stdout.flush();
+fn terminal_renderer() -> TerminalRenderer {
+    TerminalRenderer {
+        init: Arc::new(default_alternate_terminal_init),
+        render: Arc::new(default_terminal_renderer),
+        shutdown: Arc::new(default_alternate_terminal_shutdown),
+    }
 }
 
-fn normalize_status_lines(content: &str) -> String {
-    content.replace('\n', "\r\n")
+fn default_terminal_renderer(content: String) {
+    let mut stdout = io::stdout();
+    let _ = render_terminal_frame_into(&mut stdout, &content);
+}
+
+fn default_alternate_terminal_init() {
+    let mut stdout = io::stdout();
+    let _ = enter_alternate_screen_into(&mut stdout);
+}
+
+fn default_alternate_terminal_shutdown() {
+    let mut stdout = io::stdout();
+    let _ = leave_alternate_screen_into(&mut stdout);
+}
+
+fn render_terminal_frame_into<W: Write>(writer: &mut W, content: &str) -> io::Result<()> {
+    writer.write_all(format!("{}{}{}", ANSI_HOME, ANSI_CLEAR, content).as_bytes())?;
+    writer.flush()
+}
+
+fn enter_alternate_screen_into<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(format!("{}{}", ANSI_ENTER_ALTERNATE_SCREEN, ANSI_HIDE_CURSOR).as_bytes())?;
+    writer.flush()
+}
+
+fn leave_alternate_screen_into<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(format!("{}{}", ANSI_SHOW_CURSOR, ANSI_LEAVE_ALTERNATE_SCREEN).as_bytes())?;
+    writer.flush()
 }
 
 fn running_table_header_row(running_event_width: usize) -> String {
@@ -2094,6 +2141,9 @@ fn format_polling_status(polling: &PollingSnapshot) -> String {
 }
 
 fn format_cell(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let truncated = truncate_chars(value, width);
     let len = truncated.chars().count();
     if len >= width {
@@ -2103,7 +2153,12 @@ fn format_cell(value: &str, width: usize) -> String {
     }
 }
 
-const ANSI_HOME: &str = "\u{1b}[H\u{1b}[2J";
+const ANSI_HOME: &str = "\u{1b}[H";
+const ANSI_CLEAR: &str = "\u{1b}[2J";
+const ANSI_ENTER_ALTERNATE_SCREEN: &str = "\u{1b}[?1049h";
+const ANSI_LEAVE_ALTERNATE_SCREEN: &str = "\u{1b}[?1049l";
+const ANSI_HIDE_CURSOR: &str = "\u{1b}[?25l";
+const ANSI_SHOW_CURSOR: &str = "\u{1b}[?25h";
 const ANSI_RESET: &str = "\u{1b}[0m";
 const ANSI_BOLD: &str = "\u{1b}[1m";
 const ANSI_BLUE: &str = "\u{1b}[34m";
@@ -2116,6 +2171,114 @@ const ANSI_GRAY: &str = "\u{1b}[90m";
 
 fn colorize(value: &str, ansi: &str) -> String {
     format!("{ansi}{value}{ANSI_RESET}")
+}
+
+fn fit_terminal_frame(lines: Vec<String>, viewport: TerminalViewport) -> Vec<String> {
+    let columns = viewport.columns.max(1);
+    let rows = viewport.rows.max(1);
+    let total_lines = lines.len();
+    let mut fitted = lines
+        .into_iter()
+        .map(|line| fit_terminal_line(&line, columns))
+        .collect::<Vec<_>>();
+    if fitted.len() > rows {
+        fitted.truncate(rows.saturating_sub(1));
+        let hidden = total_lines.saturating_sub(rows.saturating_sub(1));
+        fitted.push(fit_terminal_line(
+            &format!("╰─ {hidden} more lines hidden; enlarge terminal"),
+            columns,
+        ));
+    }
+    fitted
+}
+
+fn fit_terminal_line(line: &str, columns: usize) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+
+    let plain = strip_ansi_sequences(line);
+    if plain.chars().count() <= columns {
+        return line.to_string();
+    }
+
+    truncate_plain_line(&plain, columns)
+}
+
+fn truncate_plain_line(value: &str, columns: usize) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+    if columns == 1 {
+        return "…".to_string();
+    }
+    let visible_columns = columns.saturating_sub(1);
+    let mut chars = value.chars();
+    let mut truncated = String::with_capacity(columns);
+    for _ in 0..visible_columns {
+        let Some(ch) = chars.next() else {
+            return value.to_string();
+        };
+        truncated.push(ch);
+    }
+    if chars.next().is_some() {
+        truncated.push('…');
+        truncated
+    } else {
+        value.to_string()
+    }
+}
+
+fn current_terminal_viewport() -> TerminalViewport {
+    terminal_viewport_from_stdout()
+        .or_else(terminal_viewport_from_env)
+        .unwrap_or(TerminalViewport {
+            columns: DEFAULT_TERMINAL_COLUMNS,
+            rows: DEFAULT_TERMINAL_ROWS,
+        })
+}
+
+fn terminal_viewport_from_env() -> Option<TerminalViewport> {
+    let columns = env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let rows = env::var("LINES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+
+    match (columns, rows) {
+        (Some(columns), Some(rows)) => Some(TerminalViewport { columns, rows }),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn terminal_viewport_from_stdout() -> Option<TerminalViewport> {
+    use std::os::fd::AsRawFd;
+
+    let stdout = io::stdout();
+    let fd = stdout.as_raw_fd();
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    let status = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+
+    let size = unsafe { size.assume_init() };
+    let columns = usize::from(size.ws_col);
+    let rows = usize::from(size.ws_row);
+    if columns == 0 || rows == 0 {
+        None
+    } else {
+        Some(TerminalViewport { columns, rows })
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_viewport_from_stdout() -> Option<TerminalViewport> {
+    None
 }
 
 const DASHBOARD_CSS: &str = r#"
@@ -2525,9 +2688,9 @@ mod tests {
     };
 
     use super::{
-        CodexTotalsPayload, RunningEntryPayload, StatePayload, TerminalDashboard, WorkflowPayload,
-        dashboard_url, humanize_blocking_reason, render_dashboard_html, render_offline_status,
-        render_terminal_dashboard, summarize_codex_message,
+        CodexTotalsPayload, RunningEntryPayload, StatePayload, TerminalDashboard, TerminalRenderer,
+        WorkflowPayload, dashboard_url, humanize_blocking_reason, render_dashboard_html,
+        render_offline_status, render_terminal_dashboard, summarize_codex_message,
     };
 
     #[test]
@@ -2572,13 +2735,59 @@ mod tests {
     #[test]
     fn terminal_dashboard_renders_live_sections() {
         let payload = sample_payload();
-        let rendered = render_terminal_dashboard(&payload, Some(132));
+        let rendered = render_terminal_dashboard(
+            &payload,
+            Some(super::TerminalViewport {
+                columns: 132,
+                rows: 32,
+            }),
+        );
         assert!(rendered.contains("SYMPHONY STATUS"));
         assert!(rendered.contains("Graph: "));
         assert!(rendered.contains("ABC-123"));
         assert!(rendered.contains("Backoff queue"));
         assert!(rendered.contains("Todoist Budget"));
         assert!(rendered.contains("24/300 remaining"));
+    }
+
+    #[test]
+    fn terminal_dashboard_respects_viewport_width() {
+        let payload = sample_payload();
+        let rendered = render_terminal_dashboard(
+            &payload,
+            Some(super::TerminalViewport {
+                columns: 72,
+                rows: 32,
+            }),
+        );
+
+        for line in rendered.lines() {
+            assert!(
+                super::strip_ansi_sequences(line).chars().count() <= 72,
+                "line exceeded viewport width: {:?}",
+                super::strip_ansi_sequences(line)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_dashboard_clips_to_viewport_height() {
+        let payload = sample_payload();
+        let rendered = render_terminal_dashboard(
+            &payload,
+            Some(super::TerminalViewport {
+                columns: 132,
+                rows: 8,
+            }),
+        );
+
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 8);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.contains("more lines hidden"))
+        );
     }
 
     #[test]
@@ -3047,9 +3256,13 @@ mod tests {
         let renders = Arc::new(AtomicUsize::new(0));
         let renderer = {
             let renders = Arc::clone(&renders);
-            Arc::new(move |_content: String| {
-                renders.fetch_add(1, Ordering::SeqCst);
-            })
+            TerminalRenderer {
+                init: Arc::new(|| {}),
+                render: Arc::new(move |_content: String| {
+                    renders.fetch_add(1, Ordering::SeqCst);
+                }),
+                shutdown: Arc::new(|| {}),
+            }
         };
 
         let dashboard = TerminalDashboard::start_with_renderer(
@@ -3077,9 +3290,13 @@ mod tests {
         let renders = Arc::new(AtomicUsize::new(0));
         let renderer = {
             let renders = Arc::clone(&renders);
-            Arc::new(move |_content: String| {
-                renders.fetch_add(1, Ordering::SeqCst);
-            })
+            TerminalRenderer {
+                init: Arc::new(|| {}),
+                render: Arc::new(move |_content: String| {
+                    renders.fetch_add(1, Ordering::SeqCst);
+                }),
+                shutdown: Arc::new(|| {}),
+            }
         };
 
         let handle = orchestrator.handle();
@@ -3108,6 +3325,46 @@ mod tests {
         dashboard.shutdown().await;
         orchestrator.shutdown().await;
         assert!(renders.load(Ordering::SeqCst) <= initial + 2);
+    }
+
+    #[test]
+    fn render_terminal_frame_clears_without_trailing_newline() {
+        let mut bytes = Vec::new();
+        super::render_terminal_frame_into(&mut bytes, "line 1\nline 2").expect("frame");
+        let rendered = String::from_utf8(bytes).expect("utf8");
+        assert!(rendered.starts_with(super::ANSI_HOME));
+        assert!(rendered.contains(super::ANSI_HOME));
+        assert!(rendered.contains(super::ANSI_CLEAR));
+        assert!(rendered.contains("line 1\nline 2"));
+        assert!(!rendered.ends_with("\n"));
+    }
+
+    #[test]
+    fn alternate_screen_init_and_shutdown_emit_expected_sequences() {
+        let mut init = Vec::new();
+        let mut shutdown = Vec::new();
+        super::enter_alternate_screen_into(&mut init).expect("init");
+        super::leave_alternate_screen_into(&mut shutdown).expect("shutdown");
+
+        let init = String::from_utf8(init).expect("utf8");
+        let shutdown = String::from_utf8(shutdown).expect("utf8");
+
+        assert_eq!(
+            init,
+            format!(
+                "{}{}",
+                super::ANSI_ENTER_ALTERNATE_SCREEN,
+                super::ANSI_HIDE_CURSOR
+            )
+        );
+        assert_eq!(
+            shutdown,
+            format!(
+                "{}{}",
+                super::ANSI_SHOW_CURSOR,
+                super::ANSI_LEAVE_ALTERNATE_SCREEN
+            )
+        );
     }
 
     fn sample_payload() -> StatePayload {
