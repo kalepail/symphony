@@ -46,8 +46,7 @@ Prefer these sources in order:
 4. `references/api-sources.md`
 
 Use `references/api-sources.md` first when the Todoist version story looks
-confusing. It records the current official source hierarchy and links the exact
-vendor pages.
+confusing. It records the forward-looking source hierarchy for this skill.
 
 When you need more examples than this file includes, read
 `references/action-recipes.md`.
@@ -253,6 +252,5 @@ Load `references/action-recipes.md` when you need:
 
 Load `references/api-sources.md` when you need:
 
-- the authoritative Todoist doc URLs
-- current version-status guidance
-- deprecated-vs-current API clarification
+- the authoritative Todoist doc URL
+- the current source hierarchy for vendor docs vs local runtime behavior

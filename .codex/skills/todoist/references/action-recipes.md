@@ -39,6 +39,25 @@ List labels:
 }
 ```
 
+Read one project directly:
+
+```json
+{
+  "action": "get_project",
+  "project_id": "6Jf8VQXxpwv56VQ7"
+}
+```
+
+List project collaborators:
+
+```json
+{
+  "action": "list_collaborators",
+  "project_id": "6Jf8VQXxpwv56VQ7",
+  "limit": 100
+}
+```
+
 ## Query sections, tasks, and filters
 
 Read one section directly:
@@ -217,6 +236,10 @@ List recent activity for a project:
 Activity logs are cursor-paginated and plan-dependent.
 
 ## Reminder recipes
+
+Reminder availability is plan-dependent. In the Rust Todoist runtime, reminder
+flows may still be backed by official API v1 `/api/v1/sync` operations even
+though the runtime itself is on the API v1 family.
 
 List reminders:
 
