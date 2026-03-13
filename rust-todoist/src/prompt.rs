@@ -4,20 +4,10 @@ use thiserror::Error;
 
 use crate::{issue::Issue, workflow::WorkflowDefinition};
 
-const DEFAULT_PROMPT: &str = r#"You are working on a Todoist task.
-
-Identifier: {{ issue.identifier }}
-Title: {{ issue.title }}
-
-Body:
-{% if issue.description %}
-{{ issue.description }}
-{% else %}
-No description provided.
-{% endif %}"#;
-
 #[derive(Debug, Error)]
 pub enum PromptError {
+    #[error("template_empty")]
+    TemplateEmpty,
     #[error("template_parse_error {0}")]
     TemplateParse(String),
     #[error("template_render_error {0}")]
@@ -29,11 +19,10 @@ pub fn build_issue_prompt(
     issue: &Issue,
     attempt: Option<u32>,
 ) -> Result<String, PromptError> {
-    let template_source = if workflow.prompt_template.trim().is_empty() {
-        DEFAULT_PROMPT
-    } else {
-        workflow.prompt_template.as_str()
-    };
+    let template_source = workflow.prompt_template.trim();
+    if template_source.is_empty() {
+        return Err(PromptError::TemplateEmpty);
+    }
 
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
@@ -108,5 +97,23 @@ mod tests {
 
         let error = build_issue_prompt(&workflow, &issue, None).unwrap_err();
         assert!(matches!(error, PromptError::TemplateRender(_)));
+    }
+
+    #[test]
+    fn rejects_empty_templates() {
+        let workflow = WorkflowDefinition {
+            config: json!({}).as_object().expect("object").clone(),
+            prompt_template: "   ".to_string(),
+        };
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let error = build_issue_prompt(&workflow, &issue, None).unwrap_err();
+        assert!(matches!(error, PromptError::TemplateEmpty));
     }
 }

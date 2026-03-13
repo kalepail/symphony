@@ -126,7 +126,7 @@ impl ServiceConfig {
         let codex = parse_codex_config(config.get("codex"), &workspace.root)?;
         let server = parse_server_config(config.get("server"))?;
 
-        Ok(Self {
+        let config = Self {
             tracker,
             polling,
             observability,
@@ -136,7 +136,9 @@ impl ServiceConfig {
             agent,
             codex,
             server,
-        })
+        };
+        config.validate_state_topology()?;
+        Ok(config)
     }
 
     pub fn validate_dispatch_ready(&self) -> Result<(), ConfigError> {
@@ -193,6 +195,29 @@ impl ServiceConfig {
             .get(&state_key)
             .copied()
             .unwrap_or(self.agent.max_concurrent_agents)
+    }
+
+    fn validate_state_topology(&self) -> Result<(), ConfigError> {
+        let active = self.active_state_set();
+        let terminal = self.terminal_state_set();
+        let overlap = active.intersection(&terminal).cloned().collect::<Vec<_>>();
+        if !overlap.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "tracker.active_states and tracker.terminal_states must not overlap: {}",
+                overlap.join(", ")
+            )));
+        }
+
+        if matches!(self.tracker.kind.as_deref(), Some("todoist" | "memory"))
+            && active.contains("human review")
+        {
+            return Err(ConfigError::Invalid(
+                "tracker.active_states must not include `Human Review`; it is a handoff state"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1037,5 +1062,50 @@ mod tests {
 
         assert_eq!(config.workspace.root_raw, "~/remote-workspaces");
         assert!(config.workspace.root.is_absolute());
+    }
+
+    #[test]
+    fn rejects_overlapping_active_and_terminal_states() {
+        let error = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj",
+                    "active_states": ["Todo", "Done"],
+                    "terminal_states": ["Done"]
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid_workflow_config tracker.active_states and tracker.terminal_states must not overlap: done"
+        );
+    }
+
+    #[test]
+    fn rejects_human_review_as_active_state() {
+        let error = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "todoist",
+                    "api_key": "token",
+                    "project_id": "proj",
+                    "active_states": ["Todo", "Human Review"]
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid_workflow_config tracker.active_states must not include `Human Review`; it is a handoff state"
+        );
     }
 }

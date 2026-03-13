@@ -59,6 +59,10 @@ pub enum WorkflowError {
     MissingWorkflowFile { path: PathBuf, reason: String },
     #[error("workflow_front_matter_not_a_map")]
     FrontMatterNotMap,
+    #[error("workflow_front_matter_not_terminated")]
+    FrontMatterNotTerminated,
+    #[error("workflow_prompt_empty")]
+    PromptEmpty,
     #[error("workflow_parse_error {0}")]
     Parse(String),
     #[error("{0}")]
@@ -243,7 +247,7 @@ fn parse_workflow(raw: &str) -> Result<WorkflowDefinition, WorkflowError> {
         let end = rest.iter().position(|line| *line == "---");
         match end {
             Some(index) => (&rest[..index], &rest[index + 1..]),
-            None => (rest, &[][..]),
+            None => return Err(WorkflowError::FrontMatterNotTerminated),
         }
     } else {
         (&[][..], lines.as_slice())
@@ -267,6 +271,9 @@ fn parse_workflow(raw: &str) -> Result<WorkflowDefinition, WorkflowError> {
     };
 
     let prompt_template = prompt_lines.join("\n").trim().to_string();
+    if prompt_template.is_empty() {
+        return Err(WorkflowError::PromptEmpty);
+    }
     Ok(WorkflowDefinition {
         config,
         prompt_template,
@@ -277,7 +284,6 @@ fn parse_workflow(raw: &str) -> Result<WorkflowDefinition, WorkflowError> {
 mod tests {
     use std::{env, fs};
 
-    use serde_json::Value;
     use tempfile::tempdir;
 
     use super::{WorkflowError, fingerprint_for, parse_workflow};
@@ -290,18 +296,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_unterminated_front_matter() {
-        let parsed = parse_workflow("---\ntracker:\n  kind: todoist\n")
-            .expect("unterminated front matter should parse");
-        assert_eq!(parsed.prompt_template, "");
-        assert_eq!(
-            parsed
-                .config
-                .get("tracker")
-                .and_then(|value| value.get("kind"))
-                .and_then(Value::as_str),
-            Some("todoist")
-        );
+    fn rejects_unterminated_front_matter() {
+        let error = parse_workflow("---\ntracker:\n  kind: todoist\n").unwrap_err();
+        assert!(matches!(error, WorkflowError::FrontMatterNotTerminated));
+    }
+
+    #[test]
+    fn rejects_empty_prompt_body() {
+        let error = parse_workflow("---\ntracker:\n  kind: todoist\n---\n").unwrap_err();
+        assert!(matches!(error, WorkflowError::PromptEmpty));
     }
 
     #[test]
@@ -375,6 +378,7 @@ mod tests {
         unsafe {
             env::set_var("TODOIST_API_TOKEN", "token");
             env::set_var("SYMPHONY_WORKSPACE_ROOT", workspace_root.path());
+            env::set_var("SYMPHONY_TODOIST_PROJECT_ID", "todoist-proj");
             env::set_var("SYMPHONY_SMOKE_PROJECT_ID", "smoke-proj");
         }
 
@@ -401,6 +405,7 @@ mod tests {
         unsafe {
             env::remove_var("TODOIST_API_TOKEN");
             env::remove_var("SYMPHONY_WORKSPACE_ROOT");
+            env::remove_var("SYMPHONY_TODOIST_PROJECT_ID");
             env::remove_var("SYMPHONY_SMOKE_PROJECT_ID");
         }
     }

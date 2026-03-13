@@ -1028,7 +1028,16 @@ fn compact_workpad_content(content: &str) -> String {
         return content.to_string();
     }
 
-    let preferred_sections = ["Plan", "Status", "Blockers", "Validation", "Handoff"];
+    let preferred_sections = [
+        "Plan",
+        "Acceptance Criteria",
+        "Status",
+        "Blockers",
+        "Validation",
+        "Notes",
+        "Handoff",
+        "Confusions",
+    ];
     let pr_url = extract_github_pr_url(content);
     let sections = parse_workpad_sections(content);
     let mut rebuilt = vec![
@@ -2689,16 +2698,19 @@ mod tests {
 
     #[test]
     fn compact_workpad_content_preserves_key_sections_within_comment_limit() {
-        let repeated = "x".repeat(TODOIST_COMMENT_SIZE_LIMIT / 2);
+        let repeated = "x".repeat(TODOIST_COMMENT_SIZE_LIMIT / 3);
         let content = format!(
-            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\n## Plan\n\n{repeated}\n\n## Status\n\n{repeated}\n\n## Notes\n\n{repeated}\n\nLinked PR: https://github.com/example/repo/pull/42"
+            "## Codex Workpad\n\n<!-- symphony:workpad -->\n\n## Plan\n\n{repeated}\n\n## Acceptance Criteria\n\n{repeated}\n\n## Validation\n\n{repeated}\n\n## Notes\n\n{repeated}\n\n## Confusions\n\n{repeated}\n\n## Scratch\n\n{repeated}\n\nLinked PR: https://github.com/example/repo/pull/42"
         );
 
         let compacted = compact_workpad_content(&content);
 
         assert!(compacted.len() <= TODOIST_COMMENT_SIZE_LIMIT);
         assert!(compacted.contains("## Plan"));
-        assert!(compacted.contains("## Status"));
+        assert!(compacted.contains("## Acceptance Criteria"));
+        assert!(compacted.contains("## Validation"));
+        assert!(compacted.contains("## Notes"));
+        assert!(compacted.contains("## Confusions"));
         assert!(compacted.contains("## Compacted History"));
         assert!(compacted.contains("https://github.com/example/repo/pull/42"));
     }

@@ -2197,6 +2197,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_candidate_issues_normalizes_task_labels_to_lowercase() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [
+    {"id":"task-1","content":"Parent","project_id":"proj","section_id":"sec-todo","labels":["Backend"," Ops "]}
+  ],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"}
+  ],
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        let issues = tracker.fetch_candidate_issues().await.expect("issues");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].labels, vec!["backend", "ops"]);
+    }
+
+    #[tokio::test]
     async fn memory_tracker_supports_todoist_tool_mutations() {
         let dir = tempdir().expect("tempdir");
         let fixture = dir.path().join("state.json");

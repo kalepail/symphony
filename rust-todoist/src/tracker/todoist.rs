@@ -1876,7 +1876,9 @@ pub(crate) fn normalize_task(
                 labels
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(|label| label.to_ascii_lowercase())
                     .collect()
             })
             .unwrap_or_default(),
@@ -2626,7 +2628,7 @@ mod tests {
             "project_id": "proj-1",
             "section_id": "todo-section",
             "parent_id": "parent-1",
-            "labels": ["backend"],
+            "labels": ["Backend", " Ops "],
             "due": { "date": "2026-03-12" },
             "deadline": { "date": "2026-03-13" }
         });
@@ -2641,6 +2643,7 @@ mod tests {
         assert_eq!(issue.project_id.as_deref(), Some("proj-1"));
         assert_eq!(issue.parent_id.as_deref(), Some("parent-1"));
         assert!(issue.is_subtask);
+        assert_eq!(issue.labels, vec!["backend", "ops"]);
         assert_eq!(
             issue
                 .due
