@@ -56,9 +56,9 @@ Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
 Current status: {{ issue.state }}
 Labels: {{ issue.labels }}
-URL: {{ issue.url }}
+URL: {% if issue.url is defined and issue.url %}{{ issue.url }}{% else %}n/a{% endif %}
 Task type: {% if issue.is_subtask %}Subtask{% else %}Top-level task{% endif %}
-Assignee: {% if issue.assignee_id %}{{ issue.assignee_id }}{% else %}unassigned{% endif %}
+Assignee: {% if issue.assignee_id is defined and issue.assignee_id %}{{ issue.assignee_id }}{% else %}unassigned{% endif %}
 
 Description:
 {% if issue.description %}

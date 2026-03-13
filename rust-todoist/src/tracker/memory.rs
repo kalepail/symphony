@@ -157,10 +157,7 @@ impl MemoryTracker {
             .unwrap_or(is_shared);
 
         if !can_assign_tasks {
-            return Err(TrackerError::TodoistAssigneeNotResolvable {
-                assignee,
-                project_id,
-            });
+            return Ok(None);
         }
 
         if is_shared {
@@ -2414,7 +2411,10 @@ mod tests {
             &fixture,
             r#"{
   "tasks": [],
-  "sections": [{"id":"sec-todo","project_id":"proj","name":"Todo"}],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"},
+    {"id":"sec-progress","project_id":"proj","name":"In Progress"}
+  ],
   "user_plan_limits": {"comments": false}
 }"#,
         )
@@ -2482,6 +2482,47 @@ mod tests {
             error.to_string(),
             "todoist_assignee_not_resolvable assignee=user-2 project_id=proj"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_ignores_assignee_in_personal_project() {
+        let dir = tempdir().expect("tempdir");
+        let fixture = dir.path().join("state.json");
+        std::fs::write(
+            &fixture,
+            r#"{
+  "tasks": [],
+  "sections": [
+    {"id":"sec-todo","project_id":"proj","name":"Todo"},
+    {"id":"sec-progress","project_id":"proj","name":"In Progress"}
+  ],
+  "projects": [{"id":"proj","name":"Personal Project","is_shared":false,"can_assign_tasks":false}],
+  "collaborators": [],
+  "current_user": {"id":"user-1","name":"Memory User"},
+  "user_plan_limits": {"comments": true}
+}"#,
+        )
+        .expect("fixture");
+
+        let config = ServiceConfig::from_map(
+            json!({
+                "tracker": {
+                    "kind": "memory",
+                    "fixture_path": fixture,
+                    "project_id": "proj",
+                    "assignee": "me"
+                }
+            })
+            .as_object()
+            .expect("object"),
+        )
+        .expect("config");
+
+        let tracker = MemoryTracker::new(config);
+        tracker
+            .validate_startup()
+            .await
+            .expect("personal project should ignore assignee");
     }
 
     #[tokio::test]

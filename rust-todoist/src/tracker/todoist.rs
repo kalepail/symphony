@@ -889,10 +889,7 @@ impl TodoistTracker {
         let capabilities = Self::project_assignment_capabilities(project);
 
         if !capabilities.can_assign_tasks {
-            return Err(TrackerError::TodoistAssigneeNotResolvable {
-                assignee,
-                project_id: project_id.to_string(),
-            });
+            return Ok(None);
         }
 
         if assignee == "me" {
@@ -2948,6 +2945,32 @@ mod tests {
             error.to_string(),
             "todoist_assignee_not_resolvable assignee=user-2 project_id=proj"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_ignores_assignee_for_personal_project() {
+        let server = spawn_mock_todoist(MockTodoistState {
+            project: json!({
+                "id": "proj",
+                "is_shared": false,
+                "can_assign_tasks": false
+            }),
+            sections: vec![
+                json!({"id": "sec-todo", "project_id": "proj", "name": "Todo"}),
+                json!({"id": "sec-progress", "project_id": "proj", "name": "In Progress"}),
+            ],
+            collaborators: Vec::new(),
+            current_user: json!({"id": "user-1"}),
+            plan_limits: json!({"comments": true}),
+        })
+        .await;
+
+        let tracker = TodoistTracker::new(tracker_config(&server.base_url, Some("me")));
+
+        tracker
+            .validate_startup()
+            .await
+            .expect("personal project should ignore assignee");
     }
 
     #[tokio::test]

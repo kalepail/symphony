@@ -6,7 +6,8 @@ tracker:
   project_id: $SYMPHONY_TODOIST_PROJECT_ID
   # Optional: set `label` when one runtime should own only part of a shared project.
   # label: symphony-runtime
-  # Optional: when the Todoist project is shared and supports assignment.
+  # Optional: leave unset for the common personal-project case.
+  # Only set this when the Todoist project is shared and assignment-based routing is intentional.
   # assignee: me
   # `Human Review` is a handoff state, not an active dispatch state.
   active_states:
@@ -67,11 +68,11 @@ Identifier: {{ issue.identifier }}
 Title: {{ issue.title }}
 Current status: {{ issue.state }}
 Labels: {{ issue.labels }}
-URL: {{ issue.url }}
+URL: {% if issue.url is defined and issue.url %}{{ issue.url }}{% else %}n/a{% endif %}
 Task type: {% if issue.is_subtask %}Subtask{% else %}Top-level task{% endif %}
-Assignee: {% if issue.assignee_id %}{{ issue.assignee_id }}{% else %}unassigned{% endif %}
-Due: {% if issue.due %}{{ issue.due }}{% else %}none{% endif %}
-Deadline: {% if issue.deadline %}{{ issue.deadline }}{% else %}none{% endif %}
+Assignee: {% if issue.assignee_id is defined and issue.assignee_id %}{{ issue.assignee_id }}{% else %}unassigned{% endif %}
+Due: {% if issue.due is defined and issue.due %}{{ issue.due }}{% else %}none{% endif %}
+Deadline: {% if issue.deadline is defined and issue.deadline %}{{ issue.deadline }}{% else %}none{% endif %}
 
 Description:
 {% if issue.description %}

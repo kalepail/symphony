@@ -116,4 +116,31 @@ mod tests {
         let error = build_issue_prompt(&workflow, &issue, None).unwrap_err();
         assert!(matches!(error, PromptError::TemplateEmpty));
     }
+
+    #[test]
+    fn guarded_optional_issue_fields_render_when_omitted() {
+        let workflow = WorkflowDefinition {
+            config: json!({}).as_object().expect("object").clone(),
+            prompt_template: r#"
+URL: {% if issue.url is defined and issue.url %}{{ issue.url }}{% else %}n/a{% endif %}
+Assignee: {% if issue.assignee_id is defined and issue.assignee_id %}{{ issue.assignee_id }}{% else %}unassigned{% endif %}
+Due: {% if issue.due is defined and issue.due %}{{ issue.due }}{% else %}none{% endif %}
+Deadline: {% if issue.deadline is defined and issue.deadline %}{{ issue.deadline }}{% else %}none{% endif %}
+"#
+            .to_string(),
+        };
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Title".to_string(),
+            state: "Todo".to_string(),
+            ..Issue::default()
+        };
+
+        let prompt = build_issue_prompt(&workflow, &issue, None).expect("render prompt");
+        assert!(prompt.contains("URL: n/a"));
+        assert!(prompt.contains("Assignee: unassigned"));
+        assert!(prompt.contains("Due: none"));
+        assert!(prompt.contains("Deadline: none"));
+    }
 }
