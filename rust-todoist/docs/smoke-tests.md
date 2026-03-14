@@ -2,6 +2,12 @@
 
 This document defines the live smoke matrix for the Rust runtime against the dedicated GitHub smoke repository [kalepail/symphony-smoke-lab](https://github.com/kalepail/symphony-smoke-lab).
 
+Helper ownership for this document:
+
+- Root [`scripts/`](../../scripts/README.md) is shared smoke infrastructure for the main repo, including the reset helper and the checked-in smoke repo fixture.
+- Runtime-local [`rust-todoist/scripts/`](../scripts) contains only Rust Todoist helper scripts.
+- [`scripts/smoke_repo_baseline/`](../../scripts/smoke_repo_baseline) is a fixture representing the root of the external smoke repo, not an application module in this repo.
+
 ## Repository
 
 - Repo: `kalepail/symphony-smoke-lab`
@@ -60,7 +66,8 @@ This verifies both the `gh` path and the direct GitHub REST fallback against the
 - Full live smoke: [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md)
 - Repo-owned live E2E harness: [tests/live_e2e.rs](./tests/live_e2e.rs)
   - Includes dedicated local and SSH-worker variants for the lightweight disposable Todoist handoff smoke, the repo-backed minimal smoke workflow, and the full parity smoke that exercises PR creation, automated `Human Review` approval, `Merging`, verified merge, and guarded `todoist.close_task`.
-- Shared-state cleanup helper: [../scripts/reset_smoke_state.py](../scripts/reset_smoke_state.py)
+- Shared-state cleanup helper: [../../scripts/reset_smoke_state.py](../../scripts/reset_smoke_state.py)
+- Runtime-local operator preflight: [../scripts/github_publish_preflight.sh](../scripts/github_publish_preflight.sh)
 
 ## Observability Evidence
 
@@ -154,7 +161,7 @@ Run a high-fidelity Symphony smoke test against the dedicated smoke repository.
 
 - Keep this repo disposable. Branch churn, PR churn, and squash merges are expected.
 - Reset the shared smoke environment before a fresh smoke round with `python3 ../scripts/reset_smoke_state.py`.
-  - This restores the smoke repo baseline, closes open smoke PRs, deletes disposable smoke branches, clears tasks from the configured smoke Todoist project, and deletes disposable Rust Todoist live-E2E projects left behind by aborted runs. To protect active Todoist projects from cleanup, set `SYMPHONY_SMOKE_PROTECT_PROJECT_IDS` to a comma-separated list of project ids before running the reset helper.
+  - This restores the smoke repo baseline from [`scripts/smoke_repo_baseline/`](../../scripts/smoke_repo_baseline), closes open smoke PRs, deletes disposable smoke branches, clears tasks from the configured smoke Todoist project, and deletes disposable Rust Todoist live-E2E projects left behind by aborted runs. To protect active Todoist projects from cleanup, set `SYMPHONY_SMOKE_PROTECT_PROJECT_IDS` to a comma-separated list of project ids before running the reset helper.
 - Prefer bounded smoke issues with explicit acceptance criteria so failures are attributable.
 - When a smoke run fails, capture the issue identifier, PR URL if one exists, and the relevant `log/symphony.log` slice before retrying.
 - Capture `/api/v1/state` and at least one `/api/v1/stream` event payload during full observability parity runs so API, web, and terminal evidence line up.

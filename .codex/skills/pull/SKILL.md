@@ -30,7 +30,12 @@ description:
 7. If conflicts appear, resolve them (see conflict guidance below), then:
    - `git add <files>`
    - `git commit` (or `git merge --continue` if the merge is paused)
-8. Verify with project checks (follow repo policy in `AGENTS.md`).
+8. Verify with project checks:
+   - Prefer the Rust Todoist gate for this fork:
+     `cargo fmt --manifest-path rust-todoist/Cargo.toml --check`
+     `cargo clippy --manifest-path rust-todoist/Cargo.toml --all-targets --all-features -- -D warnings`
+     `cargo test --manifest-path rust-todoist/Cargo.toml`
+   - If the merge touched `elixir/`, also run `make -C elixir all`.
 9. Summarize the merge:
    - Call out the most challenging conflicts/files and how they were resolved.
    - Note any assumptions or follow-ups.

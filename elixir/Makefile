@@ -1,9 +1,9 @@
-.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e
+.PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e pr-body-check
 
-MIX ?= mix
+MIX ?= $(shell if command -v mix >/dev/null 2>&1; then printf '%s\n' mix; elif command -v mise >/dev/null 2>&1; then printf '%s\n' "mise exec -- mix"; else printf '%s\n' mix; fi)
 
 help:
-	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, ci"
+	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, pr-body-check, ci"
 
 setup:
 	$(MIX) setup
@@ -48,6 +48,13 @@ e2e:
 		exit 1; \
 	fi; \
 	SYMPHONY_RUN_LIVE_E2E=1 $(MIX) test test/symphony_elixir/live_e2e_test.exs
+
+pr-body-check:
+	@if [ -z "$(FILE)" ]; then \
+		echo "FILE is required, e.g. make pr-body-check FILE=/tmp/pr_body.md"; \
+		exit 1; \
+	fi
+	$(MIX) pr_body.check --file "$(FILE)"
 
 ci:
 	$(MAKE) setup

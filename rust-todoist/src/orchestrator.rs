@@ -101,6 +101,7 @@ struct PublishedSnapshot {
 }
 
 struct RunningEntry {
+    run_id: String,
     issue: Issue,
     identifier: String,
     workspace_path: PathBuf,
@@ -116,6 +117,8 @@ struct RunningEntry {
     codex_input_tokens: u64,
     codex_output_tokens: u64,
     codex_total_tokens: u64,
+    last_token_delta: u64,
+    last_token_source: Option<String>,
     last_reported_input_tokens: u64,
     last_reported_output_tokens: u64,
     last_reported_total_tokens: u64,
@@ -127,6 +130,7 @@ struct RunningEntry {
 }
 
 struct RetryEntry {
+    run_id: Option<String>,
     attempt: u32,
     due_at: Instant,
     identifier: String,
@@ -141,6 +145,7 @@ struct RetryEntry {
 
 struct RetryRequest {
     issue_id: String,
+    run_id: Option<String>,
     attempt: u32,
     identifier: String,
     tracked_issue: Option<Issue>,
@@ -329,6 +334,7 @@ pub struct SnapshotCounts {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningSnapshot {
+    pub run_id: String,
     pub issue_id: String,
     pub issue_identifier: String,
     pub title: String,
@@ -378,6 +384,10 @@ pub struct TokenSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub token_total: u64,
+    pub token_delta: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -420,6 +430,30 @@ pub struct TurnStartContextSnapshot {
     pub preloaded_comment_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preloaded_comment_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_preload_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_tool_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub tool_call_count_by_tool: BTreeMap<String, u32>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub tool_call_count_by_action: BTreeMap<String, u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub repeated_action_summary: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_execution_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_service: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -452,6 +486,7 @@ pub struct AttemptDetail {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningDetail {
+    pub run_id: String,
     pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
@@ -495,7 +530,7 @@ enum Command {
     },
     WorkerTurnContext {
         issue_id: String,
-        turn_context: TurnStartContextSnapshot,
+        turn_context: Box<TurnStartContextSnapshot>,
     },
     WorkerUpdate {
         issue_id: String,
@@ -611,7 +646,7 @@ impl Orchestrator {
                         issue_id,
                         turn_context,
                     } => {
-                        integrate_worker_turn_context(&mut state, &issue_id, turn_context);
+                        integrate_worker_turn_context(&mut state, &issue_id, *turn_context);
                         notify_observers(
                             &updates_tx,
                             &mut update_version,
@@ -982,9 +1017,7 @@ fn snapshot_stale_after(snapshot: &Snapshot) -> Duration {
 
     let poll_interval_ms = snapshot.polling.poll_interval_ms.max(1);
     let stale_after_ms = if snapshot.polling.checking {
-        poll_interval_ms
-            .min(MAX_CHECKING_STALE_AFTER_MS)
-            .max(STALE_GRACE_MS)
+        poll_interval_ms.clamp(STALE_GRACE_MS, MAX_CHECKING_STALE_AFTER_MS)
     } else if let Some(next_poll_in_ms) = snapshot.polling.next_poll_in_ms {
         next_poll_in_ms.saturating_add(STALE_GRACE_MS)
     } else {
@@ -1318,13 +1351,29 @@ async fn reconcile_stalled_runs(
                 .clone()
                 .unwrap_or_else(|| "n/a".to_string());
             let identifier = running.identifier.clone();
+            let run_id = running.run_id.clone();
             let tracked_issue = running.issue.clone();
             let worker_host = running.worker_host.clone();
             let workspace_location = running.workspace_location.clone();
             warn!(
-                "reconcile=status=stalled issue_id={} issue_identifier={} elapsed_ms={} session_id={}",
-                issue_id, identifier, elapsed_ms, session_id
+                "reconcile=status=stalled {} elapsed_ms={} session_id={}",
+                crate::logging::run_context(&issue_id, &identifier, &run_id),
+                elapsed_ms,
+                session_id
             );
+            if let Some(context) = state
+                .context_metrics
+                .get(&issue_id)
+                .and_then(|context| context.last_turn_start.as_ref())
+            {
+                log_turn_summary(
+                    &run_id,
+                    &tracked_issue,
+                    worker_host.as_deref(),
+                    context,
+                    "stalled",
+                );
+            }
             let next_attempt = if running.retry_attempt > 0 {
                 running.retry_attempt + 1
             } else {
@@ -1336,6 +1385,7 @@ async fn reconcile_stalled_runs(
                 state,
                 RetryRequest {
                     issue_id: issue_id.clone(),
+                    run_id: Some(run_id),
                     attempt: next_attempt,
                     identifier,
                     tracked_issue: Some(tracked_issue),
@@ -1586,14 +1636,17 @@ async fn dispatch_issue(
             let workflow_store = workflow_store.clone();
             let cancel_clone = cancel.clone();
             let retry_attempt = attempt.unwrap_or(0);
+            let run_id = format!("run-{}-{}", issue_id, Utc::now().timestamp_millis());
             let worker_issue = issue.clone();
             let worker_issue_id = issue_id.clone();
             let worker_host_for_task = worker_host.clone();
+            let run_id_for_task = run_id.clone();
             let join = tokio::spawn(async move {
                 let result = run_worker(
                     workflow_store,
                     worker_issue,
                     attempt,
+                    run_id_for_task,
                     worker_host_for_task,
                     cancel_clone,
                     join_tx.clone(),
@@ -1610,6 +1663,7 @@ async fn dispatch_issue(
             state.running.insert(
                 issue_id.clone(),
                 RunningEntry {
+                    run_id: run_id.clone(),
                     issue,
                     identifier: issue_identifier.clone(),
                     workspace_path,
@@ -1625,6 +1679,8 @@ async fn dispatch_issue(
                     codex_input_tokens: 0,
                     codex_output_tokens: 0,
                     codex_total_tokens: 0,
+                    last_token_delta: 0,
+                    last_token_source: None,
                     last_reported_input_tokens: 0,
                     last_reported_output_tokens: 0,
                     last_reported_total_tokens: 0,
@@ -1639,9 +1695,8 @@ async fn dispatch_issue(
             state.claimed.insert(issue_id.clone());
             state.retry_attempts.remove(&issue_id);
             info!(
-                "dispatch=status=started issue_id={} issue_identifier={} attempt={} worker_host={}",
-                issue_id,
-                issue_identifier,
+                "dispatch=status=started {} attempt={} worker_host={}",
+                crate::logging::run_context(&issue_id, &issue_identifier, &run_id),
                 retry_attempt,
                 worker_host.as_deref().unwrap_or("local")
             );
@@ -1679,6 +1734,7 @@ fn handle_worker_exit(
                 state,
                 RetryRequest {
                     issue_id: issue_id.to_string(),
+                    run_id: Some(running.run_id.clone()),
                     attempt: 1,
                     identifier: running.identifier.clone(),
                     tracked_issue: Some(issue.clone()),
@@ -1691,17 +1747,18 @@ fn handle_worker_exit(
                 },
             );
             info!(
-                "worker=status=completed issue_id={} issue_identifier={} session_id={} continuation=queued next_state={}",
-                issue_id, running.identifier, session_id, issue.state
+                "worker=status=completed {} session_id={} continuation=queued continuation_reason=max_turns_reached_issue_still_active next_state={}",
+                crate::logging::run_context(issue_id, &running.identifier, &running.run_id),
+                session_id,
+                issue.state
             );
         }
         Ok(WorkerDisposition::Quiesced { issue }) => {
             state.claimed.remove(issue_id);
             state.retry_attempts.remove(issue_id);
             info!(
-                "worker=status=quiesced issue_id={} issue_identifier={} session_id={} final_state={}",
-                issue_id,
-                running.identifier,
+                "worker=status=quiesced {} session_id={} final_state={}",
+                crate::logging::run_context(issue_id, &running.identifier, &running.run_id),
                 session_id,
                 issue
                     .as_ref()
@@ -1720,6 +1777,7 @@ fn handle_worker_exit(
                 state,
                 RetryRequest {
                     issue_id: issue_id.to_string(),
+                    run_id: Some(running.run_id.clone()),
                     attempt,
                     identifier: running.identifier.clone(),
                     tracked_issue: Some(running.issue.clone()),
@@ -1732,8 +1790,10 @@ fn handle_worker_exit(
                 },
             );
             warn!(
-                "worker=status=failed issue_id={} issue_identifier={} session_id={} error={}",
-                issue_id, running.identifier, session_id, error
+                "worker=status=failed {} session_id={} error={}",
+                crate::logging::run_context(issue_id, &running.identifier, &running.run_id),
+                session_id,
+                error
             );
         }
     }
@@ -1814,6 +1874,7 @@ async fn handle_retry_issue_with_tracker(
                             state,
                             RetryRequest {
                                 issue_id: issue.id.clone(),
+                                run_id: retry_entry.run_id.clone(),
                                 attempt: retry_entry.attempt + 1,
                                 identifier: issue.identifier.clone(),
                                 tracked_issue: Some(issue.clone()),
@@ -1839,6 +1900,7 @@ async fn handle_retry_issue_with_tracker(
                 state,
                 RetryRequest {
                     issue_id: issue_id.to_string(),
+                    run_id: retry_entry.run_id.clone(),
                     attempt: retry_entry.attempt + 1,
                     identifier: retry_entry.identifier,
                     tracked_issue: retry_entry.tracked_issue.clone(),
@@ -1911,6 +1973,7 @@ fn guarded_close_transition_may_be_in_flight(issue: &Issue) -> bool {
 fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryRequest) {
     let RetryRequest {
         issue_id,
+        run_id,
         attempt,
         identifier,
         tracked_issue,
@@ -1952,6 +2015,7 @@ fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryR
     state.retry_attempts.insert(
         issue_id.clone(),
         RetryEntry {
+            run_id: run_id.clone(),
             attempt,
             due_at: Instant::now() + Duration::from_millis(delay_ms),
             identifier: identifier.clone(),
@@ -1965,9 +2029,8 @@ fn schedule_retry(tx: &mpsc::Sender<Command>, state: &mut State, request: RetryR
         },
     );
     warn!(
-        "retry=status=queued issue_id={} issue_identifier={} attempt={} delay_ms={} worker_host={} error={}",
-        issue_id,
-        identifier,
+        "retry=status=queued {} attempt={} delay_ms={} worker_host={} error={}",
+        crate::logging::run_context(&issue_id, &identifier, run_id.as_deref().unwrap_or("n/a"),),
         attempt,
         delay_ms,
         worker_host.as_deref().unwrap_or("local"),
@@ -2009,77 +2072,111 @@ fn integrate_worker_turn_context(
 }
 
 fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent) {
-    let Some(running) = state.running.get_mut(issue_id) else {
-        return;
+    update_turn_runtime_snapshot(state, issue_id, &event);
+    let (should_log_summary, summary_issue, summary_run_id, summary_worker_host, summary_status) = {
+        let Some(running) = state.running.get_mut(issue_id) else {
+            return;
+        };
+
+        if event.event == "session_started" {
+            let next_session_id = event.session_id.clone();
+            if next_session_id != running.session_id {
+                running.turn_count += 1;
+            }
+            running.session_id = next_session_id;
+        }
+
+        if let Some(pid) = event.codex_app_server_pid {
+            running.codex_app_server_pid = Some(pid);
+        }
+        if let Some(worker_host) = event.worker_host.clone() {
+            running.worker_host = Some(worker_host);
+        }
+        if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
+            running.terminal_transition_permitted = true;
+        }
+        running.last_codex_event = Some(event.event.clone());
+        running.last_codex_timestamp = Some(event.timestamp);
+        running.last_codex_message = event
+            .message
+            .clone()
+            .or_else(|| event.raw.clone())
+            .or_else(|| event.payload.as_ref().map(|payload| payload.to_string()));
+
+        if let Some(usage) = event.usage.as_ref() {
+            let input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total = usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+
+            let input_delta = input.saturating_sub(running.last_reported_input_tokens);
+            let output_delta = output.saturating_sub(running.last_reported_output_tokens);
+            let total_delta = total.saturating_sub(running.last_reported_total_tokens);
+
+            running.last_reported_input_tokens = input.max(running.last_reported_input_tokens);
+            running.last_reported_output_tokens = output.max(running.last_reported_output_tokens);
+            running.last_reported_total_tokens = total.max(running.last_reported_total_tokens);
+
+            running.codex_input_tokens += input_delta;
+            running.codex_output_tokens += output_delta;
+            running.codex_total_tokens += total_delta;
+            running.last_token_delta = total_delta;
+            if total_delta > 0 || running.last_token_source.is_none() {
+                running.last_token_source = event.usage_source.clone();
+            }
+            state.codex_totals.input_tokens += input_delta;
+            state.codex_totals.output_tokens += output_delta;
+            state.codex_totals.total_tokens += total_delta;
+        }
+
+        if let Some(rate_limits) = event.rate_limits.clone() {
+            state.codex_rate_limits = Some(rate_limits);
+        }
+
+        let recent_event_name = event.event.clone();
+        running.recent_events.push(RecentEvent {
+            at: event.timestamp,
+            event: recent_event_name,
+            message: running.last_codex_message.clone(),
+        });
+        if running.recent_events.len() > 100 {
+            let drain = running.recent_events.len() - 100;
+            running.recent_events.drain(0..drain);
+        }
+
+        (
+            matches!(
+                event.event.as_str(),
+                "turn_completed" | "turn_failed" | "turn_cancelled"
+            ),
+            running.issue.clone(),
+            running.run_id.clone(),
+            running.worker_host.clone(),
+            event.event.clone(),
+        )
     };
 
-    if event.event == "session_started" {
-        let next_session_id = event.session_id.clone();
-        if next_session_id != running.session_id {
-            running.turn_count += 1;
-        }
-        running.session_id = next_session_id;
-    }
-
-    if let Some(pid) = event.codex_app_server_pid {
-        running.codex_app_server_pid = Some(pid);
-    }
-    if let Some(worker_host) = event.worker_host.clone() {
-        running.worker_host = Some(worker_host);
-    }
-    if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
-        running.terminal_transition_permitted = true;
-    }
-    running.last_codex_event = Some(event.event.clone());
-    running.last_codex_timestamp = Some(event.timestamp);
-    running.last_codex_message = event
-        .message
-        .clone()
-        .or_else(|| event.raw.clone())
-        .or_else(|| event.payload.as_ref().map(|payload| payload.to_string()));
-
-    if let Some(usage) = event.usage.as_ref() {
-        let input = usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let total = usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        let input_delta = input.saturating_sub(running.last_reported_input_tokens);
-        let output_delta = output.saturating_sub(running.last_reported_output_tokens);
-        let total_delta = total.saturating_sub(running.last_reported_total_tokens);
-
-        running.last_reported_input_tokens = input.max(running.last_reported_input_tokens);
-        running.last_reported_output_tokens = output.max(running.last_reported_output_tokens);
-        running.last_reported_total_tokens = total.max(running.last_reported_total_tokens);
-
-        running.codex_input_tokens += input_delta;
-        running.codex_output_tokens += output_delta;
-        running.codex_total_tokens += total_delta;
-        state.codex_totals.input_tokens += input_delta;
-        state.codex_totals.output_tokens += output_delta;
-        state.codex_totals.total_tokens += total_delta;
-    }
-
-    if let Some(rate_limits) = event.rate_limits.clone() {
-        state.codex_rate_limits = Some(rate_limits);
-    }
-
-    running.recent_events.push(RecentEvent {
-        at: event.timestamp,
-        event: event.event,
-        message: running.last_codex_message.clone(),
-    });
-    if running.recent_events.len() > 100 {
-        let drain = running.recent_events.len() - 100;
-        running.recent_events.drain(0..drain);
+    if should_log_summary
+        && let Some(context) = state
+            .context_metrics
+            .get(issue_id)
+            .and_then(|context| context.last_turn_start.as_ref())
+    {
+        log_turn_summary(
+            &summary_run_id,
+            &summary_issue,
+            summary_worker_host.as_deref(),
+            context,
+            summary_status.as_str(),
+        );
     }
 }
 
@@ -2122,6 +2219,123 @@ fn json_id_string(value: &Value) -> Option<String> {
     }
 }
 
+fn update_turn_runtime_snapshot(state: &mut State, issue_id: &str, event: &CodexEvent) {
+    let Some(turn_context) = state
+        .context_metrics
+        .get_mut(issue_id)
+        .and_then(|context| context.last_turn_start.as_mut())
+    else {
+        return;
+    };
+
+    if event.event == "notification"
+        && event_payload_method(event.payload.as_ref()) == Some("codex/event/exec_command_begin")
+    {
+        let next = turn_context
+            .command_execution_count
+            .unwrap_or(0)
+            .saturating_add(1);
+        turn_context.command_execution_count = Some(next);
+    }
+
+    if let Some(tool_name) = event.tool_name.as_ref() {
+        *turn_context
+            .tool_call_count_by_tool
+            .entry(tool_name.clone())
+            .or_insert(0) += 1;
+    }
+    if let Some(tool_action) = event.tool_action.as_ref() {
+        *turn_context
+            .tool_call_count_by_action
+            .entry(tool_action.clone())
+            .or_insert(0) += 1;
+        turn_context.repeated_action_summary =
+            repeated_action_summary(&turn_context.tool_call_count_by_action);
+    }
+    if event.error_kind.is_some()
+        || event.error_message.is_some()
+        || event.http_status.is_some()
+        || event.retry_after_secs.is_some()
+        || event.upstream_service.is_some()
+    {
+        turn_context.error_kind = event.error_kind.clone();
+        turn_context.error_message = event.error_message.clone();
+        turn_context.http_status = event.http_status;
+        turn_context.retry_after_secs = event.retry_after_secs;
+        turn_context.upstream_service = event.upstream_service.clone();
+    }
+}
+
+fn repeated_action_summary(counts: &BTreeMap<String, u32>) -> Vec<String> {
+    let mut repeated = counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(action, count)| (action.clone(), *count))
+        .collect::<Vec<_>>();
+    repeated.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    repeated
+        .into_iter()
+        .take(5)
+        .map(|(action, count)| format!("{action}:x{count}"))
+        .collect()
+}
+
+fn event_payload_method(payload: Option<&Value>) -> Option<&str> {
+    payload
+        .and_then(|payload| payload.get("method"))
+        .and_then(Value::as_str)
+}
+
+fn log_turn_summary(
+    run_id: &str,
+    issue: &Issue,
+    worker_host: Option<&str>,
+    context: &TurnStartContextSnapshot,
+    status: &str,
+) {
+    info!(
+        "codex_turn_summary status={} {} worker_host={} turn={} kind={} continuation_reason={} prompt_bytes={} tool_calls_by_tool={} tool_calls_by_action={} repeated_actions={} command_execution_count={} last_error_kind={} http_status={} retry_after_secs={} upstream_service={}",
+        status,
+        crate::logging::run_context(&issue.id, &issue.identifier, run_id),
+        crate::logging::worker_host_for_log(worker_host),
+        context.turn_number,
+        context.kind,
+        context.continuation_reason.as_deref().unwrap_or("none"),
+        context.prompt_bytes,
+        serde_json::to_string(&context.tool_call_count_by_tool)
+            .unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string(&context.tool_call_count_by_action)
+            .unwrap_or_else(|_| "{}".to_string()),
+        if context.repeated_action_summary.is_empty() {
+            "none".to_string()
+        } else {
+            context.repeated_action_summary.join("|")
+        },
+        context.command_execution_count.unwrap_or(0),
+        context.error_kind.as_deref().unwrap_or("none"),
+        context
+            .http_status
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .retry_after_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context.upstream_service.as_deref().unwrap_or("none"),
+    );
+}
+
+fn token_snapshot(running: &RunningEntry) -> TokenSnapshot {
+    TokenSnapshot {
+        input_tokens: running.codex_input_tokens,
+        output_tokens: running.codex_output_tokens,
+        total_tokens: running.codex_total_tokens,
+        token_total: running.codex_total_tokens,
+        token_delta: running.last_token_delta,
+        token_source: running.last_token_source.clone(),
+    }
+}
+
 fn add_runtime_seconds(state: &mut State, running: &RunningEntry) {
     let elapsed = Utc::now()
         .signed_duration_since(running.started_at)
@@ -2155,6 +2369,7 @@ fn build_snapshot(state: &State) -> Snapshot {
             .running
             .iter()
             .map(|(issue_id, running)| RunningSnapshot {
+                run_id: running.run_id.clone(),
                 issue_id: issue_id.clone(),
                 issue_identifier: running.identifier.clone(),
                 title: running.issue.title.clone(),
@@ -2173,11 +2388,7 @@ fn build_snapshot(state: &State) -> Snapshot {
                 started_at: running.started_at,
                 last_event_at: running.last_codex_timestamp,
                 workspace: running.workspace_location.clone(),
-                tokens: TokenSnapshot {
-                    input_tokens: running.codex_input_tokens,
-                    output_tokens: running.codex_output_tokens,
-                    total_tokens: running.codex_total_tokens,
-                },
+                tokens: token_snapshot(running),
                 context: state.context_metrics.get(issue_id).cloned(),
             })
             .collect(),
@@ -2288,6 +2499,7 @@ fn build_issue_detail(
             current_retry_attempt: retry.map(|retry| retry.attempt),
         },
         running: running.map(|running| RunningDetail {
+            run_id: running.run_id.clone(),
             worker_host: running.worker_host.clone(),
             session_id: running.session_id.clone(),
             codex_app_server_pid: running.codex_app_server_pid,
@@ -2297,11 +2509,7 @@ fn build_issue_detail(
             last_event: running.last_codex_event.clone(),
             last_message: running.last_codex_message.clone(),
             last_event_at: running.last_codex_timestamp,
-            tokens: TokenSnapshot {
-                input_tokens: running.codex_input_tokens,
-                output_tokens: running.codex_output_tokens,
-                total_tokens: running.codex_total_tokens,
-            },
+            tokens: token_snapshot(running),
             context: running_context.clone(),
         }),
         retry: retry.map(|retry| RetryDetail {
@@ -2343,13 +2551,19 @@ fn thread_start_context_snapshot(
     }
 }
 
-fn log_turn_context(issue: &Issue, worker_host: Option<&str>, context: &TurnStartContextSnapshot) {
+fn log_turn_context(
+    run_id: &str,
+    issue: &Issue,
+    worker_host: Option<&str>,
+    context: &TurnStartContextSnapshot,
+) {
     info!(
-        "codex_context=status=turn_start {} worker_host={} kind={} turn={} prompt_bytes={} workflow_template_bytes={} issue_context_bytes={} preloaded_comment_bytes={} preloaded_comment_count={}",
-        crate::logging::issue_context(issue),
+        "codex_context=status=turn_start {} worker_host={} kind={} turn={} continuation_reason={} prompt_bytes={} workflow_template_bytes={} issue_context_bytes={} preloaded_comment_bytes={} preloaded_comment_count={} comment_preload_truncated={} dynamic_tool_bytes={}",
+        crate::logging::run_context(&issue.id, &issue.identifier, run_id),
         crate::logging::worker_host_for_log(worker_host),
         context.kind,
         context.turn_number,
+        context.continuation_reason.as_deref().unwrap_or("none"),
         context.prompt_bytes,
         context
             .workflow_template_bytes
@@ -2365,6 +2579,14 @@ fn log_turn_context(issue: &Issue, worker_host: Option<&str>, context: &TurnStar
             .unwrap_or_else(|| "n/a".to_string()),
         context
             .preloaded_comment_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .comment_preload_truncated
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .dynamic_tool_bytes
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string()),
     );
@@ -2550,15 +2772,15 @@ async fn run_worker(
     workflow_store: WorkflowStore,
     issue: Issue,
     attempt: Option<u32>,
+    run_id: String,
     worker_host: Option<String>,
     cancellation: CancellationToken,
     tx: mpsc::Sender<Command>,
 ) -> Result<WorkerDisposition, WorkerError> {
     let effective = workflow_store.effective();
     info!(
-        "worker=status=starting issue_id={} issue_identifier={} worker_host={}",
-        issue.id,
-        issue.identifier,
+        "worker=status=starting {} worker_host={}",
+        crate::logging::run_context(&issue.id, &issue.identifier, &run_id),
         worker_host.as_deref().unwrap_or("local")
     );
 
@@ -2573,6 +2795,7 @@ async fn run_worker(
             let app = &app;
             let config = &effective.config;
             let issue = &issue;
+            let run_id = run_id.clone();
             async move {
                 let workspace = Workspace::create_for_issue_on_host(
                     config,
@@ -2597,7 +2820,11 @@ async fn run_worker(
                 }
 
                 match app
-                    .start_session_on_host(&workspace.path, candidate_worker_host.as_deref())
+                    .start_session_on_host(
+                        &workspace.path,
+                        candidate_worker_host.as_deref(),
+                        &run_id,
+                    )
                     .await
                 {
                     Ok(session) => Ok((workspace, session)),
@@ -2623,6 +2850,8 @@ async fn run_worker(
             thread_context: thread_start_context_snapshot(session.dynamic_tool_payloads()),
         })
         .await;
+    let dynamic_tool_bytes =
+        crate::dynamic_tool::total_tool_payload_bytes(session.dynamic_tool_payloads());
 
     let worker_result = async {
         let mut current_issue = tracker
@@ -2678,6 +2907,18 @@ async fn run_worker(
                         ),
                         preloaded_comment_bytes: Some(built.metrics.preloaded_comment_bytes),
                         preloaded_comment_count: Some(built.metrics.preloaded_comment_count),
+                        comment_preload_truncated: Some(built.metrics.comment_preload_truncated),
+                        continuation_reason: None,
+                        dynamic_tool_bytes: Some(dynamic_tool_bytes),
+                        tool_call_count_by_tool: BTreeMap::new(),
+                        tool_call_count_by_action: BTreeMap::new(),
+                        repeated_action_summary: Vec::new(),
+                        command_execution_count: Some(0),
+                        error_kind: None,
+                        error_message: None,
+                        http_status: None,
+                        retry_after_secs: None,
+                        upstream_service: None,
                     },
                 )
             } else {
@@ -2692,14 +2933,31 @@ async fn run_worker(
                         rendered_issue_context_bytes: None,
                         preloaded_comment_bytes: None,
                         preloaded_comment_count: None,
+                        comment_preload_truncated: None,
+                        continuation_reason: Some("issue_still_active_after_turn".to_string()),
+                        dynamic_tool_bytes: Some(dynamic_tool_bytes),
+                        tool_call_count_by_tool: BTreeMap::new(),
+                        tool_call_count_by_action: BTreeMap::new(),
+                        repeated_action_summary: Vec::new(),
+                        command_execution_count: Some(0),
+                        error_kind: None,
+                        error_message: None,
+                        http_status: None,
+                        retry_after_secs: None,
+                        upstream_service: None,
                     },
                 )
             };
-            log_turn_context(&current_issue, worker_host.as_deref(), &turn_context);
+            log_turn_context(
+                &run_id,
+                &current_issue,
+                worker_host.as_deref(),
+                &turn_context,
+            );
             let _ = tx
                 .send(Command::WorkerTurnContext {
                     issue_id: current_issue.id.clone(),
-                    turn_context: turn_context.clone(),
+                    turn_context: Box::new(turn_context.clone()),
                 })
                 .await;
             let guarded_close_for_turn =
@@ -2824,7 +3082,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         fs,
         path::PathBuf,
         sync::{
@@ -2847,11 +3105,12 @@ mod tests {
     use super::{
         DynamicToolContextSnapshot, Orchestrator, OrchestratorHandle, OrchestratorHandleError,
         PollingSnapshot, RetryEntry, RunningEntry, Snapshot, SnapshotCounts, SnapshotFreshness,
-        SnapshotTotals, State, ThreadStartContextSnapshot, WorkerDisposition, WorkerError,
-        WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig, WorkerSelection, build_snapshot,
-        candidate_issue, dispatch_issue, guarded_close_transition_may_be_in_flight,
-        handle_retry_issue_with_tracker, handle_worker_exit, next_poll_delay,
-        run_startup_terminal_cleanup, select_worker_host,
+        SnapshotTotals, State, ThreadStartContextSnapshot, TurnStartContextSnapshot,
+        WorkerDisposition, WorkerError, WorkerErrorKind, WorkerErrorStage, WorkerRuntimeConfig,
+        WorkerSelection, build_snapshot, candidate_issue, dispatch_issue,
+        guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
+        handle_worker_exit, integrate_worker_turn_context, integrate_worker_update,
+        next_poll_delay, repeated_action_summary, run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
     };
@@ -2945,6 +3204,7 @@ mod tests {
         state.running.insert(
             "issue-1".to_string(),
             RunningEntry {
+                run_id: "run-issue-1".to_string(),
                 issue: Issue {
                     id: "issue-1".to_string(),
                     identifier: "ABC-1".to_string(),
@@ -2966,6 +3226,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -2989,6 +3251,7 @@ mod tests {
         state.running.insert(
             "issue-2".to_string(),
             RunningEntry {
+                run_id: "run-issue-2".to_string(),
                 issue: Issue {
                     id: "issue-2".to_string(),
                     identifier: "ABC-2".to_string(),
@@ -3010,6 +3273,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3087,6 +3352,7 @@ mod tests {
         state.running.insert(
             "issue-1".to_string(),
             RunningEntry {
+                run_id: "run-issue-1".to_string(),
                 issue: Issue {
                     id: "issue-1".to_string(),
                     identifier: "ABC-1".to_string(),
@@ -3108,6 +3374,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3149,11 +3417,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integrate_worker_update_records_loop_summary_and_structured_tool_failures() {
+        let mut state = State::default();
+        state.running.insert(
+            "issue-1".to_string(),
+            RunningEntry {
+                run_id: "run-issue-1".to_string(),
+                issue: Issue {
+                    id: "issue-1".to_string(),
+                    identifier: "ABC-1".to_string(),
+                    title: "one".to_string(),
+                    state: "In Progress".to_string(),
+                    ..Issue::default()
+                },
+                identifier: "ABC-1".to_string(),
+                workspace_path: PathBuf::from("/tmp/workspace-a"),
+                workspace_location: "/tmp/workspace-a".to_string(),
+                worker_host: Some("ssh-a".to_string()),
+                cancel: CancellationToken::new(),
+                join: tokio::spawn(async {}),
+                session_id: Some("session-1".to_string()),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+                codex_app_server_pid: None,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
+                last_reported_input_tokens: 0,
+                last_reported_output_tokens: 0,
+                last_reported_total_tokens: 0,
+                turn_count: 1,
+                retry_attempt: 0,
+                started_at: Utc::now(),
+                terminal_transition_permitted: false,
+                recent_events: Vec::new(),
+            },
+        );
+        integrate_worker_turn_context(
+            &mut state,
+            "issue-1",
+            TurnStartContextSnapshot {
+                turn_number: 1,
+                kind: "initial".to_string(),
+                prompt_bytes: 120,
+                workflow_template_bytes: Some(60),
+                rendered_issue_context_bytes: Some(100),
+                preloaded_comment_bytes: Some(20),
+                preloaded_comment_count: Some(2),
+                comment_preload_truncated: Some(false),
+                continuation_reason: None,
+                dynamic_tool_bytes: Some(512),
+                tool_call_count_by_tool: BTreeMap::new(),
+                tool_call_count_by_action: BTreeMap::new(),
+                repeated_action_summary: Vec::new(),
+                command_execution_count: Some(0),
+                error_kind: None,
+                error_message: None,
+                http_status: None,
+                retry_after_secs: None,
+                upstream_service: None,
+            },
+        );
+
+        let failed_payload = json!({
+            "method": "item/tool/call",
+            "params": {
+                "name": "github_api",
+                "arguments": {
+                    "method": "GET",
+                    "path": "/repos/acme/repo/pulls"
+                }
+            },
+            "toolResult": {
+                "success": false
+            },
+            "symphonyTelemetry": {
+                "tool_name": "github_api",
+                "tool_action": "github_api:GET:/repos/acme/repo/pulls",
+                "tool_success": false,
+                "tool_duration_ms": 150,
+                "error_kind": "http_status",
+                "error_message": "GitHub API request failed with HTTP 403.",
+                "http_status": 403,
+                "upstream_service": "github"
+            }
+        });
+        let failed_event = crate::codex::CodexEvent {
+            event: "tool_call_failed".to_string(),
+            timestamp: Utc::now(),
+            worker_host: Some("ssh-a".to_string()),
+            session_id: Some("session-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            codex_app_server_pid: Some(4242),
+            usage: None,
+            usage_source: None,
+            rate_limits: None,
+            payload: Some(failed_payload),
+            raw: None,
+            message: Some("tool failed".to_string()),
+            tool_name: Some("github_api".to_string()),
+            tool_action: Some("github_api:GET:/repos/acme/repo/pulls".to_string()),
+            tool_success: Some(false),
+            tool_duration_ms: Some(150),
+            error_kind: Some("http_status".to_string()),
+            error_message: Some("GitHub API request failed with HTTP 403.".to_string()),
+            http_status: Some(403),
+            retry_after_secs: None,
+            upstream_service: Some("github".to_string()),
+        };
+
+        integrate_worker_update(&mut state, "issue-1", failed_event.clone());
+        integrate_worker_update(&mut state, "issue-1", failed_event);
+        integrate_worker_update(
+            &mut state,
+            "issue-1",
+            crate::codex::CodexEvent {
+                event: "notification".to_string(),
+                timestamp: Utc::now(),
+                worker_host: Some("ssh-a".to_string()),
+                session_id: Some("session-1".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                codex_app_server_pid: Some(4242),
+                usage: None,
+                usage_source: None,
+                rate_limits: None,
+                payload: Some(json!({
+                    "method": "codex/event/exec_command_begin",
+                    "params": {"msg": {"command": "git status --short"}}
+                })),
+                raw: None,
+                message: Some("git status --short".to_string()),
+                tool_name: None,
+                tool_action: None,
+                tool_success: None,
+                tool_duration_ms: None,
+                error_kind: None,
+                error_message: None,
+                http_status: None,
+                retry_after_secs: None,
+                upstream_service: None,
+            },
+        );
+
+        let context = state
+            .context_metrics
+            .get("issue-1")
+            .and_then(|context| context.last_turn_start.as_ref())
+            .expect("turn context");
+        assert_eq!(
+            context.tool_call_count_by_tool.get("github_api").copied(),
+            Some(2)
+        );
+        assert_eq!(
+            context
+                .tool_call_count_by_action
+                .get("github_api:GET:/repos/acme/repo/pulls")
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            context.repeated_action_summary,
+            vec!["github_api:GET:/repos/acme/repo/pulls:x2".to_string()]
+        );
+        assert_eq!(context.command_execution_count, Some(1));
+        assert_eq!(context.error_kind.as_deref(), Some("http_status"));
+        assert_eq!(context.http_status, Some(403));
+        assert_eq!(context.upstream_service.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn repeated_action_summary_is_whitespace_free() {
+        let counts = BTreeMap::from([
+            ("github_api:GET:/repos/acme/repo/pulls".to_string(), 2),
+            ("todoist:get_comments:task_id=123".to_string(), 3),
+        ]);
+
+        let summary = repeated_action_summary(&counts);
+        assert_eq!(
+            summary,
+            vec![
+                "todoist:get_comments:task_id=123:x3".to_string(),
+                "github_api:GET:/repos/acme/repo/pulls:x2".to_string(),
+            ]
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|entry| !entry.contains(char::is_whitespace))
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_includes_worker_host_and_workspace_affinity() {
         let mut state = State::default();
         state.running.insert(
             "issue-1".to_string(),
             RunningEntry {
+                run_id: "run-issue-1".to_string(),
                 issue: Issue {
                     id: "issue-1".to_string(),
                     identifier: "ABC-1".to_string(),
@@ -3175,6 +3640,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3188,6 +3655,7 @@ mod tests {
         state.retry_attempts.insert(
             "issue-2".to_string(),
             RetryEntry {
+                run_id: None,
                 attempt: 2,
                 due_at: Instant::now() + Duration::from_secs(30),
                 identifier: "ABC-2".to_string(),
@@ -3297,6 +3765,7 @@ mod tests {
         state.running.insert(
             issue.id.clone(),
             RunningEntry {
+                run_id: "run-active-rerouted".to_string(),
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
@@ -3312,6 +3781,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3364,6 +3835,7 @@ mod tests {
         state.retry_attempts.insert(
             issue.id.clone(),
             RetryEntry {
+                run_id: None,
                 attempt: 1,
                 due_at: Instant::now(),
                 identifier: issue.identifier.clone(),
@@ -3405,6 +3877,7 @@ mod tests {
         state.retry_attempts.insert(
             "issue-1".to_string(),
             super::RetryEntry {
+                run_id: None,
                 attempt: 2,
                 due_at: Instant::now(),
                 identifier: "ABC-1".to_string(),
@@ -3561,6 +4034,7 @@ mod tests {
         state.running.insert(
             issue.id.clone(),
             RunningEntry {
+                run_id: "run-quiesced".to_string(),
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
@@ -3576,6 +4050,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3625,6 +4101,7 @@ mod tests {
         state.running.insert(
             issue.id.clone(),
             RunningEntry {
+                run_id: "run-continuation".to_string(),
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
@@ -3640,6 +4117,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,
@@ -3698,6 +4177,7 @@ mod tests {
         state.running.insert(
             issue.id.clone(),
             RunningEntry {
+                run_id: "run-worker-failure".to_string(),
                 issue: issue.clone(),
                 identifier: issue.identifier.clone(),
                 workspace_path: PathBuf::from("/tmp/workspace"),
@@ -3713,6 +4193,8 @@ mod tests {
                 codex_input_tokens: 0,
                 codex_output_tokens: 0,
                 codex_total_tokens: 0,
+                last_token_delta: 0,
+                last_token_source: None,
                 last_reported_input_tokens: 0,
                 last_reported_output_tokens: 0,
                 last_reported_total_tokens: 0,

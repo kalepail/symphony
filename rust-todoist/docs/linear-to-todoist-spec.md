@@ -434,7 +434,8 @@ rust-todoist/
   WORKFLOW.md
   WORKFLOW.smoke.minimal.md
   WORKFLOW.smoke.full.md
-  SMOKE_TESTS.md
+  docs/
+    smoke-tests.md
   scripts/
     workspace_before_remove.sh
     github_publish_preflight.sh
@@ -480,7 +481,7 @@ Phase 1 should copy and adapt. Do not prematurely abstract shared code into a co
 | [`rust/src/dynamic_tool.rs`](../rust/src/dynamic_tool.rs) | preserve `github_api`; replace `linear_graphql` with structured `todoist` actions |
 | [`rust/src/orchestrator.rs`](../rust/src/orchestrator.rs) | copy, then change startup cleanup, reconciliation, blocker behavior, and tracker refresh semantics |
 | [`rust/WORKFLOW.md`](../rust/WORKFLOW.md) | rewrite for Todoist while preserving unattended discipline |
-| [`rust/SMOKE_TESTS.md`](../rust/SMOKE_TESTS.md) and smoke workflows | create Todoist equivalents in `rust-todoist/` |
+| [`rust/SMOKE_TESTS.md`](../rust/SMOKE_TESTS.md) and smoke workflows | create Todoist equivalents in `rust-todoist/`, with smoke operator docs living at [`rust-todoist/docs/smoke-tests.md`](./smoke-tests.md) |
 
 ## Public Interface Changes
 

@@ -18,6 +18,6 @@
 
 #### Test Plan
 
-- [ ] `make -C elixir all`
-- [ ] `cargo fmt --manifest-path rust/Cargo.toml --check && cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path rust/Cargo.toml`
+- [ ] `cargo fmt --manifest-path rust-todoist/Cargo.toml --check && cargo clippy --manifest-path rust-todoist/Cargo.toml --all-targets --all-features -- -D warnings && cargo test --manifest-path rust-todoist/Cargo.toml`
+- [ ] `make -C elixir all` (if `elixir/` changed)
 - [ ] <!-- Additional targeted checks (list below) -->
