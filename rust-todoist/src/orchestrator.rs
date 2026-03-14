@@ -530,7 +530,7 @@ enum Command {
     },
     WorkerTurnContext {
         issue_id: String,
-        turn_context: TurnStartContextSnapshot,
+        turn_context: Box<TurnStartContextSnapshot>,
     },
     WorkerUpdate {
         issue_id: String,
@@ -646,7 +646,7 @@ impl Orchestrator {
                         issue_id,
                         turn_context,
                     } => {
-                        integrate_worker_turn_context(&mut state, &issue_id, turn_context);
+                        integrate_worker_turn_context(&mut state, &issue_id, *turn_context);
                         notify_observers(
                             &updates_tx,
                             &mut update_version,
@@ -1017,9 +1017,7 @@ fn snapshot_stale_after(snapshot: &Snapshot) -> Duration {
 
     let poll_interval_ms = snapshot.polling.poll_interval_ms.max(1);
     let stale_after_ms = if snapshot.polling.checking {
-        poll_interval_ms
-            .min(MAX_CHECKING_STALE_AFTER_MS)
-            .max(STALE_GRACE_MS)
+        poll_interval_ms.clamp(STALE_GRACE_MS, MAX_CHECKING_STALE_AFTER_MS)
     } else if let Some(next_poll_in_ms) = snapshot.polling.next_poll_in_ms {
         next_poll_in_ms.saturating_add(STALE_GRACE_MS)
     } else {
@@ -2956,7 +2954,7 @@ async fn run_worker(
             let _ = tx
                 .send(Command::WorkerTurnContext {
                     issue_id: current_issue.id.clone(),
-                    turn_context: turn_context.clone(),
+                    turn_context: Box::new(turn_context.clone()),
                 })
                 .await;
             let guarded_close_for_turn =
