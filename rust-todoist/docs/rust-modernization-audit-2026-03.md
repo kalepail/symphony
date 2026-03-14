@@ -80,7 +80,8 @@ Why it matters:
 
 Evidence:
 
-- `.github/workflows/rust-ci.yml:5-28`
+- Historical baseline before the dedicated workflow landed:
+  `.github/workflows/rust-ci.yml:5-28`
 
 Recommendation:
 
@@ -101,6 +102,8 @@ Success criteria:
 Implementation progress:
 
 - Implemented on 2026-03-13 via `.github/workflows/rust-todoist-ci.yml`.
+- The stale legacy `rust-ci.yml` was later removed once this dedicated workflow
+  became the only Rust CI path in the fork.
 
 ### P1. Toolchain and crate policy are underspecified
 

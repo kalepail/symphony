@@ -26,7 +26,12 @@ description:
 ## Steps
 
 1. Locate the PR for the current branch.
-2. Confirm the full gauntlet is green locally before any push.
+2. Confirm the local gauntlet is green before any push:
+   - Default Rust gate for this fork:
+     `cargo fmt --manifest-path rust-todoist/Cargo.toml --check`
+     `cargo clippy --manifest-path rust-todoist/Cargo.toml --all-targets --all-features -- -D warnings`
+     `cargo test --manifest-path rust-todoist/Cargo.toml`
+   - If the change touches `elixir/`, also run `make -C elixir all`.
 3. If the working tree has uncommitted changes, commit with the `commit` skill
    and push with the `push` skill before proceeding.
 4. Check mergeability and conflicts against main.

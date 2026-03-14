@@ -2,9 +2,15 @@ name: make-all
 
 on:
   pull_request:
+    paths:
+      - "elixir/**"
+      - ".github/workflows/make-all.yml"
   push:
     branches:
       - main
+    paths:
+      - "elixir/**"
+      - ".github/workflows/make-all.yml"
 
 jobs:
   make-all:

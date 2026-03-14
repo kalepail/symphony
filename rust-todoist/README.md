@@ -145,6 +145,7 @@ Notes:
 - Logs now default to `./log/symphony.log` relative to the current working directory, with size-based rotation at 10 MB and retention for 5 archived files. Override the root with `--logs-root /path/to/root`, which writes to `/path/to/root/log/symphony.log`. File logs now include RFC3339 millisecond timestamps, and Symphony's own lifecycle targets remain at `info` even when the surrounding shell uses a stricter `RUST_LOG` value such as `warn`. Logging conventions are documented in [`rust-todoist/docs/logging.md`](./docs/logging.md).
 - The sample `before_remove` hook first checks for `./scripts/workspace_before_remove.sh` in the target repo, then falls back to the bundled [`rust-todoist/scripts/workspace_before_remove.sh`](./scripts/workspace_before_remove.sh) path when the workspace itself is this repository. If you copy the workflow into another repo, either copy that script too or replace the hook with your own cleanup.
 - [`rust-todoist/scripts/github_publish_preflight.sh`](./scripts/github_publish_preflight.sh) provides a fast operator preflight for both `gh` and direct GitHub REST access, repo visibility, PR listing, and required label presence before launching a live PR-oriented smoke run.
+- Root [`../scripts/`](../scripts/README.md) is separate on purpose: it holds repo-wide tooling plus shared smoke-harness assets such as [`../scripts/reset_smoke_state.py`](../scripts/reset_smoke_state.py) and the checked-in smoke repo fixture [`../scripts/smoke_repo_baseline/`](../scripts/smoke_repo_baseline). [`rust-todoist/scripts/`](./scripts) remains the runtime-local helper directory for this implementation.
 - When Symphony exposes the host-side `github_api` tool, prefer it for both PR creation and post-publish metadata writes such as applying the `symphony` label. This avoids the in-session `gh auth token` drift that can appear even when host GitHub auth is healthy.
 - For predictable GitHub behavior in live publish/merge flows, prefer `gh auth login` or a classic personal access token with `repo` scope. Symphony reads pull requests and check runs, creates PRs, applies labels, and some smoke helpers mutate branches and repository contents; GitHub's fine-grained PAT limitations around the Checks API make them a poor default for this repo. If you need env-based auth, put `GH_TOKEN` or `GITHUB_TOKEN` in the workflow directory's `.env.local`, which is ignored by git.
 - The smoke workflows remain label-scoped on purpose: `symphony-smoke-minimal` and `symphony-smoke-full` keep manual smoke tasks separated when operators reuse one Todoist project, while the automated harness now creates disposable projects per run.
@@ -205,7 +206,7 @@ with the section it was completed from, which should normally be `Merging`.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo bench --bench todoist_hot_paths -- --noplot --sample-size 10
 cargo test --test live_e2e -- --ignored --nocapture
@@ -219,6 +220,6 @@ Tracked live-smoke workflow files now live alongside the main workflow:
 
 - [WORKFLOW.smoke.minimal.md](./WORKFLOW.smoke.minimal.md) exercises the smallest safe live path against the dedicated smoke repo.
 - [WORKFLOW.smoke.full.md](./WORKFLOW.smoke.full.md) targets the full branch, PR, review, and merge contract against the same repo.
-- [SMOKE_TESTS.md](./SMOKE_TESTS.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`.
+- [docs/smoke-tests.md](./docs/smoke-tests.md) documents the smoke matrix, required environment, expected dashboard evidence, and the dedicated repo `kalepail/symphony-smoke-lab`. It also explains the ownership split between root [`../scripts/`](../scripts/README.md) and runtime-local [`./scripts/`](./scripts).
 - [tests/live_e2e.rs](./tests/live_e2e.rs) is the ignored real Todoist/Codex integration harness for the current runtime. It provides both local and SSH-worker variants for the lightweight disposable-project handoff smoke, the repo-backed minimal smoke workflow, and the full clean-slate smoke flow, including the Docker-backed SSH path when `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, then drives the checked-in full smoke workflow to `Human Review`, moves the task to `Merging`, verifies the PR merge, and confirms guarded `todoist.close_task` completion.
-- [`../scripts/reset_smoke_state.py`](../scripts/reset_smoke_state.py) resets the shared smoke surfaces by restoring the smoke repo baseline files, deleting disposable smoke branches, deleting open Todoist smoke tasks from the smoke project configured for cleanup, and deleting disposable Rust Todoist live-E2E projects.
+- [`../scripts/reset_smoke_state.py`](../scripts/reset_smoke_state.py) resets the shared smoke surfaces by restoring the smoke repo baseline files from the fixture in [`../scripts/smoke_repo_baseline/`](../scripts/smoke_repo_baseline), deleting disposable smoke branches, deleting open Todoist smoke tasks from the smoke project configured for cleanup, and deleting disposable Rust Todoist live-E2E projects.
