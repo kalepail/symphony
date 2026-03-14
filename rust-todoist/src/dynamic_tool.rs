@@ -1502,6 +1502,7 @@ async fn github_api_request(
             })
         })?;
         let parsed_body = parse_error_body(&body_text);
+        let response_summary = github_response_summary(&parsed_body);
 
         if status.is_success() {
             if body_text.trim().is_empty() {
@@ -1513,13 +1514,23 @@ async fn github_api_request(
         if let Some(delay_secs) =
             github_status_retry_delay_seconds(status, &headers, attempt, waited_secs)
         {
+            let retry_after_secs = github_retry_after_seconds(&headers);
+            let response_summary_token = response_summary
+                .as_deref()
+                .map(inline_log_value)
+                .unwrap_or_else(|| "none".to_string());
             warn!(
-                "github_api status=retry method={} path={} attempt={} delay_secs={} http_status={}",
+                "github_api status=retry method={} path={} attempt={} delay_secs={} http_status={} retry_after_secs={} reason={} error={}",
                 method.as_str(),
                 path,
                 attempt + 1,
                 delay_secs,
-                status.as_u16()
+                status.as_u16(),
+                retry_after_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                github_retry_reason(status, retry_after_secs),
+                response_summary_token,
             );
             waited_secs = waited_secs.saturating_add(delay_secs);
             sleep(Duration::from_secs(delay_secs)).await;
@@ -1528,15 +1539,12 @@ async fn github_api_request(
 
         return Err(json!({
             "error": {
-                "message": if body_text.trim().is_empty() {
-                    "GitHub API request returned a non-success status with an empty body.".to_string()
-                } else {
-                    format!("GitHub API request failed with HTTP {}.", status.as_u16())
-                },
+                "message": github_error_message(status, response_summary.as_deref()),
                 "status": status.as_u16(),
                 "method": method.as_str(),
                 "path": path,
-                "response": parsed_body
+                "response": parsed_body,
+                "response_summary": response_summary
             }
         }));
     }
@@ -1560,10 +1568,7 @@ fn github_status_retry_delay_seconds(
         return None;
     }
 
-    let retry_after = headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+    let retry_after = github_retry_after_seconds(headers);
     let delay_secs = retry_after
         .unwrap_or_else(|| github_default_retry_delay_seconds(attempt))
         .min(GITHUB_API_MAX_DELAY_SECS);
@@ -1603,6 +1608,21 @@ fn github_status_is_transient(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
+fn github_retry_after_seconds(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn github_retry_reason(status: StatusCode, retry_after_secs: Option<u64>) -> &'static str {
+    if status == StatusCode::TOO_MANY_REQUESTS || retry_after_secs.is_some() {
+        "rate_limited"
+    } else {
+        "transient_http_error"
+    }
+}
+
 fn github_error_summary(error: &Value) -> String {
     let Some(details) = error.get("error") else {
         return error.to_string();
@@ -1625,6 +1645,111 @@ fn parse_error_body(body: &str) -> Value {
     } else {
         serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({ "raw": body }))
     }
+}
+
+fn github_error_message(status: StatusCode, response_summary: Option<&str>) -> String {
+    match response_summary.filter(|value| !value.is_empty()) {
+        Some(summary) => format!(
+            "GitHub API request failed with HTTP {}: {summary}",
+            status.as_u16()
+        ),
+        None => format!("GitHub API request failed with HTTP {}.", status.as_u16()),
+    }
+}
+
+fn github_response_summary(response: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(message) = response
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(message.to_string());
+    }
+
+    if let Some(errors) = response.get("errors").and_then(Value::as_array) {
+        for error in errors.iter().take(2) {
+            if let Some(summary) = github_error_entry_summary(error) {
+                parts.push(summary);
+            }
+        }
+        if errors.len() > 2 {
+            parts.push(format!("{} more error(s)", errors.len() - 2));
+        }
+    }
+
+    if parts.is_empty()
+        && let Some(raw) = response
+            .get("raw")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        parts.push(truncate_log_detail(raw, 240));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(truncate_log_detail(&parts.join("; "), 240))
+    }
+}
+
+fn inline_log_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+
+    trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("|")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn github_error_entry_summary(error: &Value) -> Option<String> {
+    match error {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| truncate_log_detail(trimmed, 120))
+        }
+        Value::Object(map) => {
+            let resource = map.get("resource").and_then(Value::as_str);
+            let field = map.get("field").and_then(Value::as_str);
+            let code = map.get("code").and_then(Value::as_str);
+            let message = map.get("message").and_then(Value::as_str);
+            let mut parts = Vec::new();
+            if let Some(resource) = resource.filter(|value| !value.trim().is_empty()) {
+                parts.push(resource.trim().to_string());
+            }
+            if let Some(field) = field.filter(|value| !value.trim().is_empty()) {
+                parts.push(field.trim().to_string());
+            }
+            if let Some(code) = code.filter(|value| !value.trim().is_empty()) {
+                parts.push(code.trim().to_string());
+            }
+            if let Some(message) = message.filter(|value| !value.trim().is_empty()) {
+                parts.push(message.trim().to_string());
+            }
+            (!parts.is_empty()).then(|| truncate_log_detail(&parts.join(":"), 120))
+        }
+        _ => None,
+    }
+}
+
+fn truncate_log_detail(value: &str, max_chars: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn tool_error_payload(error: TrackerError) -> Value {
@@ -2750,6 +2875,44 @@ mod tests {
         assert!(compacted.contains("## Confusions"));
         assert!(compacted.contains("## Compacted History"));
         assert!(compacted.contains("https://github.com/example/repo/pull/42"));
+    }
+
+    #[test]
+    fn github_response_summary_includes_message_and_field_errors() {
+        let summary = super::github_response_summary(&json!({
+            "message": "Invalid request.\n\nCheck the payload.",
+            "errors": [
+                {"resource": "Commit", "field": "content", "code": "invalid"},
+                {"message": "path must not be empty"}
+            ]
+        }))
+        .expect("summary");
+
+        assert_eq!(
+            summary,
+            "Invalid request. Check the payload.; Commit:content:invalid; path must not be empty"
+        );
+    }
+
+    #[test]
+    fn github_error_message_uses_response_summary_when_available() {
+        let message = super::github_error_message(
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("Invalid request.; Commit:content:invalid"),
+        );
+
+        assert_eq!(
+            message,
+            "GitHub API request failed with HTTP 400: Invalid request.; Commit:content:invalid"
+        );
+    }
+
+    #[test]
+    fn inline_log_value_emits_whitespace_free_token() {
+        assert_eq!(
+            super::inline_log_value(" Invalid request.\n\nCheck the payload. "),
+            "Invalid|request.|Check|the|payload."
+        );
     }
 
     #[tokio::test]

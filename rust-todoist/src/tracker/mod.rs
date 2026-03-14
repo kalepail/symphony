@@ -5,13 +5,98 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
+use tokio::task_local;
 
 use crate::config::ServiceConfig;
 use crate::issue::Issue;
 
 pub const TODOIST_COMMENT_SIZE_LIMIT: usize = 15_000;
+
+task_local! {
+    static REQUEST_LOG_HANDLE: RequestLogHandle;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RequestLogContext {
+    pub source: String,
+    pub issue_id: Option<String>,
+    pub issue_identifier: Option<String>,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_action: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RequestRetrySummary {
+    pub retry_count: u32,
+    pub total_wait_secs: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogHandle {
+    inner: Arc<Mutex<RequestLogState>>,
+}
+
+#[derive(Clone, Debug)]
+struct RequestLogState {
+    context: RequestLogContext,
+    retry_summary: RequestRetrySummary,
+}
+
+impl RequestLogHandle {
+    pub fn new(context: RequestLogContext) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestLogState {
+                context,
+                retry_summary: RequestRetrySummary::default(),
+            })),
+        }
+    }
+
+    pub fn context(&self) -> RequestLogContext {
+        self.inner
+            .lock()
+            .expect("request log state poisoned")
+            .context
+            .clone()
+    }
+
+    pub fn record_retry(&self, delay_secs: u64) {
+        let mut state = self.inner.lock().expect("request log state poisoned");
+        state.retry_summary.retry_count = state.retry_summary.retry_count.saturating_add(1);
+        state.retry_summary.total_wait_secs = state
+            .retry_summary
+            .total_wait_secs
+            .saturating_add(delay_secs);
+    }
+
+    pub fn retry_summary(&self) -> RequestRetrySummary {
+        self.inner
+            .lock()
+            .expect("request log state poisoned")
+            .retry_summary
+            .clone()
+    }
+}
+
+pub async fn with_request_log_handle<F, T>(handle: RequestLogHandle, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    REQUEST_LOG_HANDLE.scope(handle, future).await
+}
+
+pub fn current_request_log_handle() -> Option<RequestLogHandle> {
+    REQUEST_LOG_HANDLE.try_with(Clone::clone).ok()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrackerCapabilities {
@@ -255,5 +340,40 @@ pub fn build_tracker_client(config: ServiceConfig) -> Result<Arc<dyn TrackerClie
         None => Err(TrackerError::UnsupportedTrackerKind(
             "<missing>".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RequestLogContext, RequestLogHandle, current_request_log_handle, with_request_log_handle,
+    };
+
+    #[tokio::test]
+    async fn request_log_handle_scopes_context_and_retry_summary() {
+        let handle = RequestLogHandle::new(RequestLogContext {
+            source: "tool_call".to_string(),
+            issue_id: Some("task-1".to_string()),
+            issue_identifier: Some("TD-task-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            tool_name: Some("todoist".to_string()),
+            tool_action: Some("todoist:get_task:task_id=task-1".to_string()),
+        });
+
+        let summary = with_request_log_handle(handle.clone(), async {
+            let scoped = current_request_log_handle().expect("scoped request log");
+            assert_eq!(scoped.context().source, "tool_call");
+            scoped.record_retry(2);
+            scoped.record_retry(4);
+            scoped.retry_summary()
+        })
+        .await;
+
+        assert_eq!(summary.retry_count, 2);
+        assert_eq!(summary.total_wait_secs, 6);
+        assert!(current_request_log_handle().is_none());
     }
 }

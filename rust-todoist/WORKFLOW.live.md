@@ -153,7 +153,9 @@ When the session includes `todoist`, prefer these exact narrow operations instea
 - `Backlog` -> out of scope for this workflow; do not modify.
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `Human Review` -> PR is attached, validated, and ready for review.
+- Define `Blocked` or `Stuck` sections separately if the workflow needs
+  explicit non-review handoff states.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` (implicit after `close_task`) -> terminal completed state; no further action required.

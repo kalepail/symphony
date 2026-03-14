@@ -83,6 +83,18 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+Elixir file logs are written relative to the process current working directory:
+
+- launch from `elixir/`: `elixir/log/symphony.log`
+- launch from repo root: `log/symphony.log`
+- launch from `rust-todoist/`: `rust-todoist/log/symphony.log`
+- override with `--logs-root /path/to/root`: `/path/to/root/log/symphony.log`
+
+Rotation is size-based, not daily. Elixir uses OTP's wrapped disk log handler
+with 5 files at 10 MB each, plus `.idx` and `.siz` metadata files in the same
+directory. See [`elixir/docs/logging.md`](./docs/logging.md) for the logging
+contract and on-disk shape.
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
