@@ -3045,10 +3045,12 @@ mod tests {
     }
 
     fn tracker_config(base_url: &str, assignee: Option<&str>) -> ServiceConfig {
+        static NEXT_API_KEY_ID: AtomicUsize = AtomicUsize::new(1);
+        let api_key = format!("token-{}", NEXT_API_KEY_ID.fetch_add(1, Ordering::SeqCst));
         let mut tracker = json!({
             "kind": "todoist",
             "base_url": base_url,
-            "api_key": "token",
+            "api_key": api_key,
             "project_id": "proj",
             "active_states": ["Todo", "In Progress"],
             "terminal_states": ["Done"]
