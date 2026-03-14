@@ -16,104 +16,122 @@ description:
 
 ## Log Sources
 
-- Primary runtime log: `log/symphony.log`
-  - Default comes from `SymphonyElixir.LogFile` (`log/symphony.log`).
-  - Includes orchestrator, agent runner, and Codex app-server lifecycle logs.
-- Rotated runtime logs: `log/symphony.log*`
-  - Check these when the relevant run is older.
+`log/symphony.log` is relative to the runtime current working directory unless
+`--logs-root` is passed. In this repo that usually means:
+
+- running from repo root: `log/symphony.log`
+- running from `rust-todoist/`: `rust-todoist/log/symphony.log`
+- running from `elixir/`: `elixir/log/symphony.log`
+- overriding with `--logs-root /path`: `/path/log/symphony.log`
+
+Check rotated logs too:
+
+- Rust: `symphony.log.1` through `symphony.log.5`
+- Elixir: wrapped disk-log files rooted at `symphony.log`, plus `.idx` and
+  `.siz` metadata
 
 ## Correlation Keys
 
-- `issue_identifier`: human ticket or task key (example: `ABC-123`)
-- `issue_id`: tracker internal ID (stable internal ID; exact shape depends on
-  the active tracker)
-- `session_id`: Codex thread-turn pair (`<thread_id>-<turn_id>`)
+- `issue_identifier`: human ticket or task key such as `ABC-123`
+- `issue_id`: tracker internal ID
+- `run_id`: orchestrator attempt identifier
+- `session_id`: Codex session identifier
+- `thread_id`: Codex thread identifier
+- `turn_id`: Codex turn identifier
 
-`elixir/docs/logging.md` requires these fields for issue/session lifecycle logs. Use
-them as your join keys during debugging.
+Prefer `run_id` as the first Rust correlation key when you have it, then narrow
+to `session_id` and `turn_id`.
 
-## Quick Triage (Stuck Run)
+## Quick Triage
 
-1. Confirm scheduler/worker symptoms for the ticket.
-2. Find recent lines for the ticket (`issue_identifier` first).
-3. Extract `session_id` from matching lines.
-4. Trace that `session_id` across start, stream, completion/failure, and stall
-   handling logs.
-5. Decide class of failure: timeout/stall, app-server startup failure, turn
-   failure, or orchestrator retry loop.
+1. Confirm the runtime and the working directory used to launch it.
+2. Search the correct `log/symphony.log*` path for `issue_identifier` first.
+3. Extract `run_id` and `session_id` from matching lines.
+4. Trace that `run_id` or `session_id` across start, stream, retries,
+   completion/failure, and stall handling logs.
+5. Decide the failure class before reading more widely.
 
 ## Commands
 
 ```bash
-# 1) Narrow by ticket key (fastest entry point)
+# 1) Narrow by ticket key
 rg -n "issue_identifier=<tracker-key>" log/symphony.log*
 
-# 2) If needed, narrow by tracker internal ID
+# 2) If available, narrow by runtime attempt
+rg -n "run_id=<run-id>" log/symphony.log*
+
+# 3) If needed, narrow by tracker internal ID
 rg -n "issue_id=<tracker-internal-id>" log/symphony.log*
 
-# 3) Pull session IDs seen for that ticket
+# 4) Pull session IDs seen for that run or ticket
 rg -o "session_id=[^ ;]+" log/symphony.log* | sort -u
 
-# 4) Trace one session end-to-end
-rg -n "session_id=<thread>-<turn>" log/symphony.log*
+# 5) Trace one session end-to-end
+rg -n "session_id=<session-id>|thread_id=<thread-id>|turn_id=<turn-id>" log/symphony.log*
 
-# 5) Focus on stuck/retry signals
-rg -n "Issue stalled|scheduling retry|turn_timeout|turn_failed|Codex session failed|Codex session ended with error" log/symphony.log*
+# 6) Focus on stuck, timeout, and retry signals
+rg -n "reconcile=status=stalled|turn_timeout|response_timeout|dynamic_tool_call|todoist .*retry|Issue stalled|Codex session failed|Codex session ended with error" log/symphony.log*
 ```
 
 ## Investigation Flow
 
 1. Locate the ticket slice:
-    - Search by `issue_identifier=<KEY>`.
-    - If noise is high, add `issue_id=<UUID>`.
+   - Search by `issue_identifier=<KEY>`.
+   - If present, pin to one `run_id=<...>`.
 2. Establish timeline:
-    - Identify first `Codex session started ... session_id=...`.
-    - Follow with `Codex session completed`, `ended with error`, or worker exit
-      lines.
+   - Identify dispatch/start lines for that run.
+   - Follow with `session_id`, `thread_id`, and `turn_id`.
 3. Classify the problem:
-    - Stall loop: `Issue stalled ... restarting with backoff`.
-    - App-server startup: `Codex session failed ...`.
-    - Turn execution failure: `turn_failed`, `turn_cancelled`, `turn_timeout`, or
-      `ended with error`.
-    - Worker crash: `Agent task exited ... reason=...`.
+   - Todoist poller instability:
+     - tracker retry warning with `source=poller`
+     - usually outside an active session
+   - Todoist tool-call retry:
+     - tracker retry warning with `source=tool_call`
+     - usually shares `issue_id`, `issue_identifier`, `run_id`, and `session_id`
+   - Tracker blocking on long `retry_after`:
+     - `reason=rate_limited`
+     - `retry_after_secs` or `detail=retry_after=...`
+   - Codex timeout or stall:
+     - `response_timeout`, `turn_timeout`, or `reconcile=status=stalled`
 4. Validate scope:
-    - Check whether failures are isolated to one issue/session or repeating across
-      multiple tickets.
+   - Check whether failures are isolated to one run or repeating across
+     multiple tasks.
 5. Capture evidence:
-    - Save key log lines with timestamps, `issue_identifier`, `issue_id`, and
-      `session_id`.
-    - Record probable root cause and the exact failing stage.
+   - Save key log lines with timestamps plus the correlation keys you used.
+   - Record the exact failing stage, not just the symptom.
 
-## Reading Codex Session Logs
+## Reading Rust Session Logs
 
-In Symphony, Codex session diagnostics are emitted into `log/symphony.log` and
-keyed by `session_id`. Read them as a lifecycle:
+In the Rust runtime, the most useful lifecycle chain is:
 
-1. `Codex session started ... session_id=...`
-2. Session stream/lifecycle events for the same `session_id`
-3. Terminal event:
-    - `Codex session completed ...`, or
-    - `Codex session ended with error ...`, or
-    - `Issue stalled ... restarting with backoff`
+1. run and session start lines containing `run_id=...`
+2. `dynamic_tool_call ...`
+3. `codex_turn_summary ...`
+4. terminal lifecycle lines such as completion, `response_timeout`,
+   `turn_timeout`, or `reconcile=status=stalled`
 
-For one specific session investigation, keep the trace narrow:
+When Todoist tool retries occur inside a turn, expect the tracker warning and
+the final tool/session summary to line up:
 
-1. Capture one `session_id` for the ticket.
-2. Build a timestamped slice for only that session:
-    - `rg -n "session_id=<thread>-<turn>" log/symphony.log*`
-3. Mark the exact failing stage:
-    - Startup failure before stream events (`Codex session failed ...`).
-    - Turn/runtime failure after stream events (`turn_*` / `ended with error`).
-    - Stall recovery (`Issue stalled ... restarting with backoff`).
-4. Pair findings with `issue_identifier` and `issue_id` from nearby lines to
-   confirm you are not mixing concurrent retries.
+- tracker warning: `reason=... source=tool_call detail=...`
+- tool summary: `retry_count=... retry_wait_secs=...`
+- turn summary: `tool_retry_count_total=... tool_retry_wait_secs_total=...`
 
-Always pair session findings with `issue_identifier`/`issue_id` to avoid mixing
-concurrent runs.
+## Reading Elixir Session Logs
+
+In the Elixir runtime, keep the investigation narrower:
+
+1. `issue_identifier=...` and `issue_id=...`
+2. `session_id=...`
+3. session start/completion/error lines
+4. stall recovery such as `Issue stalled ... restarting with backoff`
+
+Focus on lifecycle timing and session state rather than per-tool retry counters.
 
 ## Notes
 
 - Prefer `rg` over `grep` for speed on large logs.
-- Check rotated logs (`log/symphony.log*`) before concluding data is missing.
-- If required context fields are missing in new log statements, align with
-  `elixir/docs/logging.md` conventions.
+- Check rotated logs before concluding the data is missing.
+- If a new runtime log omits `run_id`, `issue_id`, `issue_identifier`,
+  `session_id`, `thread_id`, or `turn_id` where they should exist, treat that as
+  a logging gap worth fixing.

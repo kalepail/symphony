@@ -168,7 +168,9 @@ When the session includes `todoist`, prefer narrow direct operations over explor
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `Human Review` -> PR is attached, validated, and ready for review.
+- Define `Blocked` or `Stuck` sections separately if the workflow needs
+  explicit non-review handoff states.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` (implicit after `close_task`) -> terminal completed state; no further action required.

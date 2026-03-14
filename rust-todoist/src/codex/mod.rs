@@ -22,7 +22,10 @@ use crate::{
     dynamic_tool,
     issue::Issue,
     logging,
-    tracker::TrackerClient,
+    tracker::{
+        RequestLogContext, RequestLogHandle, RequestRetrySummary, TrackerClient,
+        with_request_log_handle,
+    },
     workspace::{
         remote_shell_assign, ssh_args, ssh_executable, validate_workspace_path_for_worker,
     },
@@ -55,6 +58,8 @@ pub struct CodexEvent {
     pub error_message: Option<String>,
     pub http_status: Option<u16>,
     pub retry_after_secs: Option<u64>,
+    pub retry_count: Option<u32>,
+    pub retry_wait_secs: Option<u64>,
     pub upstream_service: Option<String>,
 }
 
@@ -146,6 +151,8 @@ struct ToolEventMetadata {
     error_message: Option<String>,
     http_status: Option<u16>,
     retry_after_secs: Option<u64>,
+    retry_count: Option<u32>,
+    retry_wait_secs: Option<u64>,
     upstream_service: Option<String>,
 }
 
@@ -684,10 +691,26 @@ impl AppServerSession {
                 let tool = tool_call_name(&params).unwrap_or_default();
                 let arguments = tool_call_arguments(&params);
                 let started_at = Instant::now();
-                let result =
-                    dynamic_tool::execute(&self.config, self.tracker.as_ref(), &tool, arguments)
-                        .await;
-                let tool_metadata = tool_event_metadata(message, &result, started_at.elapsed());
+                let tool_action = tool_action_label(Some(&tool), &arguments);
+                let request_log = RequestLogHandle::new(RequestLogContext {
+                    source: "tool_call".to_string(),
+                    issue_id: Some(turn.issue_id.to_string()),
+                    issue_identifier: Some(turn.issue_identifier.to_string()),
+                    run_id: Some(turn.run_id.to_string()),
+                    session_id: Some(turn.session_id.to_string()),
+                    thread_id: Some(turn.thread_id.clone()),
+                    turn_id: Some(turn.turn_id.to_string()),
+                    tool_name: Some(tool.clone()),
+                    tool_action: tool_action.clone(),
+                });
+                let result = with_request_log_handle(
+                    request_log.clone(),
+                    dynamic_tool::execute(&self.config, self.tracker.as_ref(), &tool, arguments),
+                )
+                .await;
+                let retry_summary = request_log.retry_summary();
+                let tool_metadata =
+                    tool_event_metadata(message, &result, started_at.elapsed(), &retry_summary);
                 let event_payload = tool_event_payload(message, &result, &tool_metadata);
                 self.send_json(&json!({
                     "id": request_id,
@@ -727,7 +750,7 @@ impl AppServerSession {
                     .map(inline_log_value)
                     .unwrap_or_else(|| "none".to_string());
                 info!(
-                    "dynamic_tool_call status={} {} tool={} action={} call_id={} success={} duration_ms={} upstream_service={} error_kind={} http_status={} retry_after_secs={} error={}",
+                    "dynamic_tool_call status={} {} tool={} action={} call_id={} success={} duration_ms={} upstream_service={} error_kind={} http_status={} retry_after_secs={} retry_count={} retry_wait_secs={} error={}",
                     tool_status,
                     turn_log_context(turn),
                     tool,
@@ -748,6 +771,14 @@ impl AppServerSession {
                         .retry_after_secs
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "n/a".to_string()),
+                    tool_metadata
+                        .retry_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                    tool_metadata
+                        .retry_wait_secs
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
                     error_summary,
                 );
                 on_event(event(turn, event_name, None, None, event_payload, None));
@@ -1203,13 +1234,20 @@ fn tool_event_payload(message: &Value, result: &Value, metadata: &ToolEventMetad
             "error_message": metadata.error_message,
             "http_status": metadata.http_status,
             "retry_after_secs": metadata.retry_after_secs,
+            "retry_count": metadata.retry_count,
+            "retry_wait_secs": metadata.retry_wait_secs,
             "upstream_service": metadata.upstream_service
         }),
     );
     Value::Object(payload)
 }
 
-fn tool_event_metadata(message: &Value, result: &Value, duration: Duration) -> ToolEventMetadata {
+fn tool_event_metadata(
+    message: &Value,
+    result: &Value,
+    duration: Duration,
+    retry_summary: &RequestRetrySummary,
+) -> ToolEventMetadata {
     let params = message.get("params").cloned().unwrap_or_default();
     let tool_name = tool_call_name(&params);
     let arguments = tool_call_arguments(&params);
@@ -1265,6 +1303,9 @@ fn tool_event_metadata(message: &Value, result: &Value, duration: Duration) -> T
         error_message,
         http_status,
         retry_after_secs,
+        retry_count: (retry_summary.retry_count > 0).then_some(retry_summary.retry_count),
+        retry_wait_secs: (retry_summary.total_wait_secs > 0)
+            .then_some(retry_summary.total_wait_secs),
         upstream_service,
     }
 }
@@ -1296,6 +1337,8 @@ fn tool_metadata_from_payload(payload: &Value) -> ToolEventMetadata {
             .map(ToOwned::to_owned),
         http_status: telemetry.get("http_status").and_then(value_as_u16),
         retry_after_secs: telemetry.get("retry_after_secs").and_then(value_as_u64),
+        retry_count: telemetry.get("retry_count").and_then(value_as_u32),
+        retry_wait_secs: telemetry.get("retry_wait_secs").and_then(value_as_u64),
         upstream_service: telemetry
             .get("upstream_service")
             .and_then(Value::as_str)
@@ -1362,6 +1405,10 @@ fn value_as_u16(value: &Value) -> Option<u16> {
     value_as_u64(value).and_then(|value| u16::try_from(value).ok())
 }
 
+fn value_as_u32(value: &Value) -> Option<u32> {
+    value_as_u64(value).and_then(|value| u32::try_from(value).ok())
+}
+
 fn value_as_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => {
@@ -1422,6 +1469,8 @@ fn event(
         error_message: tool_metadata.error_message,
         http_status: tool_metadata.http_status,
         retry_after_secs: tool_metadata.retry_after_secs,
+        retry_count: tool_metadata.retry_count,
+        retry_wait_secs: tool_metadata.retry_wait_secs,
         upstream_service: tool_metadata.upstream_service,
     }
 }
@@ -1454,6 +1503,8 @@ fn event_with(
         error_message: None,
         http_status: None,
         retry_after_secs: None,
+        retry_count: None,
+        retry_wait_secs: None,
         upstream_service: None,
     }
 }

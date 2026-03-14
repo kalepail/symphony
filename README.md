@@ -47,6 +47,23 @@ For Rust Todoist planning and implementation docs, see:
 - [`rust-todoist/scripts/`](rust-todoist/scripts) is for Rust Todoist runtime-local helper scripts.
 - [`scripts/smoke_repo_baseline/`](scripts/smoke_repo_baseline) is a fixture that models the root of the external smoke repo, which is why it includes its own `AGENTS.md`.
 
+## Logs
+
+Runtime file logs are written relative to the process current working directory unless `--logs-root`
+is provided.
+
+- Launch from repo root: `log/symphony.log`
+- Launch from `rust-todoist/`: `rust-todoist/log/symphony.log`
+- Launch from `elixir/`: `elixir/log/symphony.log`
+- Override with `--logs-root /path`: `/path/log/symphony.log`
+
+Rotation is size-based in both runtimes, not daily:
+
+- Rust keeps the current file plus `symphony.log.1` through `symphony.log.5`, rotating before a
+  write would exceed 10 MB.
+- Elixir uses OTP's wrapped disk log with 5 files at 10 MB each, plus `.idx` and `.siz` metadata
+  files in the same directory.
+
 ---
 
 ## License

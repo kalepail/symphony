@@ -20,7 +20,7 @@ use crate::{
     issue::{Issue, normalize_state_name, todoist_review_comments_from_values},
     tracker::{
         TODOIST_COMMENT_SIZE_LIMIT, TrackerCapabilities, TrackerClient, TrackerError,
-        TrackerRateBudget,
+        TrackerRateBudget, current_request_log_handle,
     },
 };
 
@@ -79,6 +79,15 @@ struct TodoistRetryPolicy {
 enum TodoistRequestLane {
     Rest,
     Sync,
+}
+
+impl TodoistRequestLane {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rest => "rest",
+            Self::Sync => "sync",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -623,6 +632,7 @@ impl TodoistTracker {
         let url = format!("{}{}", self.base_url(), path);
         let request_id = todoist_request_id(&method);
         let retry_policy = retry_policy_for_request(&method, path);
+        let request_log = current_request_log_handle();
         let mut attempts = 0usize;
         let mut waited_secs = 0u64;
 
@@ -655,6 +665,9 @@ impl TodoistTracker {
                     if let Some(delay_secs) =
                         retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
                     {
+                        if let Some(request_log) = request_log.as_ref() {
+                            request_log.record_retry(delay_secs);
+                        }
                         warn!(
                             method = method.as_str(),
                             path,
@@ -663,6 +676,34 @@ impl TodoistTracker {
                             delay_secs,
                             total_wait_secs = waited_secs.saturating_add(delay_secs),
                             reason = todoist_retry_reason(&error),
+                            source = todoist_retry_source(
+                                request_log.as_ref(),
+                                TodoistRequestLane::Rest
+                            ),
+                            request_lane = TodoistRequestLane::Rest.as_str(),
+                            issue_id =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .issue_id
+                                    .as_deref()),
+                            issue_identifier =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .issue_identifier
+                                    .as_deref()),
+                            run_id = todoist_request_field(request_log.as_ref(), |context| context
+                                .run_id
+                                .as_deref()),
+                            session_id =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .session_id
+                                    .as_deref()),
+                            tool = todoist_request_field(request_log.as_ref(), |context| context
+                                .tool_name
+                                .as_deref()),
+                            tool_action =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .tool_action
+                                    .as_deref()),
+                            detail = todoist_retry_detail(&error),
                             "todoist request transient failure; retrying"
                         );
                         attempts += 1;
@@ -694,6 +735,9 @@ impl TodoistTracker {
             if let Some(delay_secs) =
                 retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
             {
+                if let Some(request_log) = request_log.as_ref() {
+                    request_log.record_retry(delay_secs);
+                }
                 warn!(
                     method = method.as_str(),
                     path,
@@ -702,6 +746,28 @@ impl TodoistTracker {
                     delay_secs,
                     total_wait_secs = waited_secs.saturating_add(delay_secs),
                     reason = todoist_retry_reason(&error),
+                    source = todoist_retry_source(request_log.as_ref(), TodoistRequestLane::Rest),
+                    request_lane = TodoistRequestLane::Rest.as_str(),
+                    issue_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .issue_id
+                        .as_deref()),
+                    issue_identifier =
+                        todoist_request_field(request_log.as_ref(), |context| context
+                            .issue_identifier
+                            .as_deref()),
+                    run_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .run_id
+                        .as_deref()),
+                    session_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .session_id
+                        .as_deref()),
+                    tool = todoist_request_field(request_log.as_ref(), |context| context
+                        .tool_name
+                        .as_deref()),
+                    tool_action = todoist_request_field(request_log.as_ref(), |context| context
+                        .tool_action
+                        .as_deref()),
+                    detail = todoist_retry_detail(&error),
                     "todoist request failed transiently; retrying"
                 );
                 attempts += 1;
@@ -719,6 +785,7 @@ impl TodoistTracker {
         let url = format!("{}/sync", self.base_url());
         let request_id = sync_id("todoist-sync");
         let retry_policy = retry_policy_for_sync_form(form);
+        let request_log = current_request_log_handle();
         let mut attempts = 0usize;
         let mut waited_secs = 0u64;
 
@@ -742,6 +809,9 @@ impl TodoistTracker {
                     if let Some(delay_secs) =
                         retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
                     {
+                        if let Some(request_log) = request_log.as_ref() {
+                            request_log.record_retry(delay_secs);
+                        }
                         warn!(
                             path = "/sync",
                             attempt = attempts + 1,
@@ -749,6 +819,34 @@ impl TodoistTracker {
                             delay_secs,
                             total_wait_secs = waited_secs.saturating_add(delay_secs),
                             reason = todoist_retry_reason(&error),
+                            source = todoist_retry_source(
+                                request_log.as_ref(),
+                                TodoistRequestLane::Sync
+                            ),
+                            request_lane = TodoistRequestLane::Sync.as_str(),
+                            issue_id =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .issue_id
+                                    .as_deref()),
+                            issue_identifier =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .issue_identifier
+                                    .as_deref()),
+                            run_id = todoist_request_field(request_log.as_ref(), |context| context
+                                .run_id
+                                .as_deref()),
+                            session_id =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .session_id
+                                    .as_deref()),
+                            tool = todoist_request_field(request_log.as_ref(), |context| context
+                                .tool_name
+                                .as_deref()),
+                            tool_action =
+                                todoist_request_field(request_log.as_ref(), |context| context
+                                    .tool_action
+                                    .as_deref()),
+                            detail = todoist_retry_detail(&error),
                             "todoist sync request transient failure; retrying"
                         );
                         attempts += 1;
@@ -776,6 +874,9 @@ impl TodoistTracker {
             if let Some(delay_secs) =
                 retry_delay_for_attempt(&error, attempts, waited_secs, retry_policy)
             {
+                if let Some(request_log) = request_log.as_ref() {
+                    request_log.record_retry(delay_secs);
+                }
                 warn!(
                     path = "/sync",
                     attempt = attempts + 1,
@@ -783,6 +884,28 @@ impl TodoistTracker {
                     delay_secs,
                     total_wait_secs = waited_secs.saturating_add(delay_secs),
                     reason = todoist_retry_reason(&error),
+                    source = todoist_retry_source(request_log.as_ref(), TodoistRequestLane::Sync),
+                    request_lane = TodoistRequestLane::Sync.as_str(),
+                    issue_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .issue_id
+                        .as_deref()),
+                    issue_identifier =
+                        todoist_request_field(request_log.as_ref(), |context| context
+                            .issue_identifier
+                            .as_deref()),
+                    run_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .run_id
+                        .as_deref()),
+                    session_id = todoist_request_field(request_log.as_ref(), |context| context
+                        .session_id
+                        .as_deref()),
+                    tool = todoist_request_field(request_log.as_ref(), |context| context
+                        .tool_name
+                        .as_deref()),
+                    tool_action = todoist_request_field(request_log.as_ref(), |context| context
+                        .tool_action
+                        .as_deref()),
+                    detail = todoist_retry_detail(&error),
                     "todoist sync request failed transiently; retrying"
                 );
                 attempts += 1;
@@ -2745,6 +2868,80 @@ fn todoist_retry_reason(error: &TrackerError) -> &'static str {
         TrackerError::TodoistApiRequest(_) => "transport_error",
         _ => "non_retryable",
     }
+}
+
+fn todoist_retry_detail(error: &TrackerError) -> String {
+    match error {
+        TrackerError::TodoistApiRequest(reason) => inline_todoist_log_value(reason),
+        TrackerError::TodoistApiStatus { status, body } => {
+            let body = inline_todoist_log_value(body);
+            if body == "none" {
+                format!("http_status={status}")
+            } else {
+                format!("http_status={status} body={body}")
+            }
+        }
+        TrackerError::TodoistRateLimited { retry_after } => retry_after
+            .map(|value| format!("retry_after={value}s"))
+            .unwrap_or_else(|| "retry_after=n/a".to_string()),
+        _ => "none".to_string(),
+    }
+}
+
+fn todoist_retry_source(
+    request_log: Option<&crate::tracker::RequestLogHandle>,
+    lane: TodoistRequestLane,
+) -> &'static str {
+    request_log
+        .map(|request_log| request_log.context())
+        .and_then(|context| match context.source.as_str() {
+            "tool_call" => Some("tool_call"),
+            "poller" => Some("poller"),
+            "startup" => Some("startup"),
+            "sync" => Some("sync"),
+            _ => None,
+        })
+        .unwrap_or(match lane {
+            TodoistRequestLane::Rest => "poller",
+            TodoistRequestLane::Sync => "sync",
+        })
+}
+
+fn todoist_request_field<F>(
+    request_log: Option<&crate::tracker::RequestLogHandle>,
+    getter: F,
+) -> String
+where
+    F: Fn(&crate::tracker::RequestLogContext) -> Option<&str>,
+{
+    request_log
+        .map(|request_log| request_log.context())
+        .and_then(|context| {
+            getter(&context)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn inline_todoist_log_value(value: &str) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+
+    const MAX_CHARS: usize = 180;
+    let mut result = String::new();
+    for (count, ch) in trimmed.chars().enumerate() {
+        if count >= MAX_CHARS {
+            result.push_str("...");
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 fn map_todoist_status(status: StatusCode, retry_after: Option<u64>, text: &str) -> TrackerError {

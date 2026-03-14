@@ -23,7 +23,10 @@ use crate::{
     config::ServiceConfig,
     issue::{Issue, normalize_state_name},
     prompt,
-    tracker::{TrackerClient, TrackerError, TrackerRateBudget, build_tracker_client},
+    tracker::{
+        RequestLogContext, RequestLogHandle, TrackerClient, TrackerError, TrackerRateBudget,
+        build_tracker_client, with_request_log_handle,
+    },
     workflow::WorkflowStore,
     workspace::{
         Workspace, WorkspaceError, sanitize_identifier, ssh_args, ssh_executable,
@@ -445,6 +448,8 @@ pub struct TurnStartContextSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_execution_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -452,6 +457,10 @@ pub struct TurnStartContextSnapshot {
     pub http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_retry_count_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_retry_wait_secs_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_service: Option<String>,
 }
@@ -574,11 +583,11 @@ impl Orchestrator {
 
         let tracker =
             build_tracker_client(effective.config.clone()).map_err(|error| error.to_string())?;
-        tracker
-            .validate_startup()
+        with_tracker_log_context("startup", tracker.validate_startup())
             .await
             .map_err(|error| error.to_string())?;
-        let initial_todoist_rate_budget = tracker.rate_budget().await;
+        let initial_todoist_rate_budget =
+            with_tracker_log_context("startup", tracker.rate_budget()).await;
         let (tx, mut rx) = mpsc::channel(256);
         let (updates_tx, updates_rx) = watch::channel(0u64);
         let snapshot_cache = Arc::new(Mutex::new(SnapshotCache {
@@ -803,6 +812,17 @@ impl Orchestrator {
     }
 }
 
+async fn with_tracker_log_context<F, T>(source: &'static str, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let handle = RequestLogHandle::new(RequestLogContext {
+        source: source.to_string(),
+        ..RequestLogContext::default()
+    });
+    with_request_log_handle(handle, future).await
+}
+
 impl OrchestratorHandle {
     pub fn subscribe_observability(&self) -> watch::Receiver<u64> {
         self.updates.clone()
@@ -915,8 +935,9 @@ async fn run_tick(
                         }
                     };
                     if startup_validation_needed(state, &effective.config) {
-                        let validate_result = tracker.validate_startup().await;
-                        capture_tracker_rate_budget(state, tracker.as_ref()).await;
+                        let validate_result =
+                            with_tracker_log_context("startup", tracker.validate_startup()).await;
+                        capture_tracker_rate_budget(state, tracker.as_ref(), "startup").await;
                         if let Err(error) = validate_result {
                             error!("dispatch=status=blocked reason={error}");
                             schedule_next_tick(tx, state);
@@ -926,8 +947,9 @@ async fn run_tick(
                         }
                         mark_startup_validated(state, &effective.config);
                     }
-                    let issues_result = tracker.fetch_candidate_issues().await;
-                    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+                    let issues_result =
+                        with_tracker_log_context("poller", tracker.fetch_candidate_issues()).await;
+                    capture_tracker_rate_budget(state, tracker.as_ref(), "poller").await;
                     match issues_result {
                         Ok(issues) => {
                             let active_states = effective.config.active_state_set();
@@ -1058,8 +1080,72 @@ fn refresh_runtime_config(workflow_store: &WorkflowStore, state: &mut State) {
     state.worker_runtime = worker_runtime_from_config(&effective.config);
 }
 
-async fn capture_tracker_rate_budget(state: &mut State, tracker: &dyn TrackerClient) {
-    state.todoist_rate_budget = tracker.rate_budget().await;
+async fn capture_tracker_rate_budget(
+    state: &mut State,
+    tracker: &dyn TrackerClient,
+    source: &'static str,
+) {
+    let previous = state.todoist_rate_budget.clone();
+    let next = with_tracker_log_context(source, tracker.rate_budget()).await;
+    log_tracker_rate_budget_transition(previous.as_ref(), next.as_ref(), source);
+    state.todoist_rate_budget = next;
+}
+
+fn log_tracker_rate_budget_transition(
+    previous: Option<&TrackerRateBudget>,
+    next: Option<&TrackerRateBudget>,
+    source: &'static str,
+) {
+    if previous == next {
+        return;
+    }
+
+    let was_throttled = previous.is_some_and(tracker_rate_budget_is_throttled);
+    let is_throttled = next.is_some_and(tracker_rate_budget_is_throttled);
+
+    match (was_throttled, is_throttled, next) {
+        (_, true, Some(budget)) => {
+            warn!(
+                "todoist_rate_budget status=throttled source={} service={} retry_after_secs={} throttled_for_secs={} next_request_in_secs={} limit={} remaining={} reset_in_secs={}",
+                source,
+                budget.service,
+                optional_u64_for_log(budget.retry_after_seconds),
+                optional_u64_for_log(budget.throttled_for_seconds),
+                optional_u64_for_log(budget.next_request_in_seconds),
+                optional_u64_for_log(budget.limit),
+                optional_u64_for_log(budget.remaining),
+                optional_u64_for_log(budget.reset_in_seconds),
+            );
+        }
+        (true, false, Some(budget)) => {
+            info!(
+                "todoist_rate_budget status=cleared source={} service={} next_request_in_secs={} limit={} remaining={} reset_in_secs={}",
+                source,
+                budget.service,
+                optional_u64_for_log(budget.next_request_in_seconds),
+                optional_u64_for_log(budget.limit),
+                optional_u64_for_log(budget.remaining),
+                optional_u64_for_log(budget.reset_in_seconds),
+            );
+        }
+        (true, false, None) => {
+            info!(
+                "todoist_rate_budget status=cleared source={} service=todoist next_request_in_secs=n/a limit=n/a remaining=n/a reset_in_secs=n/a",
+                source
+            );
+        }
+        _ => {}
+    }
+}
+
+fn tracker_rate_budget_is_throttled(budget: &TrackerRateBudget) -> bool {
+    budget.retry_after_seconds.is_some() || budget.throttled_for_seconds.is_some()
+}
+
+fn optional_u64_for_log(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn startup_validation_needed(state: &State, config: &ServiceConfig) -> bool {
@@ -1081,7 +1167,7 @@ async fn startup_terminal_cleanup(workflow_store: &WorkflowStore, tracker: &dyn 
     let effective = workflow_store.effective();
     let worker_runtime = worker_runtime_from_config(&effective.config);
 
-    match tracker.fetch_open_issues().await {
+    match with_tracker_log_context("startup", tracker.fetch_open_issues()).await {
         Ok(issues) => {
             let live_workspaces: BTreeSet<String> = issues
                 .iter()
@@ -1184,8 +1270,9 @@ async fn reconcile_running_issues(
         }
     };
     let running_ids: Vec<String> = state.running.keys().cloned().collect();
-    let issues_result = tracker.fetch_issue_states_by_ids(&running_ids).await;
-    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+    let issues_result =
+        with_tracker_log_context("poller", tracker.fetch_issue_states_by_ids(&running_ids)).await;
+    capture_tracker_rate_budget(state, tracker.as_ref(), "poller").await;
     match issues_result {
         Ok(issues) => {
             let returned_ids: BTreeSet<String> =
@@ -1217,7 +1304,12 @@ async fn reconcile_running_issues(
                         "reconcile=status=missing_unexpected issue_id={} issue_identifier={} reason=not_returned_by_tracker previous_state={}",
                         missing_id, identifier, previous_issue.state
                     );
-                    match tracker.restore_active_issue(&previous_issue).await {
+                    match with_tracker_log_context(
+                        "poller",
+                        tracker.restore_active_issue(&previous_issue),
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             info!(
                                 "reconcile=status=restored issue_id={} issue_identifier={} state={}",
@@ -1260,7 +1352,12 @@ async fn reconcile_running_issues(
                                 "reconcile=status=unexpected_terminal issue_id={} issue_identifier={} state={} previous_state={}",
                                 issue.id, issue.identifier, issue.state, previous_issue.state
                             );
-                            match tracker.restore_active_issue(&previous_issue).await {
+                            match with_tracker_log_context(
+                                "poller",
+                                tracker.restore_active_issue(&previous_issue),
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     info!(
                                         "reconcile=status=restored issue_id={} issue_identifier={} state={}",
@@ -1355,17 +1452,44 @@ async fn reconcile_stalled_runs(
             let tracked_issue = running.issue.clone();
             let worker_host = running.worker_host.clone();
             let workspace_location = running.workspace_location.clone();
-            warn!(
-                "reconcile=status=stalled {} elapsed_ms={} session_id={}",
-                crate::logging::run_context(&issue_id, &identifier, &run_id),
-                elapsed_ms,
-                session_id
-            );
-            if let Some(context) = state
+            let context = state
                 .context_metrics
                 .get(&issue_id)
-                .and_then(|context| context.last_turn_start.as_ref())
-            {
+                .and_then(|context| context.last_turn_start.as_ref());
+            warn!(
+                "reconcile=status=stalled {} elapsed_ms={} session_id={} last_event={} last_tool={} last_error_kind={} http_status={} retry_after_secs={} upstream_service={} error={} last_message={}",
+                crate::logging::run_context(&issue_id, &identifier, &run_id),
+                elapsed_ms,
+                session_id,
+                running.last_codex_event.as_deref().unwrap_or("none"),
+                context
+                    .and_then(|context| context.last_tool_action.as_deref())
+                    .unwrap_or("none"),
+                context
+                    .and_then(|context| context.error_kind.as_deref())
+                    .unwrap_or("none"),
+                context
+                    .and_then(|context| context.http_status)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                context
+                    .and_then(|context| context.retry_after_secs)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                context
+                    .and_then(|context| context.upstream_service.as_deref())
+                    .unwrap_or("none"),
+                context
+                    .and_then(|context| context.error_message.as_deref())
+                    .map(inline_log_value)
+                    .unwrap_or_else(|| "none".to_string()),
+                running
+                    .last_codex_message
+                    .as_deref()
+                    .map(inline_log_value)
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+            if let Some(context) = context {
                 log_turn_summary(
                     &run_id,
                     &tracked_issue,
@@ -1584,10 +1708,12 @@ async fn dispatch_issue(
         }
     };
 
-    let refreshed = tracker
-        .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
-        .await;
-    capture_tracker_rate_budget(state, tracker.as_ref()).await;
+    let refreshed = with_tracker_log_context(
+        "poller",
+        tracker.fetch_issue_states_by_ids(std::slice::from_ref(&issue.id)),
+    )
+    .await;
+    capture_tracker_rate_budget(state, tracker.as_ref(), "poller").await;
     match refreshed {
         Ok(refreshed) => {
             let Some(issue) = refreshed.into_iter().next() else {
@@ -1838,10 +1964,12 @@ async fn handle_retry_issue_with_tracker(
     let effective = workflow_store.effective();
     let active_states = effective.config.active_state_set();
     let terminal_states = effective.config.terminal_state_set();
-    let issues_result = tracker
-        .fetch_issue_states_by_ids(&[issue_id.to_string()])
-        .await;
-    capture_tracker_rate_budget(state, tracker).await;
+    let issues_result = with_tracker_log_context(
+        "poller",
+        tracker.fetch_issue_states_by_ids(&[issue_id.to_string()]),
+    )
+    .await;
+    capture_tracker_rate_budget(state, tracker, "poller").await;
     match issues_result {
         Ok(issues) => {
             if let Some(issue) = issues.into_iter().find(|issue| issue.id == issue_id) {
@@ -2251,17 +2379,34 @@ fn update_turn_runtime_snapshot(state: &mut State, issue_id: &str, event: &Codex
             .or_insert(0) += 1;
         turn_context.repeated_action_summary =
             repeated_action_summary(&turn_context.tool_call_count_by_action);
+        turn_context.last_tool_action = Some(tool_action.clone());
     }
     if event.error_kind.is_some()
         || event.error_message.is_some()
         || event.http_status.is_some()
         || event.retry_after_secs.is_some()
+        || event.retry_count.is_some()
+        || event.retry_wait_secs.is_some()
         || event.upstream_service.is_some()
     {
         turn_context.error_kind = event.error_kind.clone();
         turn_context.error_message = event.error_message.clone();
         turn_context.http_status = event.http_status;
         turn_context.retry_after_secs = event.retry_after_secs;
+        if let Some(retry_count) = event.retry_count {
+            let next = turn_context
+                .tool_retry_count_total
+                .unwrap_or(0)
+                .saturating_add(retry_count);
+            turn_context.tool_retry_count_total = Some(next);
+        }
+        if let Some(retry_wait_secs) = event.retry_wait_secs {
+            let next = turn_context
+                .tool_retry_wait_secs_total
+                .unwrap_or(0)
+                .saturating_add(retry_wait_secs);
+            turn_context.tool_retry_wait_secs_total = Some(next);
+        }
         turn_context.upstream_service = event.upstream_service.clone();
     }
 }
@@ -2294,7 +2439,7 @@ fn log_turn_summary(
     status: &str,
 ) {
     info!(
-        "codex_turn_summary status={} {} worker_host={} turn={} kind={} continuation_reason={} prompt_bytes={} tool_calls_by_tool={} tool_calls_by_action={} repeated_actions={} command_execution_count={} last_error_kind={} http_status={} retry_after_secs={} upstream_service={}",
+        "codex_turn_summary status={} {} worker_host={} turn={} kind={} continuation_reason={} prompt_bytes={} tool_calls_by_tool={} tool_calls_by_action={} repeated_actions={} command_execution_count={} last_tool={} last_error_kind={} http_status={} retry_after_secs={} tool_retry_count_total={} tool_retry_wait_secs_total={} upstream_service={} error={}",
         status,
         crate::logging::run_context(&issue.id, &issue.identifier, run_id),
         crate::logging::worker_host_for_log(worker_host),
@@ -2312,6 +2457,7 @@ fn log_turn_summary(
             context.repeated_action_summary.join("|")
         },
         context.command_execution_count.unwrap_or(0),
+        context.last_tool_action.as_deref().unwrap_or("none"),
         context.error_kind.as_deref().unwrap_or("none"),
         context
             .http_status
@@ -2321,8 +2467,31 @@ fn log_turn_summary(
             .retry_after_secs
             .map(|value| value.to_string())
             .unwrap_or_else(|| "n/a".to_string()),
+        context
+            .tool_retry_count_total
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        context
+            .tool_retry_wait_secs_total
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string()),
         context.upstream_service.as_deref().unwrap_or("none"),
+        context
+            .error_message
+            .as_deref()
+            .map(inline_log_value)
+            .unwrap_or_else(|| "none".to_string()),
     );
+}
+
+fn inline_log_value(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 fn token_snapshot(running: &RunningEntry) -> TokenSnapshot {
@@ -2914,10 +3083,13 @@ async fn run_worker(
                         tool_call_count_by_action: BTreeMap::new(),
                         repeated_action_summary: Vec::new(),
                         command_execution_count: Some(0),
+                        last_tool_action: None,
                         error_kind: None,
                         error_message: None,
                         http_status: None,
                         retry_after_secs: None,
+                        tool_retry_count_total: Some(0),
+                        tool_retry_wait_secs_total: Some(0),
                         upstream_service: None,
                     },
                 )
@@ -2940,10 +3112,13 @@ async fn run_worker(
                         tool_call_count_by_action: BTreeMap::new(),
                         repeated_action_summary: Vec::new(),
                         command_execution_count: Some(0),
+                        last_tool_action: None,
                         error_kind: None,
                         error_message: None,
                         http_status: None,
                         retry_after_secs: None,
+                        tool_retry_count_total: Some(0),
+                        tool_retry_wait_secs_total: Some(0),
                         upstream_service: None,
                     },
                 )
@@ -3474,10 +3649,13 @@ mod tests {
                 tool_call_count_by_action: BTreeMap::new(),
                 repeated_action_summary: Vec::new(),
                 command_execution_count: Some(0),
+                last_tool_action: None,
                 error_kind: None,
                 error_message: None,
                 http_status: None,
                 retry_after_secs: None,
+                tool_retry_count_total: Some(0),
+                tool_retry_wait_secs_total: Some(0),
                 upstream_service: None,
             },
         );
@@ -3527,6 +3705,8 @@ mod tests {
             error_message: Some("GitHub API request failed with HTTP 403.".to_string()),
             http_status: Some(403),
             retry_after_secs: None,
+            retry_count: Some(2),
+            retry_wait_secs: Some(6),
             upstream_service: Some("github".to_string()),
         };
 
@@ -3560,6 +3740,8 @@ mod tests {
                 error_message: None,
                 http_status: None,
                 retry_after_secs: None,
+                retry_count: None,
+                retry_wait_secs: None,
                 upstream_service: None,
             },
         );
@@ -3585,8 +3767,18 @@ mod tests {
             vec!["github_api:GET:/repos/acme/repo/pulls:x2".to_string()]
         );
         assert_eq!(context.command_execution_count, Some(1));
+        assert_eq!(
+            context.last_tool_action.as_deref(),
+            Some("github_api:GET:/repos/acme/repo/pulls")
+        );
         assert_eq!(context.error_kind.as_deref(), Some("http_status"));
+        assert_eq!(
+            context.error_message.as_deref(),
+            Some("GitHub API request failed with HTTP 403.")
+        );
         assert_eq!(context.http_status, Some(403));
+        assert_eq!(context.tool_retry_count_total, Some(4));
+        assert_eq!(context.tool_retry_wait_secs_total, Some(12));
         assert_eq!(context.upstream_service.as_deref(), Some("github"));
     }
 
