@@ -2273,7 +2273,7 @@ fn repeated_action_summary(counts: &BTreeMap<String, u32>) -> Vec<String> {
     repeated
         .into_iter()
         .take(5)
-        .map(|(action, count)| format!("{action} x{count}"))
+        .map(|(action, count)| format!("{action}:x{count}"))
         .collect()
 }
 
@@ -2306,7 +2306,7 @@ fn log_turn_summary(
         if context.repeated_action_summary.is_empty() {
             "none".to_string()
         } else {
-            context.repeated_action_summary.join(" | ")
+            context.repeated_action_summary.join("|")
         },
         context.command_execution_count.unwrap_or(0),
         context.error_kind.as_deref().unwrap_or("none"),
@@ -3107,7 +3107,7 @@ mod tests {
         WorkerSelection, build_snapshot, candidate_issue, dispatch_issue,
         guarded_close_transition_may_be_in_flight, handle_retry_issue_with_tracker,
         handle_worker_exit, integrate_worker_turn_context, integrate_worker_update,
-        next_poll_delay, run_startup_terminal_cleanup, select_worker_host,
+        next_poll_delay, repeated_action_summary, run_startup_terminal_cleanup, select_worker_host,
         should_cleanup_terminal_workspace_after_guarded_close, sort_issues_for_dispatch,
         todoist_close_task_succeeded,
     };
@@ -3493,7 +3493,7 @@ mod tests {
             },
             "symphonyTelemetry": {
                 "tool_name": "github_api",
-                "tool_action": "github_api:GET /repos/acme/repo/pulls",
+                "tool_action": "github_api:GET:/repos/acme/repo/pulls",
                 "tool_success": false,
                 "tool_duration_ms": 150,
                 "error_kind": "http_status",
@@ -3517,7 +3517,7 @@ mod tests {
             raw: None,
             message: Some("tool failed".to_string()),
             tool_name: Some("github_api".to_string()),
-            tool_action: Some("github_api:GET /repos/acme/repo/pulls".to_string()),
+            tool_action: Some("github_api:GET:/repos/acme/repo/pulls".to_string()),
             tool_success: Some(false),
             tool_duration_ms: Some(150),
             error_kind: Some("http_status".to_string()),
@@ -3573,18 +3573,40 @@ mod tests {
         assert_eq!(
             context
                 .tool_call_count_by_action
-                .get("github_api:GET /repos/acme/repo/pulls")
+                .get("github_api:GET:/repos/acme/repo/pulls")
                 .copied(),
             Some(2)
         );
         assert_eq!(
             context.repeated_action_summary,
-            vec!["github_api:GET /repos/acme/repo/pulls x2".to_string()]
+            vec!["github_api:GET:/repos/acme/repo/pulls:x2".to_string()]
         );
         assert_eq!(context.command_execution_count, Some(1));
         assert_eq!(context.error_kind.as_deref(), Some("http_status"));
         assert_eq!(context.http_status, Some(403));
         assert_eq!(context.upstream_service.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn repeated_action_summary_is_whitespace_free() {
+        let counts = BTreeMap::from([
+            ("github_api:GET:/repos/acme/repo/pulls".to_string(), 2),
+            ("todoist:get_comments:task_id=123".to_string(), 3),
+        ]);
+
+        let summary = repeated_action_summary(&counts);
+        assert_eq!(
+            summary,
+            vec![
+                "todoist:get_comments:task_id=123:x3".to_string(),
+                "github_api:GET:/repos/acme/repo/pulls:x2".to_string(),
+            ]
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|entry| !entry.contains(char::is_whitespace))
+        );
     }
 
     #[tokio::test]

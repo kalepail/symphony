@@ -1321,7 +1321,7 @@ fn tool_action_label(tool_name: Option<&str>, arguments: &Value) -> Option<Strin
             let mut label = format!("todoist:{action}");
             for key in ["task_id", "project_id", "comment_id", "section_id"] {
                 if let Some(value) = args.get(key).and_then(value_as_string) {
-                    label.push(' ');
+                    label.push(':');
                     label.push_str(key);
                     label.push('=');
                     label.push_str(&value);
@@ -1344,7 +1344,7 @@ fn tool_action_label(tool_name: Option<&str>, arguments: &Value) -> Option<Strin
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("/");
-            Some(format!("github_api:{method} {path}"))
+            Some(format!("github_api:{method}:{path}"))
         }
         Some(other) if !other.is_empty() => Some(other.to_string()),
         _ => None,
@@ -1624,11 +1624,15 @@ mod tests {
 
     use crate::{
         config::ServiceConfig,
+        dynamic_tool,
         issue::Issue,
         tracker::{TrackerClient, TrackerError},
     };
 
-    use super::{AppServerClient, CodexError, CodexEvent, extract_rate_limits, extract_usage};
+    use super::{
+        AppServerClient, CodexError, CodexEvent, extract_rate_limits, extract_usage,
+        tool_action_label,
+    };
 
     struct StubTracker {
         tool_result: Result<Value, TrackerError>,
@@ -2062,6 +2066,36 @@ done
             Some(12)
         );
         assert_eq!(usage.source, "turn/completed.usage");
+    }
+
+    #[test]
+    fn todoist_action_labels_are_whitespace_free() {
+        let label = tool_action_label(
+            Some(dynamic_tool::TODOIST_TOOL),
+            &json!({
+                "action": "get_comments",
+                "task_id": "123"
+            }),
+        )
+        .expect("label");
+
+        assert_eq!(label, "todoist:get_comments:task_id=123");
+        assert!(!label.contains(char::is_whitespace));
+    }
+
+    #[test]
+    fn github_action_labels_are_whitespace_free() {
+        let label = tool_action_label(
+            Some(dynamic_tool::GITHUB_API_TOOL),
+            &json!({
+                "method": "GET",
+                "path": "/repos/acme/repo/pulls"
+            }),
+        )
+        .expect("label");
+
+        assert_eq!(label, "github_api:GET:/repos/acme/repo/pulls");
+        assert!(!label.contains(char::is_whitespace));
     }
 
     #[test]
