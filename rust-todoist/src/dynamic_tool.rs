@@ -1515,6 +1515,10 @@ async fn github_api_request(
             github_status_retry_delay_seconds(status, &headers, attempt, waited_secs)
         {
             let retry_after_secs = github_retry_after_seconds(&headers);
+            let response_summary_token = response_summary
+                .as_deref()
+                .map(inline_log_value)
+                .unwrap_or_else(|| "none".to_string());
             warn!(
                 "github_api status=retry method={} path={} attempt={} delay_secs={} http_status={} retry_after_secs={} reason={} error={}",
                 method.as_str(),
@@ -1526,9 +1530,7 @@ async fn github_api_request(
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "n/a".to_string()),
                 github_retry_reason(status, retry_after_secs),
-                response_summary
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string()),
+                response_summary_token,
             );
             waited_secs = waited_secs.saturating_add(delay_secs);
             sleep(Duration::from_secs(delay_secs)).await;
@@ -1693,6 +1695,21 @@ fn github_response_summary(response: &Value) -> Option<String> {
     } else {
         Some(truncate_log_detail(&parts.join("; "), 240))
     }
+}
+
+fn inline_log_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+
+    trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("|")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 fn github_error_entry_summary(error: &Value) -> Option<String> {
@@ -2887,6 +2904,14 @@ mod tests {
         assert_eq!(
             message,
             "GitHub API request failed with HTTP 400: Invalid request.; Commit:content:invalid"
+        );
+    }
+
+    #[test]
+    fn inline_log_value_emits_whitespace_free_token() {
+        assert_eq!(
+            super::inline_log_value(" Invalid request.\n\nCheck the payload. "),
+            "Invalid|request.|Check|the|payload."
         );
     }
 

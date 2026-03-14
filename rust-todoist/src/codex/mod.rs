@@ -1102,10 +1102,15 @@ fn turn_log_context(turn: &TurnContext<'_>) -> String {
 }
 
 fn inline_log_value(value: &str) -> String {
-    value
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+
+    trimmed
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("|")
         .chars()
         .take(240)
         .collect()
