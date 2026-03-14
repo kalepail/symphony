@@ -54,16 +54,25 @@ pub fn issue_identity(issue_id: &str, issue_identifier: &str) -> String {
     )
 }
 
+pub fn run_context(issue_id: &str, issue_identifier: &str, run_id: &str) -> String {
+    format!(
+        "{} run_id={}",
+        issue_identity(issue_id, issue_identifier),
+        run_id
+    )
+}
+
 pub fn codex_session_context(
     issue_id: &str,
     issue_identifier: &str,
+    run_id: &str,
     session_id: &str,
     thread_id: &str,
     turn_id: &str,
 ) -> String {
     format!(
         "{} session_id={} thread_id={} turn_id={}",
-        issue_identity(issue_id, issue_identifier),
+        run_context(issue_id, issue_identifier, run_id),
         session_id,
         thread_id,
         turn_id

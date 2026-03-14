@@ -42,10 +42,20 @@ pub struct CodexEvent {
     pub turn_id: Option<String>,
     pub codex_app_server_pid: Option<u32>,
     pub usage: Option<Value>,
+    pub usage_source: Option<String>,
     pub rate_limits: Option<Value>,
     pub payload: Option<Value>,
     pub raw: Option<String>,
     pub message: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_action: Option<String>,
+    pub tool_success: Option<bool>,
+    pub tool_duration_ms: Option<u64>,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+    pub http_status: Option<u16>,
+    pub retry_after_secs: Option<u64>,
+    pub upstream_service: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +92,7 @@ pub struct AppServerClient {
 pub struct AppServerSession {
     config: ServiceConfig,
     tracker: Arc<dyn TrackerClient>,
+    run_id: String,
     workspace: PathBuf,
     worker_host: Option<String>,
     child: Child,
@@ -104,6 +115,7 @@ struct TurnContext<'a> {
     worker_host: Option<String>,
     issue_id: &'a str,
     issue_identifier: &'a str,
+    run_id: &'a str,
     session_id: &'a str,
     thread_id: String,
     turn_id: &'a str,
@@ -116,6 +128,25 @@ struct ToolInputReply {
     answers: Value,
     event: &'static str,
     message: String,
+}
+
+#[derive(Clone, Debug)]
+struct UsageExtraction {
+    value: Value,
+    source: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolEventMetadata {
+    tool_name: Option<String>,
+    tool_action: Option<String>,
+    tool_success: Option<bool>,
+    tool_duration_ms: Option<u64>,
+    error_kind: Option<String>,
+    error_message: Option<String>,
+    http_status: Option<u16>,
+    retry_after_secs: Option<u64>,
+    upstream_service: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -156,14 +187,19 @@ impl AppServerClient {
         Self { config, tracker }
     }
 
-    pub async fn start_session(&self, workspace: &Path) -> Result<AppServerSession, CodexError> {
-        self.start_session_on_host(workspace, None).await
+    pub async fn start_session(
+        &self,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<AppServerSession, CodexError> {
+        self.start_session_on_host(workspace, None, run_id).await
     }
 
     pub async fn start_session_on_host(
         &self,
         workspace: &Path,
         worker_host: Option<&str>,
+        run_id: &str,
     ) -> Result<AppServerSession, CodexError> {
         validate_workspace_path_for_worker(&self.config, workspace, worker_host)
             .map_err(|error| CodexError::InvalidWorkspaceCwd(error.to_string()))?;
@@ -192,6 +228,7 @@ impl AppServerClient {
         let mut session = AppServerSession {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
+            run_id: run_id.to_string(),
             workspace,
             worker_host,
             child,
@@ -226,7 +263,7 @@ impl AppServerSession {
     {
         info!(
             "codex_turn=status=starting {} worker_host={} workspace={} thread_id={} pid={}",
-            logging::issue_context(issue),
+            logging::run_context(&issue.id, &issue.identifier, &self.run_id),
             logging::worker_host_for_log(self.worker_host.as_deref()),
             self.workspace.display(),
             self.thread_id,
@@ -259,7 +296,7 @@ impl AppServerSession {
             .inspect_err(|error| {
                 warn!(
                     "codex_turn=status=startup_failed {} worker_host={} workspace={} thread_id={} error={}",
-                    logging::issue_context(issue),
+                    logging::run_context(&issue.id, &issue.identifier, &self.run_id),
                     logging::worker_host_for_log(self.worker_host.as_deref()),
                     self.workspace.display(),
                     self.thread_id,
@@ -284,11 +321,13 @@ impl AppServerSession {
             self.thread_id.clone(),
             turn_id.clone(),
         );
+        let run_id = self.run_id.clone();
         info!(
             "codex_turn=status=started {} worker_host={} workspace={} pid={}",
             logging::codex_session_context(
                 &issue.id,
                 &issue.identifier,
+                &run_id,
                 &session_id,
                 &self.thread_id,
                 &turn_id,
@@ -336,6 +375,7 @@ impl AppServerSession {
                                 worker_host: self.worker_host.clone(),
                                 issue_id: &issue.id,
                                 issue_identifier: &issue.identifier,
+                                run_id: &run_id,
                                 session_id: &session_id,
                                 thread_id: self.thread_id.clone(),
                                 turn_id: &turn_id,
@@ -643,10 +683,12 @@ impl AppServerSession {
                 let params = message.get("params").cloned().unwrap_or_default();
                 let tool = tool_call_name(&params).unwrap_or_default();
                 let arguments = tool_call_arguments(&params);
+                let started_at = Instant::now();
                 let result =
                     dynamic_tool::execute(&self.config, self.tracker.as_ref(), &tool, arguments)
                         .await;
-                let event_payload = tool_event_payload(message, &result);
+                let tool_metadata = tool_event_metadata(message, &result, started_at.elapsed());
+                let event_payload = tool_event_payload(message, &result, &tool_metadata);
                 self.send_json(&json!({
                     "id": request_id,
                     "result": result
@@ -679,17 +721,33 @@ impl AppServerSession {
                     .get("success")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let error_summary = result
-                    .get("error")
-                    .map(|error| inline_log_value(&error.to_string()))
+                let error_summary = tool_metadata
+                    .error_message
+                    .as_deref()
+                    .map(inline_log_value)
                     .unwrap_or_else(|| "none".to_string());
                 info!(
-                    "dynamic_tool_call status={} {} tool={} call_id={} success={} error={}",
+                    "dynamic_tool_call status={} {} tool={} action={} call_id={} success={} duration_ms={} upstream_service={} error_kind={} http_status={} retry_after_secs={} error={}",
                     tool_status,
                     turn_log_context(turn),
                     tool,
+                    tool_metadata.tool_action.as_deref().unwrap_or("n/a"),
                     call_id,
                     success,
+                    tool_metadata.tool_duration_ms.unwrap_or(0),
+                    tool_metadata
+                        .upstream_service
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    tool_metadata.error_kind.as_deref().unwrap_or("none"),
+                    tool_metadata
+                        .http_status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    tool_metadata
+                        .retry_after_secs
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
                     error_summary,
                 );
                 on_event(event(turn, event_name, None, None, event_payload, None));
@@ -1005,6 +1063,7 @@ fn turn_log_context(turn: &TurnContext<'_>) -> String {
     logging::codex_session_context(
         turn.issue_id,
         turn.issue_identifier,
+        turn.run_id,
         turn.session_id,
         &turn.thread_id,
         turn.turn_id,
@@ -1130,10 +1189,188 @@ fn tool_call_arguments(params: &Value) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn tool_event_payload(message: &Value, result: &Value) -> Value {
+fn tool_event_payload(message: &Value, result: &Value, metadata: &ToolEventMetadata) -> Value {
     let mut payload = message.as_object().cloned().unwrap_or_default();
     payload.insert("toolResult".to_string(), result.clone());
+    payload.insert(
+        "symphonyTelemetry".to_string(),
+        json!({
+            "tool_name": metadata.tool_name,
+            "tool_action": metadata.tool_action,
+            "tool_success": metadata.tool_success,
+            "tool_duration_ms": metadata.tool_duration_ms,
+            "error_kind": metadata.error_kind,
+            "error_message": metadata.error_message,
+            "http_status": metadata.http_status,
+            "retry_after_secs": metadata.retry_after_secs,
+            "upstream_service": metadata.upstream_service
+        }),
+    );
     Value::Object(payload)
+}
+
+fn tool_event_metadata(message: &Value, result: &Value, duration: Duration) -> ToolEventMetadata {
+    let params = message.get("params").cloned().unwrap_or_default();
+    let tool_name = tool_call_name(&params);
+    let arguments = tool_call_arguments(&params);
+    let tool_result_body = tool_result_body(result);
+    let error = tool_result_body
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(Value::as_object);
+    let http_status = error
+        .and_then(|error| error.get("status"))
+        .and_then(value_as_u16);
+    let retry_after_secs = error
+        .and_then(|error| error.get("retry_after").or_else(|| error.get("retryAfter")))
+        .and_then(value_as_u64);
+    let error_message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let upstream_service = match tool_name.as_deref() {
+        Some(dynamic_tool::TODOIST_TOOL) => Some("todoist".to_string()),
+        Some(dynamic_tool::GITHUB_API_TOOL) => Some("github".to_string()),
+        Some(other) if !other.is_empty() => Some(other.to_string()),
+        _ => None,
+    };
+    let error_kind = if result
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        None
+    } else if retry_after_secs.is_some() {
+        Some("rate_limited".to_string())
+    } else if http_status.is_some() {
+        Some("http_status".to_string())
+    } else if error
+        .and_then(|error| error.get("reason"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        Some("transport_error".to_string())
+    } else {
+        Some("tool_call_failed".to_string())
+    };
+
+    ToolEventMetadata {
+        tool_name: tool_name.clone(),
+        tool_action: tool_action_label(tool_name.as_deref(), &arguments),
+        tool_success: result.get("success").and_then(Value::as_bool),
+        tool_duration_ms: Some(duration.as_millis().min(u128::from(u64::MAX)) as u64),
+        error_kind,
+        error_message,
+        http_status,
+        retry_after_secs,
+        upstream_service,
+    }
+}
+
+fn tool_metadata_from_payload(payload: &Value) -> ToolEventMetadata {
+    let telemetry = payload
+        .get("symphonyTelemetry")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    ToolEventMetadata {
+        tool_name: telemetry
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tool_action: telemetry
+            .get("tool_action")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        tool_success: telemetry.get("tool_success").and_then(Value::as_bool),
+        tool_duration_ms: telemetry.get("tool_duration_ms").and_then(value_as_u64),
+        error_kind: telemetry
+            .get("error_kind")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        error_message: telemetry
+            .get("error_message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        http_status: telemetry.get("http_status").and_then(value_as_u16),
+        retry_after_secs: telemetry.get("retry_after_secs").and_then(value_as_u64),
+        upstream_service: telemetry
+            .get("upstream_service")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn tool_result_body(result: &Value) -> Option<Value> {
+    result
+        .get("contentItems")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+}
+
+fn tool_action_label(tool_name: Option<&str>, arguments: &Value) -> Option<String> {
+    let args = arguments.as_object()?;
+    match tool_name {
+        Some(dynamic_tool::TODOIST_TOOL) => {
+            let action = args.get("action").and_then(Value::as_str)?.trim();
+            let mut label = format!("todoist:{action}");
+            for key in ["task_id", "project_id", "comment_id", "section_id"] {
+                if let Some(value) = args.get(key).and_then(value_as_string) {
+                    label.push(' ');
+                    label.push_str(key);
+                    label.push('=');
+                    label.push_str(&value);
+                    break;
+                }
+            }
+            Some(label)
+        }
+        Some(dynamic_tool::GITHUB_API_TOOL) => {
+            let method = args
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("/");
+            Some(format!("github_api:{method} {path}"))
+        }
+        Some(other) if !other.is_empty() => Some(other.to_string()),
+        _ => None,
+    }
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn value_as_u16(value: &Value) -> Option<u16> {
+    value_as_u64(value).and_then(|value| u16::try_from(value).ok())
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 fn input_required_method(method: &str, message: &Value) -> bool {
@@ -1157,11 +1394,12 @@ fn input_required_method(method: &str, message: &Value) -> bool {
 fn event(
     turn: &TurnContext<'_>,
     event: &str,
-    usage: Option<Value>,
+    usage: Option<UsageExtraction>,
     rate_limits: Option<Value>,
     payload: Value,
     raw: Option<String>,
 ) -> CodexEvent {
+    let tool_metadata = tool_metadata_from_payload(&payload);
     CodexEvent {
         event: event.to_string(),
         timestamp: Utc::now(),
@@ -1170,11 +1408,21 @@ fn event(
         thread_id: Some(turn.thread_id.clone()),
         turn_id: Some(turn.turn_id.to_string()),
         codex_app_server_pid: turn.pid,
-        usage,
+        usage: usage.as_ref().map(|usage| usage.value.clone()),
+        usage_source: usage.map(|usage| usage.source.to_string()),
         rate_limits,
         payload: Some(payload),
         raw,
         message: None,
+        tool_name: tool_metadata.tool_name,
+        tool_action: tool_metadata.tool_action,
+        tool_success: tool_metadata.tool_success,
+        tool_duration_ms: tool_metadata.tool_duration_ms,
+        error_kind: tool_metadata.error_kind,
+        error_message: tool_metadata.error_message,
+        http_status: tool_metadata.http_status,
+        retry_after_secs: tool_metadata.retry_after_secs,
+        upstream_service: tool_metadata.upstream_service,
     }
 }
 
@@ -1193,30 +1441,55 @@ fn event_with(
         turn_id: identity.turn_id,
         codex_app_server_pid: identity.pid,
         usage: None,
+        usage_source: None,
         rate_limits: None,
         payload: None,
         raw,
         message,
+        tool_name: None,
+        tool_action: None,
+        tool_success: None,
+        tool_duration_ms: None,
+        error_kind: None,
+        error_message: None,
+        http_status: None,
+        retry_after_secs: None,
+        upstream_service: None,
     }
 }
 
-fn extract_usage(message: &Value) -> Option<Value> {
+fn extract_usage(message: &Value) -> Option<UsageExtraction> {
     absolute_usage(message).or_else(|| turn_completed_usage(message))
 }
 
-fn absolute_usage(message: &Value) -> Option<Value> {
+fn absolute_usage(message: &Value) -> Option<UsageExtraction> {
     [
-        &["params", "msg", "payload", "info", "total_token_usage"][..],
-        &["params", "msg", "info", "total_token_usage"][..],
-        &["params", "tokenUsage", "total"][..],
-        &["tokenUsage", "total"][..],
+        (
+            &["params", "tokenUsage", "total"][..],
+            "thread/tokenUsage/updated.total",
+        ),
+        (
+            &["tokenUsage", "total"][..],
+            "thread/tokenUsage/updated.total",
+        ),
+        (
+            &["params", "msg", "payload", "info", "total_token_usage"][..],
+            "codex/event/token_count.total",
+        ),
+        (
+            &["params", "msg", "info", "total_token_usage"][..],
+            "codex/event/token_count.total",
+        ),
     ]
     .iter()
-    .find_map(|path| lookup_path(message, path))
-    .and_then(normalize_usage_map)
+    .find_map(|(path, source)| {
+        lookup_path(message, path).and_then(|value| {
+            normalize_usage_map(value).map(|value| UsageExtraction { value, source })
+        })
+    })
 }
 
-fn turn_completed_usage(message: &Value) -> Option<Value> {
+fn turn_completed_usage(message: &Value) -> Option<UsageExtraction> {
     if message.get("method").and_then(Value::as_str) != Some("turn/completed") {
         return None;
     }
@@ -1225,6 +1498,10 @@ fn turn_completed_usage(message: &Value) -> Option<Value> {
         .iter()
         .find_map(|path| lookup_path(message, path))
         .and_then(normalize_usage_map)
+        .map(|value| UsageExtraction {
+            value,
+            source: "turn/completed.usage",
+        })
 }
 
 fn extract_rate_limits(message: &Value) -> Option<Value> {
@@ -1399,16 +1676,19 @@ mod tests {
         .expect("usage");
         assert_eq!(
             usage
+                .value
                 .get("input_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(10)
         );
         assert_eq!(
             usage
+                .value
                 .get("total_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(30)
         );
+        assert_eq!(usage.source, "thread/tokenUsage/updated.total");
     }
 
     #[tokio::test]
@@ -1429,13 +1709,13 @@ mod tests {
             }),
         );
 
-        let root_error = match app.start_session(&workspace_root).await {
+        let root_error = match app.start_session(&workspace_root, "run-test").await {
             Ok(_) => panic!("expected workspace root to be rejected"),
             Err(error) => error,
         };
         assert!(matches!(root_error, CodexError::InvalidWorkspaceCwd(_)));
 
-        let outside_error = match app.start_session(&outside_workspace).await {
+        let outside_error = match app.start_session(&outside_workspace, "run-test").await {
             Ok(_) => panic!("expected outside workspace to be rejected"),
             Err(error) => error,
         };
@@ -1494,7 +1774,10 @@ done
             }),
         );
 
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         session.stop().await;
 
         let captured = fs::read_to_string(trace).expect("trace");
@@ -1604,6 +1887,7 @@ done
             .start_session_on_host(
                 Path::new("~/remote-workspaces/MT-REMOTE"),
                 Some("builder-1"),
+                "run-test",
             )
             .await
             .expect("session");
@@ -1658,7 +1942,7 @@ done
             }),
         );
 
-        let error = match app.start_session(&symlink_workspace).await {
+        let error = match app.start_session(&symlink_workspace, "run-test").await {
             Ok(_) => panic!("expected symlink escape to be rejected"),
             Err(error) => error,
         };
@@ -1696,16 +1980,19 @@ done
 
         assert_eq!(
             usage
+                .value
                 .get("input_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(10)
         );
         assert_eq!(
             usage
+                .value
                 .get("total_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(12)
         );
+        assert_eq!(usage.source, "turn/completed.usage");
     }
 
     #[test]
@@ -1726,22 +2013,26 @@ done
 
         assert_eq!(
             usage
+                .value
                 .get("input_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(9)
         );
         assert_eq!(
             usage
+                .value
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(4)
         );
         assert_eq!(
             usage
+                .value
                 .get("total_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(13)
         );
+        assert_eq!(usage.source, "thread/tokenUsage/updated.total");
     }
 
     #[test]
@@ -1758,16 +2049,19 @@ done
 
         assert_eq!(
             usage
+                .value
                 .get("input_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(5)
         );
         assert_eq!(
             usage
+                .value
                 .get("total_tokens")
                 .and_then(serde_json::Value::as_i64),
             Some(12)
         );
+        assert_eq!(usage.source, "turn/completed.usage");
     }
 
     #[test]
@@ -1853,7 +2147,10 @@ done
                 tool_result: Ok(json!({ "data": {} })),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         let issue = sample_issue();
 
         let result = session
@@ -1909,7 +2206,10 @@ done
                 tool_result: Ok(json!({ "data": {} })),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         let cancellation = CancellationToken::new();
         let cancel_clone = cancellation.clone();
         tokio::spawn(async move {
@@ -1983,7 +2283,10 @@ done
                 tool_result: Ok(json!({ "data": {} })),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
 
         let result = session
             .run_turn(
@@ -2051,7 +2354,10 @@ done
                 tool_result: Ok(json!({ "data": {} })),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         let events = Arc::new(Mutex::new(Vec::<CodexEvent>::new()));
         let captured = Arc::clone(&events);
 
@@ -2131,7 +2437,10 @@ done
                 tool_result: Ok(json!({ "data": {} })),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         let events = Arc::new(Mutex::new(Vec::<CodexEvent>::new()));
         let captured = Arc::clone(&events);
 
@@ -2210,7 +2519,10 @@ done
                 tool_result: Err(TrackerError::TodoistApiRequest("boom".to_string())),
             }),
         );
-        let mut session = app.start_session(&workspace).await.expect("session");
+        let mut session = app
+            .start_session(&workspace, "run-test")
+            .await
+            .expect("session");
         let events = Arc::new(Mutex::new(Vec::<CodexEvent>::new()));
         let captured = Arc::clone(&events);
 

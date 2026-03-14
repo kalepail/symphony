@@ -93,6 +93,7 @@ pub struct AgentLimitsPayload {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningEntryPayload {
+    pub run_id: String,
     pub issue_id: String,
     pub issue_identifier: String,
     pub title: String,
@@ -174,6 +175,7 @@ pub struct IssueAttemptsPayload {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct IssueRunningPayload {
+    pub run_id: String,
     pub worker_host: Option<String>,
     pub session_id: Option<String>,
     pub app_server_pid: Option<u32>,
@@ -305,6 +307,7 @@ impl Presenter {
                 .map(|entry| {
                     let last_event = entry.last_event.clone();
                     RunningEntryPayload {
+                        run_id: entry.run_id,
                         issue_id: entry.issue_id,
                         issue_identifier: entry.issue_identifier,
                         title: entry.title,
@@ -456,6 +459,7 @@ impl Presenter {
             running: detail.running.map(|running| {
                 let last_event = running.last_event.clone();
                 IssueRunningPayload {
+                    run_id: running.run_id,
                     worker_host: running.worker_host,
                     session_id: running.session_id,
                     app_server_pid: running.codex_app_server_pid,
@@ -4170,6 +4174,7 @@ mod tests {
                 max_concurrent_agents: 10,
             },
             running: vec![RunningEntryPayload {
+                run_id: "run-issue-123".to_string(),
                 issue_id: "issue-123".to_string(),
                 issue_identifier: "ABC-123".to_string(),
                 title: "Review Todoist-native observability".to_string(),
@@ -4193,6 +4198,9 @@ mod tests {
                     input_tokens: 11,
                     output_tokens: 7,
                     total_tokens: 18,
+                    token_total: 18,
+                    token_delta: 4,
+                    token_source: Some("thread/tokenUsage/updated.total".to_string()),
                 },
                 context: None,
             }],

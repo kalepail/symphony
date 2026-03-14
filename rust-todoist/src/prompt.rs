@@ -11,6 +11,7 @@ pub struct IssuePromptMetrics {
     pub rendered_issue_context_bytes: usize,
     pub preloaded_comment_bytes: usize,
     pub preloaded_comment_count: usize,
+    pub comment_preload_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +77,7 @@ pub fn build_issue_prompt_with_metrics(
             rendered_issue_context_bytes: prompt_without_comments.len(),
             preloaded_comment_bytes: prompt.len().saturating_sub(prompt_without_comments.len()),
             preloaded_comment_count: issue.todoist_comments.len(),
+            comment_preload_truncated: issue.todoist_comments_truncated,
         },
         prompt,
     })
@@ -247,5 +249,25 @@ Deadline: {% if issue.deadline is defined and issue.deadline %}{{ issue.deadline
         assert!(built.metrics.rendered_issue_context_bytes > 0);
         assert!(built.metrics.preloaded_comment_bytes > 0);
         assert_eq!(built.metrics.preloaded_comment_count, 1);
+        assert!(!built.metrics.comment_preload_truncated);
+    }
+
+    #[test]
+    fn reports_comment_preload_truncation_flag() {
+        let workflow = WorkflowDefinition {
+            config: json!({}).as_object().expect("object").clone(),
+            prompt_template: "{{ issue.identifier }}".to_string(),
+        };
+        let issue = Issue {
+            id: "1".to_string(),
+            identifier: "ABC-1".to_string(),
+            title: "Title".to_string(),
+            state: "Rework".to_string(),
+            todoist_comments_truncated: true,
+            ..Issue::default()
+        };
+
+        let built = build_issue_prompt_with_metrics(&workflow, &issue, None).expect("render");
+        assert!(built.metrics.comment_preload_truncated);
     }
 }
