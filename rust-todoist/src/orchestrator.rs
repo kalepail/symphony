@@ -2073,93 +2073,96 @@ fn integrate_worker_turn_context(
 
 fn integrate_worker_update(state: &mut State, issue_id: &str, event: CodexEvent) {
     update_turn_runtime_snapshot(state, issue_id, &event);
-    let Some(running) = state.running.get_mut(issue_id) else {
-        return;
+    let (should_log_summary, summary_issue, summary_run_id, summary_worker_host, summary_status) = {
+        let Some(running) = state.running.get_mut(issue_id) else {
+            return;
+        };
+
+        if event.event == "session_started" {
+            let next_session_id = event.session_id.clone();
+            if next_session_id != running.session_id {
+                running.turn_count += 1;
+            }
+            running.session_id = next_session_id;
+        }
+
+        if let Some(pid) = event.codex_app_server_pid {
+            running.codex_app_server_pid = Some(pid);
+        }
+        if let Some(worker_host) = event.worker_host.clone() {
+            running.worker_host = Some(worker_host);
+        }
+        if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
+            running.terminal_transition_permitted = true;
+        }
+        running.last_codex_event = Some(event.event.clone());
+        running.last_codex_timestamp = Some(event.timestamp);
+        running.last_codex_message = event
+            .message
+            .clone()
+            .or_else(|| event.raw.clone())
+            .or_else(|| event.payload.as_ref().map(|payload| payload.to_string()));
+
+        if let Some(usage) = event.usage.as_ref() {
+            let input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total = usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+
+            let input_delta = input.saturating_sub(running.last_reported_input_tokens);
+            let output_delta = output.saturating_sub(running.last_reported_output_tokens);
+            let total_delta = total.saturating_sub(running.last_reported_total_tokens);
+
+            running.last_reported_input_tokens = input.max(running.last_reported_input_tokens);
+            running.last_reported_output_tokens = output.max(running.last_reported_output_tokens);
+            running.last_reported_total_tokens = total.max(running.last_reported_total_tokens);
+
+            running.codex_input_tokens += input_delta;
+            running.codex_output_tokens += output_delta;
+            running.codex_total_tokens += total_delta;
+            running.last_token_delta = total_delta;
+            if total_delta > 0 || running.last_token_source.is_none() {
+                running.last_token_source = event.usage_source.clone();
+            }
+            state.codex_totals.input_tokens += input_delta;
+            state.codex_totals.output_tokens += output_delta;
+            state.codex_totals.total_tokens += total_delta;
+        }
+
+        if let Some(rate_limits) = event.rate_limits.clone() {
+            state.codex_rate_limits = Some(rate_limits);
+        }
+
+        let recent_event_name = event.event.clone();
+        running.recent_events.push(RecentEvent {
+            at: event.timestamp,
+            event: recent_event_name,
+            message: running.last_codex_message.clone(),
+        });
+        if running.recent_events.len() > 100 {
+            let drain = running.recent_events.len() - 100;
+            running.recent_events.drain(0..drain);
+        }
+
+        (
+            matches!(
+                event.event.as_str(),
+                "turn_completed" | "turn_failed" | "turn_cancelled"
+            ),
+            running.issue.clone(),
+            running.run_id.clone(),
+            running.worker_host.clone(),
+            event.event.clone(),
+        )
     };
-
-    if event.event == "session_started" {
-        let next_session_id = event.session_id.clone();
-        if next_session_id != running.session_id {
-            running.turn_count += 1;
-        }
-        running.session_id = next_session_id;
-    }
-
-    if let Some(pid) = event.codex_app_server_pid {
-        running.codex_app_server_pid = Some(pid);
-    }
-    if let Some(worker_host) = event.worker_host.clone() {
-        running.worker_host = Some(worker_host);
-    }
-    if todoist_close_task_succeeded(event.payload.as_ref(), issue_id) {
-        running.terminal_transition_permitted = true;
-    }
-    running.last_codex_event = Some(event.event.clone());
-    running.last_codex_timestamp = Some(event.timestamp);
-    running.last_codex_message = event
-        .message
-        .clone()
-        .or_else(|| event.raw.clone())
-        .or_else(|| event.payload.as_ref().map(|payload| payload.to_string()));
-
-    if let Some(usage) = event.usage.as_ref() {
-        let input = usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let total = usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        let input_delta = input.saturating_sub(running.last_reported_input_tokens);
-        let output_delta = output.saturating_sub(running.last_reported_output_tokens);
-        let total_delta = total.saturating_sub(running.last_reported_total_tokens);
-
-        running.last_reported_input_tokens = input.max(running.last_reported_input_tokens);
-        running.last_reported_output_tokens = output.max(running.last_reported_output_tokens);
-        running.last_reported_total_tokens = total.max(running.last_reported_total_tokens);
-
-        running.codex_input_tokens += input_delta;
-        running.codex_output_tokens += output_delta;
-        running.codex_total_tokens += total_delta;
-        running.last_token_delta = total_delta;
-        if total_delta > 0 || running.last_token_source.is_none() {
-            running.last_token_source = event.usage_source.clone();
-        }
-        state.codex_totals.input_tokens += input_delta;
-        state.codex_totals.output_tokens += output_delta;
-        state.codex_totals.total_tokens += total_delta;
-    }
-
-    if let Some(rate_limits) = event.rate_limits.clone() {
-        state.codex_rate_limits = Some(rate_limits);
-    }
-
-    let recent_event_name = event.event.clone();
-    running.recent_events.push(RecentEvent {
-        at: event.timestamp,
-        event: recent_event_name,
-        message: running.last_codex_message.clone(),
-    });
-    if running.recent_events.len() > 100 {
-        let drain = running.recent_events.len() - 100;
-        running.recent_events.drain(0..drain);
-    }
-
-    let should_log_summary = matches!(
-        event.event.as_str(),
-        "turn_completed" | "turn_failed" | "turn_cancelled"
-    );
-    let summary_issue = running.issue.clone();
-    let summary_run_id = running.run_id.clone();
-    let summary_worker_host = running.worker_host.clone();
-    let summary_status = event.event.clone();
-    let _ = running;
 
     if should_log_summary
         && let Some(context) = state

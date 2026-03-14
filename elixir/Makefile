@@ -1,6 +1,6 @@
 .PHONY: help all setup deps build fmt fmt-check lint test coverage ci dialyzer e2e pr-body-check
 
-MIX ?= $(shell if command -v mix >/dev/null 2>&1; then echo mix; elif command -v mise >/dev/null 2>&1; then echo 'mise exec -- mix'; else echo mix; fi)
+MIX ?= $(shell if command -v mix >/dev/null 2>&1; then printf '%s\n' mix; elif command -v mise >/dev/null 2>&1; then printf '%s\n' "mise exec -- mix"; else printf '%s\n' mix; fi)
 
 help:
 	@echo "Targets: setup, deps, fmt, fmt-check, lint, test, coverage, dialyzer, e2e, pr-body-check, ci"
